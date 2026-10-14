@@ -2,7 +2,8 @@
 -- it says: flags with dashes, letters and other names, an option given again
 -- and again, one of a few values, one that is something where it is not
 -- given, options several commands take, options every command takes, a
--- version, and a command for when there is none. MiniML's own command line
+-- version, what follows a `--`, and a command for when there is none, which
+-- has no name. MiniML's own command line
 -- (in `Lib`) needs none of it; a compiler's does.
 
 use Lingua (cli!)
@@ -20,6 +21,7 @@ cli! {
     "1.2.0"
     default
     repl
+    unnamed
     options
     {
       offline : Flag "Never fetch a dependency"
@@ -41,7 +43,7 @@ cli! {
       "Build a package and run it"
       {
         path : Maybe String "the package"
-        rest : [String] "what the program is given"
+        rest : [String] "what the program is given" after "--"
       }
       with
       Build
@@ -161,12 +163,28 @@ def plain : String = "release=False O=None runtime=glade cfg= emit= workspace=Fa
 
 @test fun optionsSeveralCommandsTakeAreOneType () =
   assertEq
-    (V.map said [["run", "--release", "app", "a", "b"], ["run", "app", "--", "--release"]])
+    (V.map said [["run", "--release", "app"], ["run", "-O2"]])
     [
-      "offline=False locked=False | run app [a b] | release=True O=None runtime=glade cfg= emit= workspace=False noPrune=False",
-      "offline=False locked=False | run app [--release] | release=False O=None runtime=glade cfg= emit= workspace=False noPrune=False"
+      "offline=False locked=False | run app [] | release=True O=None runtime=glade cfg= emit= workspace=False noPrune=False",
+      "offline=False locked=False | run . [] | release=False O=Just(2) runtime=glade cfg= emit= workspace=False noPrune=False"
     ]
-    "`run` takes what `build` does, read by the one function; and after `--` nothing is a flag"
+    "`run` takes what `build` does, read by the one function"
+
+@test fun whatFollowsTheDashesIsKeptApart () =
+  assertEq
+    (V.map said [
+       ["run", "app", "--", "a", "--release"],
+       ["run", "--", "a", "b"],
+       ["run", "app", "a"],
+       ["run", "--release", "--"]
+     ])
+    [
+      "offline=False locked=False | run app [a --release] | ${plain}",
+      "offline=False locked=False | run . [a b] | ${plain}",
+      "`run` takes nothing more",
+      "offline=False locked=False | run . [] | release=True O=None runtime=glade cfg= emit= workspace=False noPrune=False"
+    ]
+    "after `--` nothing is a flag and nothing is the package; before it, nothing is the program's"
 
 @test fun whatEveryCommandTakesComesBeforeItOrAfter () =
   assertEq
@@ -174,7 +192,7 @@ def plain : String = "release=False O=None runtime=glade cfg= emit= workspace=Fa
        ["--offline", "build"],
        ["build", "--offline", "--locked"],
        ["--locked", "fmt", "--offline", "a.mw"],
-       ["--offline", "--offline", "repl"]
+       ["--offline", "--offline"]
      ])
     [
       "offline=True locked=False | build . | ${plain}",
@@ -186,16 +204,28 @@ def plain : String = "release=False O=None runtime=glade cfg= emit= workspace=Fa
 
 @test fun aProgramGivenNoCommandRunsTheOneItSays () =
   assertEq
-    (V.map said [[], ["--offline"], ["--version"], ["-V"], ["help"], ["bild"]])
+    (V.map said [[], ["--offline"], ["--version"], ["-V"], ["help"], ["bild"], ["repl"]])
     [
-      "offline=False locked=False | repl",
-      "offline=True locked=False | repl",
-      "tool 1.2.0",
-      "tool 1.2.0",
-      "tool -- A compiler's command line, for the tests",
-      "there is no command `bild`"
+      "offline=False locked=False | repl", "offline=True locked=False | repl", "tool 1.2.0",
+      "tool 1.2.0", "tool -- A compiler's command line, for the tests",
+      "there is no command `bild`", "there is no command `repl`"
     ]
-    "none, or only what every command takes; its version; and a word that is no command is still a mistake"
+    "none, or only what every command takes; its version; a word that is no command is still a mistake -- and so is the name of the one run when there is none, which has no name"
+
+@test fun aCommandWithNoNameIsNotListed () =
+  let help = (match askTool ["help"] with | Err (Help h) -> h | _ -> "") in
+  let script =
+    (match askTool ["completions", "bash"] with
+     | Err (Complete c) -> c
+     | _ -> "")
+  in assertEq
+       (
+         S.contains "\n  repl" help,
+         S.contains "With no command: Read entries and evaluate them" help,
+         S.contains "compgen -W \"build run fmt lsp help completions\"" script
+       )
+       (False, True, True)
+       "not among the commands, in help or in what is completed; help says what happens with none"
 
 @test fun helpSaysHowAFlagIsWritten () =
   let help =

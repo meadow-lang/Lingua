@@ -50,6 +50,22 @@ argument, read by position, or a flag, read by name.
 
 After `--`, everything is an argument.
 
+**Only what follows `--`.** A program that runs another passes it arguments
+of its own, and they must not be taken for the program's:
+
+```meadow
+| run "Build a package and run it" {
+    path : Maybe String "the package"
+    rest : [String] "what the program is given" after "--"
+  }
+```
+
+`rest` holds what follows a `--` and nothing before it. `tool run -- a b`
+leaves `path` as it was and gives `rest` both; without `after "--"`, `a`
+would be the path. Before the `--`, the command takes its other arguments
+and no more: `tool run app a` is a mistake. Only the rest of the arguments,
+a `[T]`, can be said to be after `--`.
+
 **One of a few values.** `runtime : Option ("glade" | "silo")` refuses anything
 else, saying which there are, and help lists them.
 
@@ -156,6 +172,12 @@ default repl
 is `tool repl`, and so is `tool --offline`. A line that starts with a flag is
 that command's too. A word that is no command is still a mistake.
 
+`default repl unnamed` is a command that is run only so. It is declared like
+any other and is a constructor like any other, but it has no name on the
+line: `tool repl` is a mistake, help does not list it among the commands,
+and completions do not offer it. Help says instead what the program does
+with no command, and that command's flags.
+
 Both come before the commands, with `options`, in any order.
 
 ## Help
@@ -194,6 +216,7 @@ Each is reported where it was written:
 - `short`, `alias`, `as`, `value`, `split` or `= d` on an argument; `split`
   on an option of one value; `= d` on a `Flag` or an `Option [T]`; a `short`
   of more than one letter;
+- `after "--"` on anything but the rest of the arguments;
 - `default x` where there is no command `x`.
 
 [Tool.mw](../examples/MiniML/src/Tool.mw) declares a command line with all of

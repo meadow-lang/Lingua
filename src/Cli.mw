@@ -49,8 +49,14 @@
 -- with them `argsCli ()` answers a pair, those options -- a `CliOptions` --
 -- and the command.
 --
+-- **After `--`.** `rest : [String] "…" after "--"` is what follows a `--`
+-- and nothing before it: `run -- a b` leaves the arguments before it as they
+-- were, not given `a`.
+--
 -- **The program itself.** `version "1.2.0"` gives it `--version` and `-V`;
--- `default repl` is the command it runs when it is given none.
+-- `default repl` is the command it runs when it is given none, and `default
+-- repl unnamed` one that is run only so: no command of that name can be
+-- written, and help lists none.
 --
 -- What is written for it:
 --
@@ -79,8 +85,8 @@ use Lingua.Diagnostic (Diagnostic, errorAt, withNote, renderToOutput)
 
 -- What a field holds: text, a number, one that may be left out, the rest of
 -- the arguments, a flag that is there or not, a flag with a value -- of
--- which `KOption (KMany k)` is one that may be given again and again -- or
--- one of a few texts.
+-- which `KOption (KMany k)` is one that may be given again and again -- one
+-- of a few texts, or what follows a `--`.
 @pub data Kind
   = KText
   | KNum
@@ -89,6 +95,7 @@ use Lingua.Diagnostic (Diagnostic, errorAt, withNote, renderToOutput)
   | KFlag
   | KOption Kind
   | KChoice [String]
+  | KLast Kind
 
 use Kind.*
 
@@ -108,8 +115,9 @@ use Kind.*
 
 -- What a program has beside its commands: the options every command takes,
 -- the command it runs when it is given none, and its version -- either of
--- which may be nothing.
-@pub data Whole = Whole [Arg] String String
+-- which may be nothing -- and whether that command is run only so, with no
+-- name to be written.
+@pub data Whole = Whole [Arg] String String Bool
 
 -- A program's command line: the program, what it is, its commands, and the
 -- rest.
@@ -156,6 +164,7 @@ use Asked.*
 @pub fun kMany (k : Kind) : Kind = KMany k
 @pub fun kOption (k : Kind) : Kind = KOption k
 @pub fun kChoice (names : [String]) : Kind = KChoice names
+@pub fun kLast (k : Kind) : Kind = KLast k
 @pub fun arg (n : String) (k : Kind) (h : String) : Arg =
   Arg n k h (Written (dashed n) "" [] (dashed n) "" [])
 
@@ -177,10 +186,11 @@ use Asked.*
 
 @pub fun command (n : String) (about : String) (fs : [Arg]) : Command = Command n about fs
 @pub fun spec (p : String) (about : String) (cs : [Command]) : Spec =
-  Spec p about cs (Whole [] "" "")
+  Spec p about cs (Whole [] "" "" False)
 
 -- A program's command line, with the options every command takes, the
--- command it runs given none, and its version: either may be nothing.
+-- command it runs given none, and its version: either may be nothing. And
+-- whether that command has no name on the line.
 @pub fun specWith
     (p : String)
     (about : String)
@@ -188,8 +198,9 @@ use Asked.*
     (everywhere : [Arg])
     (given : String)
     (version : String)
+    (unnamed : Bool)
     : Spec =
-  Spec p about cs (Whole everywhere given version)
+  Spec p about cs (Whole everywhere given version unnamed)
 
 fun argName a = match a with | Arg n _ _ _ -> n
 
@@ -221,20 +232,36 @@ fun isFlag k =
 
 fun flagsOf c = V.filter (\a -> isFlag (argKind a)) (commandArgs c)
 
-fun positionalsOf c = V.filter (\a -> not (isFlag (argKind a))) (commandArgs c)
+fun isLast k = match k with | KLast _ -> True | _ -> False
+
+-- The arguments read by where they are: not a flag, and not what follows a
+-- `--`.
+fun positionalsOf c =
+  V.filter (\a -> not (isFlag (argKind a)) and not (isLast (argKind a))) (commandArgs c)
+
+-- The field that holds what follows a `--`, if the command has one.
+fun lastOf c = V.find (\a -> isLast (argKind a)) (commandArgs c)
 
 fun program s = match s with | Spec p _ _ _ -> p
 
 fun commandsOf s = match s with | Spec _ _ cs _ -> cs
 
-fun everywhereOf s = match s with | Spec _ _ _ (Whole fs _ _) -> fs
+fun everywhereOf s = match s with | Spec _ _ _ (Whole fs _ _ _) -> fs
 
-fun givenNoneOf s = match s with | Spec _ _ _ (Whole _ d _) -> d
+fun givenNoneOf s = match s with | Spec _ _ _ (Whole _ d _ _) -> d
 
-fun versionOf s = match s with | Spec _ _ _ (Whole _ _ v) -> v
+fun versionOf s = match s with | Spec _ _ _ (Whole _ _ v _) -> v
+
+fun unnamedOf s = match s with | Spec _ _ _ (Whole _ _ _ u) -> u
+
+-- The commands that can be written: all of them, but one run only when
+-- none is.
+fun namedOf s =
+  if unnamedOf s then V.filter (\c -> commandName c != givenNoneOf s) (commandsOf s)
+  else commandsOf s
 
 @pub fun findCommand (s : Spec) (name : String) : Maybe Command =
-  V.find (\c -> commandName c == name) (commandsOf s)
+  V.find (\c -> commandName c == name) (namedOf s)
 
 -- A command, with the options every command takes among its own.
 fun everywhere (s : Spec) (c : Command) : Command =
@@ -274,7 +301,7 @@ fun asking (s : Spec) (args : [String]) (line : String) (from : Int) before : As
       fill s args whole line i 0 False (over (defaults whole) before)
   in
   let none =
-    M.andThen (findCommand s) (if S.isEmpty (givenNoneOf s) then None else Just (givenNoneOf s))
+    V.find (\c -> not (S.isEmpty (givenNoneOf s)) and commandName c == givenNoneOf s) (commandsOf s)
   in match V.get args from with
      | None ->
          (match none with
@@ -314,7 +341,7 @@ fun noCommand (s : Spec) (first : String) (place : Meta) (line : String) : Asked
   Wrong
     (errorAt place "there is no command `${first}`"
        |> withNote
-         "the commands are ${S.join ", " (V.map (\c -> "`${commandName c}`") (commandsOf s))}")
+         "the commands are ${S.join ", " (V.map (\c -> "`${commandName c}`") (namedOf s))}")
     line
 
 -- What each field holds when nothing is said of it; and, under no name,
@@ -328,6 +355,7 @@ fun defaults c =
            match argKind a with
            | KFlag -> VBool False
            | KMany _ -> VList []
+           | KLast _ -> VList []
            | KOption (KMany _) -> VList []
            | KOption k ->
                (match M.map (convert k) (otherwiseOf a) with
@@ -471,13 +499,29 @@ fun fill s args c line i p rest vals =
              | Next j now -> fill s args c line j p rest now
              | Bad d -> Wrong d line)
         | None ->
-            match V.get (positionalsOf c) p with
-            | None ->
+            match (if rest then lastOf c else None, V.get (positionalsOf c) p) with
+            | (Just f, _) ->
+                (match convert (argKind f) a with
+                 | Ok x ->
+                     fill
+                       s
+                       args
+                       c
+                       line
+                       (i + 1)
+                       p
+                       rest
+                       (set
+                          (argName f)
+                          (VList (V.pushBack (listOf (valueOf (argName f) vals)) x))
+                          vals)
+                 | Err why -> Wrong (errorAt (at i) why) line)
+            | (None, None) ->
                 Wrong
                   (errorAt (at i) "`${commandName c}` takes nothing more"
                      |> withNote (usageLine s c))
                   line
-            | Just f ->
+            | (None, Just f) ->
                 (match argKind f with
                  | KMany k ->
                      (match convert k a with
@@ -536,6 +580,7 @@ fun convert k text =
       else Err "`${text}` is not one of ${S.join ", " (V.map (\n -> "`${n}`") names)}"
   | KMaybe x -> convert x text
   | KMany x -> convert x text
+  | KLast x -> convert x text
   | KOption x -> convert x text
   | _ -> Ok (VText text)
 
@@ -609,6 +654,7 @@ fun signature a =
   | KChoice _ -> "<${n}>"
   | KMaybe _ -> "[<${n}>]"
   | KMany _ -> "[<${n}>...]"
+  | KLast _ -> "[-- <${n}>...]"
   | KFlag -> "[--${longOf a}]"
   | KOption (KMany _) -> "[--${longOf a} <${valueNameOf a}>]..."
   | KOption _ -> "[--${longOf a} <${valueNameOf a}>]"
@@ -659,7 +705,7 @@ fun flagRows (fs : [Arg]) : [(String, String)] = V.map (\a -> (flagSignature a, 
                  S.join " " (V.pushFront (V.map signature (positionalsOf c)) (commandName c)),
                  commandAbout c
                ))
-             cs)
+             (namedOf s))
           [
             ("help [<command>]", "Say what the program or a command takes"),
             ("completions bash", "Print a completion script for bash")
@@ -672,6 +718,11 @@ fun flagRows (fs : [Arg]) : [(String, String)] = V.map (\a -> (flagSignature a, 
       in
       let none =
         if S.isEmpty (givenNoneOf s) then ""
+        else if unnamedOf s then
+          (match V.find (\c -> commandName c == givenNoneOf s) cs with
+           | Just c ->
+               "\nWith no command: ${commandAbout c}\n${if V.isEmpty (flagsOf c) then "" else table (flagRows (flagsOf c))}"
+           | None -> "")
         else "\nWith no command, `${p}` is `${p} ${givenNoneOf s}`.\n"
       in "${p} -- ${about}\n\nUsage: ${p} <command> [arguments]\n\nCommands:\n${table rows}${if V.isEmpty options then "" else "\nOptions:\n${table options}"}${none}\n`${p} help <command>` says what a command takes.\n"
 
@@ -701,7 +752,7 @@ fun flagsNote c =
 @pub fun bashCompletion (s : Spec) : String =
   let p = program s in
   let fn = "_${S.join "_" (S.split "-" p)}" in
-  let words = S.join " " (V.append (V.map commandName (commandsOf s)) ["help", "completions"]) in
+  let words = S.join " " (V.append (V.map commandName (namedOf s)) ["help", "completions"]) in
   let names = \f -> V.map (\n -> "--${n}") (V.pushFront (aliasesOf f) (longOf f)) in
   let arms =
     S.join
@@ -709,7 +760,7 @@ fun flagsNote c =
       (V.map
          (\c ->
            "    ${commandName c}) COMPREPLY=($(compgen -f -W \"${S.join " " (V.pushBack (V.concatMap names (flagsOf (everywhere s c))) "--help")}\" -- \"$cur\")) ;;\n")
-         (commandsOf s))
+         (namedOf s))
   in "${fn}() {\n  local cur=\"\${COMP_WORDS[COMP_CWORD]}\"\n  if [ \"$COMP_CWORD\" -eq 1 ]; then\n    COMPREPLY=($(compgen -W \"${words}\" -- \"$cur\"))\n    return\n  fi\n  case \"\${COMP_WORDS[1]}\" in\n${arms}  esac\n}\ncomplete -o default -F ${fn} ${p}\n"
 
 -- --- cli! --------------------------------------------------------------------
@@ -726,7 +777,7 @@ use Lingua.Pipe (named)
 
 -- A field as written: its name and where, what it holds, what help says,
 -- and what else is said of it -- `short`, `alias`, `as`, `value`, `split`,
--- and `default` for what follows an `=` -- each with its text.
+-- `after`, and `default` for what follows an `=` -- each with its text.
 type Field = (String, Loc, Kind, String, [(String, String)])
 
 -- A command as written: its name and where, what help says, its fields, and
@@ -738,7 +789,7 @@ data Declared
 -- is given, the options every command takes, or some that several do.
 data Part
   = Version String
-  | GivenNone String Loc
+  | GivenNone String Loc Bool
   | Everywhere [Field]
   | Shared String Loc [Field]
 
@@ -771,7 +822,8 @@ def saidP : Parser Tokens (String, String) =
        "alias",
        "as",
        "value",
-       "split"
+       "split",
+       "after"
      ])
 
 def fieldP : Parser Tokens Field =
@@ -779,7 +831,10 @@ def fieldP : Parser Tokens Field =
     (
       fst n,
       snd n,
-      k,
+      -- The rest of the arguments, said to be what follows a `--`.
+      (match (k, V.any (\x -> fst x == "after") said) with
+       | (KMany x, True) -> KLast x
+       | _ -> k),
       M.unwrapOr "" h,
       (match d with
        | Just x -> V.pushBack said ("default", x)
@@ -810,7 +865,11 @@ def commandP : Parser Tokens Declared =
 def partP : Parser Tokens Part =
   P.choice [
     P.map Version (P.skipThen (keyword "version") stringLit),
-    P.map (\n -> GivenNone (fst n) (snd n)) (P.skipThen (keyword "default") named),
+    P.skipThen
+      (keyword "default")
+      (P.pure (\n unnamed -> GivenNone (fst n) (snd n) (M.isSome unnamed))
+         |> keep named
+         |> keep (P.optional (keyword "unnamed"))),
     P.skipThen
       (keyword "options")
       (P.pure (\n fs ->
@@ -908,7 +967,7 @@ fun cliProblems (parts : [Part]) (cs : [Declared]) : Maybe TokenTree =
     V.concatMap
       (\p ->
         match p with
-        | GivenNone n at ->
+        | GivenNone n at _ ->
             if V.elem n names then [] else [Fail "there is no command `${n}` to run" at]
         | Everywhere fs ->
             V.concatMap
@@ -945,7 +1004,13 @@ fun twice (fs : [Field]) : [TokenTree] =
 fun misplaced (f : Field) : [TokenTree] =
   let has = \what -> not (V.isEmpty (saidOf f what)) in
   let k = fieldKind f in
-  if not (isFlag k) and V.any has ["short", "alias", "as", "value", "split", "default"] then
+  if has "after" and not (isLast k) then
+    [Fail
+       "`${fieldName f}` cannot be what follows a `--`: only the rest of the arguments, a `[T]`, can"
+       (fieldAt f)]
+  else if has "after" and saidOf f "after" != ["--"] then
+    [Fail "`${fieldName f}` is after `--`: there is nothing else for it to be after" (fieldAt f)]
+  else if not (isFlag k) and V.any has ["short", "alias", "as", "value", "split", "default"] then
     [Fail
        "`${fieldName f}` is an argument, not a flag: it has no other name, and nothing it is otherwise"
        (fieldAt f)]
@@ -966,7 +1031,7 @@ fun misplaced (f : Field) : [TokenTree] =
 fun longName (f : Field) : String = M.unwrapOr (dashed (fieldName f)) (V.get (saidOf f "as") 0)
 
 fun unreachable (fs : [Field]) : [TokenTree] =
-  let pos = V.filter (\f -> not (isFlag (fieldKind f))) fs in
+  let pos = V.filter (\f -> not (isFlag (fieldKind f)) and not (isLast (fieldKind f))) fs in
   V.concatMap
     (\i ->
       match (V.get pos i, V.get pos (i + 1)) with
@@ -1006,6 +1071,7 @@ fun kindCode k =
   | KMany x -> "(LinguaCli.kMany ${kindCode x})"
   | KOption x -> "(LinguaCli.kOption ${kindCode x})"
   | KChoice names -> "(LinguaCli.kChoice [${S.join ", " (V.map quoted names)}])"
+  | KLast x -> "(LinguaCli.kLast ${kindCode x})"
 
 fun kindType k =
   match k with
@@ -1017,6 +1083,7 @@ fun kindType k =
   | KOption (KMany x) -> "[${kindType x}]"
   | KOption x -> "(Maybe ${kindType x})"
   | KMany x -> "[${kindType x}]"
+  | KLast x -> "[${kindType x}]"
 
 -- `v`, a `Value`, as what a field of kind `k` holds.
 fun readBack k v =
@@ -1029,6 +1096,7 @@ fun readBack k v =
   | KOption (KMany x) -> "LinguaCli.many (\\y -> ${readBack x "y"}) (${v})"
   | KOption x -> "LinguaCli.maybe (\\y -> ${readBack x "y"}) (${v})"
   | KMany x -> "LinguaCli.many (\\y -> ${readBack x "y"}) (${v})"
+  | KLast x -> "LinguaCli.many (\\y -> ${readBack x "y"}) (${v})"
 
 -- An option that is something where it is not given holds that, and no
 -- `Maybe`.
@@ -1070,8 +1138,9 @@ fun cliCode pub t prog about (parts : [Part]) cs =
   let none =
     M.unwrapOr
       ""
-      (V.get (V.concatMap (\p -> match p with | GivenNone n _ -> [n] | _ -> []) parts) 0)
+      (V.get (V.concatMap (\p -> match p with | GivenNone n _ _ -> [n] | _ -> []) parts) 0)
   in
+  let unnamed = V.any (\p -> match p with | GivenNone _ _ u -> u | _ -> False) parts in
   let commandSpec =
     \c ->
       match c with
@@ -1135,7 +1204,7 @@ fun cliCode pub t prog about (parts : [Part]) cs =
   "use Lingua.Cli as LinguaCli
 
 -- `${t}`'s command line, as `Lingua.Cli` reads it.
-${pub}def ${spec} = LinguaCli.specWith ${quoted prog} ${quoted about} [${S.join ", " (V.map commandSpec cs)}] [${S.join ", " (V.map fieldSpec all)}] ${quoted none} ${quoted version}
+${pub}def ${spec} = LinguaCli.specWith ${quoted prog} ${quoted about} [${S.join ", " (V.map commandSpec cs)}] [${S.join ", " (V.map fieldSpec all)}] ${quoted none} ${quoted version} ${if unnamed then "True" else "False"}
 ${types}
 -- A command `${prog}` can be given, and what it was given with it.
 ${pub}data ${t} = ${S.join " | " (V.map ctor cs)}
