@@ -37,6 +37,10 @@
 --                                                  unfinished entry opens
 --                                                  with: a formatter's
 --                                                  (`format!`) `indent<Name>`
+--   commands      [(String, String, String, db -> String -> Reply)]
+--                                                  the language's own lines
+--                                                  that start with `:` -- see
+--                                                  below
 --   prompt        what a line starts with; `history`, the file entries are
 --                 kept in between runs; `theme`, the one it starts in
 --
@@ -53,6 +57,15 @@
 -- that starts with `:` is for the prompt and not the language: `:theme`
 -- lists them, each with a line in its colours and the one that is on
 -- marked, and `:theme quiet` turns one on, for what is typed from then on.
+--
+-- **Commands.** `:help` says what such lines there are, and `:quit` ends the
+-- prompt. A language adds its own with `commands`: each a name, what is
+-- written after it, what help says of it, and what it does -- a function of
+-- the database and the rest of the line, answering a `Reply`: something
+-- `Said`, an `Entry` to be entered as if it had been typed, or `Leave`, which
+-- ends the prompt. Where the language names a command as the prompt names
+-- one of its own, the language's is the one that is run. Tab completes a
+-- command's name.
 --
 -- Only `text` and `eval` are needed. What is written is `runRepl ()`: entries
 -- read, each printed as `eval` says, until there are no more.
@@ -231,7 +244,7 @@ fun sample (theme : Theme) : String =
 -- What a line that starts with `:` does: `:theme` says which themes there
 -- are, the one that is on marked; `:theme name` turns one on. What it says,
 -- and the theme that is on after it.
-@pub fun command (line : String) (on : Theme) : (String, Theme) =
+@pub fun command (line : String) (on : Theme) (has : [String]) : (String, Theme) =
   let words = V.filter (\w -> not (S.isEmpty w)) (S.split " " (S.trim line)) in
   let listed =
     S.join
@@ -246,7 +259,81 @@ fun sample (theme : Theme) : String =
          (match themeNamed name with
           | Just t -> ("${sample t}", t)
           | None -> ("no theme is called `${name}`:\n${listed}", on))
-     | (other, _) -> ("`${other}` is not something this prompt does: it has `:theme`", on)
+     | (other, _) ->
+         (
+           "`${other}` is not something this prompt does: it has ${S.join ", " (V.map (\n -> "`:${n}`") has)}",
+           on
+         )
+
+-- --- commands ----------------------------------------------------------------
+--
+-- A line that starts with `:` is a command: the prompt's own -- `:help`,
+-- `:quit`, `:theme` -- or one the language gave it. A language's command is
+-- its name, what is written after it, what help says of it, and what it
+-- does, given the database and the rest of the line.
+
+-- What a command answers: something said; an entry, entered as if it had
+-- been typed; or something said, and the prompt ended.
+@derive(Debug, PartialEq)
+@pub data Reply = Said String | Entry String | Leave String
+
+-- The commands every prompt has: each its name, what is written after it,
+-- and what help says of it.
+@pub def ownCommands : [(String, String, String)] =
+  [
+    ("help", "", "what this prompt does"),
+    ("quit", "", "end the prompt"),
+    ("theme", "[NAME]", "the themes there are, or the one named turned on")
+  ]
+
+-- A command line's name, without its colon, and the rest of it.
+@pub fun commandOf (line : String) : (String, String) =
+  let t = S.trim line in
+  let word = V.getOr "" (S.split " " t) 0 in
+  (
+    stringSlice word 1 (stringByteLength word),
+    S.trim (stringSlice t (stringByteLength word) (stringByteLength t))
+  )
+
+-- Every command a prompt with `commands` has, by name: the language's, then
+-- the prompt's own that the language did not give one of the same name.
+@pub fun commandNames commands : [String] =
+  let given = V.map (\c -> match c with | (n, _, _, _) -> n) commands in
+  V.append
+    given
+    (V.filter
+       (\n -> not (V.elem n given))
+       (V.map (\c -> match c with | (n, _, _) -> n) ownCommands))
+
+-- What `:help` says: each command, what is written after it, and what it is
+-- for -- the language's first.
+@pub fun helped commands : String =
+  let given = V.map (\c -> match c with | (n, a, about, _) -> (n, a, about)) commands in
+  let names = V.map (\c -> match c with | (n, _, _) -> n) given in
+  let rows =
+    V.append given (V.filter (\o -> match o with | (n, _, _) -> not (V.elem n names)) ownCommands)
+  in
+  let head =
+    \r ->
+      match r with
+      | (n, a, _) -> if S.isEmpty a then ":${n}" else ":${n} ${a}"
+  in
+  let wide = V.foldl (\w r -> max w (S.charLength (head r))) 0 rows in
+  S.join
+    "\n"
+    (V.map
+       (\r ->
+         match r with
+         | (_, _, about) -> "${head r}${S.repeat " " (wide + 2 - S.charLength (head r))}${about}")
+       rows)
+
+-- What Tab offers in a command line: the commands that start as the name
+-- after the colon does, while the cursor is in it, and nothing after it.
+@pub fun commandCandidates (text : String) (at : Int) (names : [String]) : (Int, [String]) =
+  let from = nameStart text at in
+  if S.trim (S.fromChars (V.take (S.chars text) from)) == ":" then
+    candidates text at (V.map (\n -> (n, "")) names)
+  else (at, [])
 
 fun isNameChar (c : Char) : Bool = C.isAlphaNum c or C.code c == 95 or C.code c == 39
 
@@ -371,8 +458,8 @@ fun finding (f : Finder) : Maybe String ! { Console | e } =
 
 -- The line's editor, of what the compiler says of a text: its tree, where
 -- the parser's errors are, what a kind is called, what the next line opens
--- with, what could be written at a byte of it, and what there is to find --
--- none, for a prompt with no finder.
+-- with, what could be written at a byte of it, what there is to find --
+-- none, for a prompt with no finder -- and the names of its commands.
 @pub fun editorOf
     theme
     (prompt : String)
@@ -382,7 +469,8 @@ fun finding (f : Finder) : Maybe String ! { Console | e } =
     name
     indentOf
     completionsOf
-    declsOf =
+    declsOf
+    (commands : [String]) =
   let found =
     \text at ->
       match find (declsOf text) with
@@ -407,37 +495,72 @@ fun finding (f : Finder) : Maybe String ! { Console | e } =
              | None -> coloured (getRef theme) name (treeOf t),
        finished = \t -> isCommand t or not (unfinished t (errorsOf t)),
        indent = \t -> indentOf (treeOf t),
-       complete = \t at -> candidates t at (completionsOf t (byteAt t at)),
+       complete =
+         \t at ->
+           if isCommand t then commandCandidates t at commands
+           else candidates t at (completionsOf t (byteAt t at)),
        bindings = [(T.ctrl "f", found)]
      }
 
 -- Entries read with `editor` and each printed as `eval` says, until there
 -- are no more: kept in the file `history`, when it names one.
 -- `editorOn` is the editor, given the cell the theme that is on is kept in:
--- a line that starts with `:` is the prompt's own, and may change it.
-@pub fun run editorOn (theme : String) (history : String) eval =
+-- a line that starts with `:` is a command, and may change it. `commands`
+-- are the language's own, each given `db` and the rest of its line.
+@pub fun run editorOn (theme : String) (history : String) eval db commands =
   let on = newRef (themeOr theme) in
-  entering (editorOn on) on history eval (if S.isEmpty history then [] else LE.loadHistory history)
+  entering
+    (editorOn on)
+    on
+    history
+    eval
+    db
+    commands
+    (if S.isEmpty history then [] else LE.loadHistory history)
 
 -- Whether a line is for the prompt itself, not the language.
 @pub fun isCommand (text : String) : Bool = S.startsWith ":" (S.trimStart text)
 
-fun entering editor on (history : String) eval (before : [String]) =
+-- An entry evaluated: kept in the history's file, and what `eval` says of
+-- it written.
+fun entered (history : String) eval (text : String) =
+  let u = if S.isEmpty history then () else LE.saveEntry history text in
+  writeOutput (eval text ++ "\n")
+
+fun entering editor on (history : String) eval db commands (before : [String]) =
   match LE.readEntry editor before with
   | Outcome.Ended -> ()
-  | Outcome.Interrupted -> entering editor on history eval before
+  | Outcome.Interrupted -> entering editor on history eval db commands before
   | Outcome.Entered text ->
-      if S.isEmpty (S.trim text) then entering editor on history eval before
+      if S.isEmpty (S.trim text) then entering editor on history eval db commands before
       else if isCommand text then
-        (match command text (getRef on) with
-         | (said, now) ->
-             let u = setRef on now in
-             let w = writeOutput (said ++ "\n") in
-             entering editor on history eval (V.pushBack before text))
+        let again = V.pushBack before text in
+        let say = \said -> if S.isEmpty said then () else writeOutput (said ++ "\n") in
+        (match commandOf text with
+         | (name, rest) ->
+             match V.find (\c -> match c with | (n, _, _, _) -> n == name) commands with
+             | Just (_, _, _, act) ->
+                 (match act db rest with
+                  | Reply.Said said ->
+                      (let w = say said in entering editor on history eval db commands again)
+                  | Reply.Entry entry ->
+                      (let w = entered history eval entry in
+                       entering editor on history eval db commands again)
+                  | Reply.Leave said -> say said)
+             | None ->
+                 if name == "quit" then ()
+                 else if name == "help" then
+                   (let w = say (helped commands) in
+                    entering editor on history eval db commands again)
+                 else
+                   (match command text (getRef on) (commandNames commands) with
+                    | (said, now) ->
+                        let u = setRef on now in
+                        let w = say said in
+                        entering editor on history eval db commands again))
       else
-        let u = if S.isEmpty history then () else LE.saveEntry history text in
-        let w = writeOutput (eval text ++ "\n") in
-        entering editor on history eval (V.pushBack before text)
+        let w = entered history eval text in
+        entering editor on history eval db commands (V.pushBack before text)
 
 -- --- repl! -------------------------------------------------------------------
 
@@ -476,8 +599,8 @@ def replCall : Parser Tokens (Bool, String, String, String, [ReplFeature]) =
 
 def replFeatures : [String] =
   [
-    "text", "eval", "tree", "errors", "completion", "declarations", "indent", "prompt", "history",
-    "theme"
+    "text", "eval", "tree", "errors", "completion", "declarations", "indent", "commands", "prompt",
+    "history", "theme"
   ]
 
 def replWritten : [String] = ["prompt", "history", "theme"]
@@ -550,16 +673,20 @@ fun replCode pub name lang db (server : Maybe String) fs =
     (match given "declarations" with
      | Just f -> "(\\t -> ${setting "t"}${f} db 0))"
      | None -> "(\\t -> [])")
-  in "use Lingua.Repl as LinguaRepl
+  in
+  let commands = M.unwrapOr "[]" (given "commands") in
+  "use Lingua.Repl as LinguaRepl
 
 -- ${lang}'s prompt: entries read and evaluated until there are no more.
 ${pub}fun run${name} () =
   let db = new${db} () in
   LinguaRepl.run
-    (\\theme -> LinguaRepl.editorFor theme ${quoted (M.unwrapOr "> " (given "prompt"))} ${paint} ${tree} ${errors} (\\k -> display k) ${indent} ${completion} ${decls})
+    (\\theme -> LinguaRepl.editorFor theme ${quoted (M.unwrapOr "> " (given "prompt"))} ${paint} ${tree} ${errors} (\\k -> display k) ${indent} ${completion} ${decls} (LinguaRepl.commandNames ${commands}))
     ${quoted (fn "theme")}
     ${quoted (fn "history")}
     (\\t -> ${setting "t"}${fn "eval"} db 0))
+    db
+    ${commands}
 "
 
 fun quoted (s : String) : String =
@@ -587,9 +714,11 @@ fun quoted (s : String) : String =
     name
     indentOf
     completionsOf
-    declsOf =
+    declsOf
+    (commands : [String]) =
   match treeOf with
-  | Just tree -> editorOf theme prompt paint tree errorsOf name indentOf completionsOf declsOf
+  | Just tree ->
+      editorOf theme prompt paint tree errorsOf name indentOf completionsOf declsOf commands
   | None ->
       {
         LE.editor | prompt,
@@ -598,7 +727,8 @@ fun quoted (s : String) : String =
           \t ->
             match paint with
             | Just shown -> if isCommand t then t else shown (getRef theme) t
-            | None -> t
+            | None -> t,
+        complete = \t at -> if isCommand t then commandCandidates t at commands else (at, [])
       }
 
 -- --- tests -------------------------------------------------------------------
@@ -723,6 +853,7 @@ fun after (ks : [Key]) : (Finder, Found) =
 
 @test fun aLineForThePromptChoosesATheme () =
   let on = themeOr "bright" in
+  let command = \line th -> command line th ["help", "quit", "theme"] in
   let a = assertEq (themeName (snd (command ":theme warm" on))) "warm" "the one named" in
   let b =
     assertEq
@@ -750,6 +881,44 @@ fun after (ks : [Key]) : (Finder, Found) =
       ("bright", True)
       "one nobody has changes nothing, and is said"
   in assertEq
-       (S.startsWith "`:quit` is not something this prompt does" (fst (command ":quit" on)))
-       True
-       "and what is not a command is said not to be"
+       (fst (command ":mauve" on))
+       "`:mauve` is not something this prompt does: it has `:help`, `:quit`, `:theme`"
+       "and what is not a command is said not to be, with what there is"
+
+def spoken : [(String, String, String, () -> String -> Reply)] =
+  [
+    ("type", "EXPR", "what an expression is", \db rest -> Reply.Said "${rest} : Int"),
+    ("quit", "", "leave, saying so", \db rest -> Reply.Leave "bye")
+  ]
+
+@test fun aCommandIsItsNameAndTheRestOfItsLine () =
+  let a = assertEq (commandOf ":type  1 + 2 ") ("type", "1 + 2") "the name, and what is after it" in
+  let b = assertEq (commandOf "  :help") ("help", "") "with nothing after it" in
+  assertEq (commandOf ":") ("", "") "and a colon alone names nothing"
+
+@test fun aPromptHasItsOwnCommandsAndTheLanguages () =
+  let a =
+    assertEq (commandNames (V.take spoken 0)) ["help", "quit", "theme"] "its own, with none given"
+  in
+  let b =
+    assertEq
+      (commandNames spoken)
+      ["type", "quit", "help", "theme"]
+      "the language's first, and its own `quit` in place of the prompt's"
+  in assertEq
+       (S.split "\n" (helped spoken))
+       [
+         ":type EXPR     what an expression is",
+         ":quit          leave, saying so",
+         ":help          what this prompt does",
+         ":theme [NAME]  the themes there are, or the one named turned on"
+       ]
+       "and help says each, what is written after it, and what it is for"
+
+@test fun tabCompletesACommandsName () =
+  let names = commandNames spoken in
+  let a =
+    assertEq (commandCandidates ":t" 2 names) (1, ["type", "theme"]) "what starts as it does"
+  in
+  let b = assertEq (commandCandidates ":" 1 names) (1, names) "every one, after the colon alone" in
+  assertEq (commandCandidates ":type qu" 8 names) (8, []) "and nothing after the name"

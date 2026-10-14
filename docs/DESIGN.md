@@ -838,6 +838,11 @@ that is worked out again, so hovering after an edit reads an elaboration that
 was only redone for the file that changed. The protocol is Lingua's -- its
 framing, which needs Meadow's `Console.readExact`, its UTF-16 positions, the
 documents open -- and the server says it can do exactly what it was given.
+What Lingua has no feature for is the language's to answer: `requests` are
+methods and what answers each, a function of the database and what was asked
+-- the file, its text, the byte pointed at, the parameters as they came -- so
+that hints, lenses, workspace symbols and a method only this language has
+(`miniml/type`) are each a query like any other.
 
 **`repl!`** declares a prompt over the compiler's database, with the
 server's features: what is being typed is a file of the session, and `text`,
@@ -857,7 +862,11 @@ is -- `tokensServer`, which is also what it tells the editor, name resolution
 and all -- and where it has none, from the tree. How each class is shown is a
 theme, of which a prompt has several built in; a line that starts with `:` is
 for the prompt and not the language, and `:theme` lists them, each in its own
-colours, while `:theme quiet` turns one on. What is written is `runRepl ()`.
+colours, while `:theme quiet` turns one on; `:help` says what such lines
+there are and `:quit` ends the prompt. `commands` are the language's own:
+each a name, what is written after it, what help says of it, and a function
+of the database and the rest of the line that says something, enters an
+entry, or ends the prompt. What is written is `runRepl ()`.
 
 The line, the finder's matching and its drawing are packages of their own,
 which a compiler not written with Lingua can use as well:

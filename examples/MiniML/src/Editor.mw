@@ -5,6 +5,10 @@
 
 use Lingua (lsp!, repl!)
 use Lingua.Green (Green)
+use Lingua.Repl (Reply)
+use Lingua.Lsp (Asked, positionIn)
+use Std.Json as J
+use Std.String as S
 use Lingua.Red (Syntax)
 use Lingua.Red as R
 use Lingua.Diagnostic (renderToOutput)
@@ -31,7 +35,30 @@ lsp! {
     | symbols = symbolsOf
     | format = formattedOf
     | resolved = resolvedOf
+    | requests = serverRequests
 }
+
+-- What MiniML's server answers itself: a request of its own, for what the
+-- program in a file is, and one of the protocol's that Lingua has no
+-- feature for -- a hint after the program, saying the same.
+def serverRequests =
+  [
+    ("miniml/type", \db (a : Asked) -> J.jString (typeIn db a.file)),
+    ("textDocument/inlayHint", hintsOf)
+  ]
+
+fun typeIn db file = answered "" (\() -> match sessionTyped db file with | Ok t -> t | Err _ -> "")
+
+fun hintsOf db (a : Asked) =
+  let t = typeIn db a.file in
+  if S.isEmpty t then J.jArray []
+  else
+    J.jArray
+      [J.jObject [
+         ("position", positionIn a (stringByteLength (S.trimEnd a.text))),
+         ("label", J.jString ": ${t}"),
+         ("paddingLeft", J.jBool True)
+       ]]
 
 -- The prompt (`repl!`), over the same session and with the server's own
 -- features: what is typed is coloured from its tree, an entry the parser
@@ -47,6 +74,7 @@ repl! {
     | completion = completionAt
     | declarations = declarationsOf
     | indent = indentStyle
+    | commands = promptCommands
     | prompt = "> "
     | history = ".miniml_history"
 }
@@ -58,6 +86,26 @@ fun shownIn db file =
   | Ok (Ok out) -> out
   | Ok (Err ds) -> renderToOutput "input.ml" (answered "" (\() -> sessionSource db file)) ds
   | Err e -> "miniml: a query could not be answered"
+
+-- MiniML's own lines at the prompt: `:type`, what an expression is without
+-- running it, and `:try`, which enters one to see.
+def promptCommands =
+  [
+    ("type", "EXPR", "what an expression is, without running it", typeOfEntry),
+    (
+      "try",
+      "",
+      "enter an example",
+      \db rest -> Reply.Entry "let double = fun x -> x + x in double 21"
+    )
+  ]
+
+fun typeOfEntry db rest =
+  let u = setSessionSource db 0 rest in
+  match toResult (\() -> sessionTyped db 0) with
+  | Ok (Ok t) -> Reply.Said "${rest} : ${t}"
+  | Ok (Err ds) -> Reply.Said (renderToOutput "input.ml" rest ds)
+  | Err e -> Reply.Said "miniml: a query could not be answered"
 
 -- Where the parser found something wrong.
 fun errorsOf db file = answered [] (\() -> V.map fst (snd (sessionParsed db file)))
@@ -269,7 +317,6 @@ use Std.Terminal as T
 use Std.Terminal (Event, Key)
 use Std.Terminal.Code.*
 use Std.Char as C
-use Std.String as S
 use Std.Fs (removeFile)
 
 fun typing (text : String) : [Key] = V.map (\c -> T.key (Character (C.toString c))) (S.chars text)
@@ -424,3 +471,93 @@ use Lingua.Lsp (classOf)
     (S.contains "34 : Int" out and not (S.contains "Error" out))
     True
     "and the line that chose it was no program"
+
+@test fun aCommandOfTheLanguagesIsRunWithTheRestOfItsLine () =
+  let out = prompted (V.append (typing ":type 1 + 2") [T.key Enter]) in
+  assertEq
+    (S.contains "1 + 2 : Int\n" out and not (S.contains "3 : Int" out))
+    True
+    "what it is, and it was not run"
+
+@test fun aCommandMayEnterAnEntry () =
+  assertEq
+    (S.contains "42 : Int\n" (prompted (V.append (typing ":try") [T.key Enter])))
+    True
+    "what `:try` enters is evaluated as if it had been typed"
+
+@test fun helpSaysTheLanguagesCommandsAndThePromptsOwn () =
+  let out = prompted (V.append (typing ":help") [T.key Enter]) in
+  assertEq
+    (S.contains ":type EXPR" out and S.contains ":theme [NAME]" out and S.contains ":quit" out)
+    True
+    "each with what is written after it"
+
+@test fun quitEndsThePrompt () =
+  let out = prompted (V.concat [typing ":quit", [T.key Enter], typing "12", [T.key Enter]]) in
+  assertEq (S.contains "12 : Int" out) False "what is typed after it is not read"
+
+@test fun tabCompletesACommandAtThePrompt () =
+  assertEq
+    (S.contains
+       "7 : Int\n"
+       (prompted (V.concat [typing ":ty", [T.key Tab], typing " 7", [T.key Enter]])))
+    True
+    "`:ty`, Tab, is `:type`"
+
+-- --- the server, told what an editor would tell it ---------------------------
+
+use Lingua.Lsp (told)
+use Std.Json (Json)
+
+fun message (fields : [(String, Json)]) : Json =
+  J.jObject (V.pushFront fields ("jsonrpc", J.jString "2.0"))
+
+fun asking (id : Int) (method : String) (params : Json) : Json =
+  message [("id", J.jInt id), ("method", J.jString method), ("params", params)]
+
+fun inFile (uri : String) : Json = J.jObject [("textDocument", J.jObject [("uri", J.jString uri)])]
+
+fun opening (uri : String) (text : String) : Json =
+  message [
+    ("method", J.jString "textDocument/didOpen"),
+    (
+      "params",
+      J.jObject [("textDocument", J.jObject [("uri", J.jString uri), ("text", J.jString text)])]
+    )
+  ]
+
+@test fun theServerAnswersARequestOfMiniMLsOwn () =
+  let said =
+    told
+      [opening "file:///a.ml" "1 + 2\n", asking 1 "miniml/type" (inFile "file:///a.ml")]
+      serveServer
+  in assertEq
+       (M.andThen (J.get "result") (V.get said 1))
+       (Just (J.jString "Int"))
+       "what the program is, from the session an edit set the text of"
+
+@test fun theServerAnswersAMethodLinguaHasNoFeatureFor () =
+  let said =
+    told
+      [
+        asking 1 "initialize" (J.jObject []),
+        opening "file:///a.ml" "1 + 2\n",
+        asking 2 "textDocument/inlayHint" (inFile "file:///a.ml")
+      ]
+      serveServer
+  in
+  let a =
+    assertEq
+      (M.andThen (J.path ["result", "capabilities", "inlayHintProvider"]) (V.get said 0))
+      (Just (J.jBool True))
+      "it says it gives hints, having been given what answers them"
+  in assertEq
+       (M.andThen (J.get "result") (V.get said 2))
+       (Just
+          (J.jArray
+             [J.jObject [
+                ("position", J.jObject [("line", J.jInt 0), ("character", J.jInt 5)]),
+                ("label", J.jString ": Int"),
+                ("paddingLeft", J.jBool True)
+              ]]))
+       "a hint where the program ends, saying what it is"

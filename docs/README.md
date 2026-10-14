@@ -13,7 +13,8 @@ write, what gets generated, the defaults, the errors and the limits.
 | [languages.md](languages.md)       | `lang!`: names scoped by sort, `Core.Expr.Lam` with `with modules`, readers that read a program being written, `with set` and `with reflect` |
 | [passes.md](passes.md)             | `pass!`: what the traversal does on its own, `Sort.Prod` cases, `node`, cases that answer several nodes, and `from` for a pass over part of a program |
 | [format.md](format.md)             | `format!`: rules, layout within a width, indent-only mode, and the next line's indent |
-| [repl.md](repl.md)                 | `repl!`: features, multi-line entries, keys, completion, the finder, themes and `:theme` |
+| [server.md](server.md)             | `lsp!`: features, a language's own requests, what the server says it can do, and testing one |
+| [repl.md](repl.md)                 | `repl!`: features, multi-line entries, keys, completion, the finder, themes, and commands: `:help`, `:quit`, `:theme` and a language's own |
 | [highlighting.md](highlighting.md) | semantic tokens: how a token gets its class, `resolved`, and how the editor and the prompt share one answer |
 
 Most examples in the guides are taken from tested code in

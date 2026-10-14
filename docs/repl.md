@@ -37,6 +37,7 @@ Only `text` and `eval` are required. Each of the others turns something on.
 | `completion`   | `db -> Int -> Int -> [(String, String)]`     | Tab: names and what each is, at a byte     |
 | `declarations` | `db -> Int -> [(String, String, String)]`    | Ctrl-F: name, what it is, what is said of it |
 | `indent`       | `Green k -> String`                          | what a continuation line opens with        |
+| `commands`     | `[(String, String, String, db -> String -> Reply)]` | the language's own `:` lines        |
 | `prompt`       | text                                         | what a line starts with; `"> "` if omitted |
 | `history`      | text                                         | the file entries are kept in between runs  |
 | `theme`        | text                                         | the theme it starts in; `soft` if omitted  |
@@ -173,13 +174,70 @@ A line that starts with `:` is for the prompt, not the language. It is not
 coloured, never counts as unfinished, is not evaluated, and is not written to
 the history file.
 
+Every prompt has three:
+
 | command        | does                                                             |
 | -------------- | ---------------------------------------------------------------- |
+| `:help`        | list the commands, each with what is written after it and what it is for |
+| `:quit`        | end the prompt                                                   |
 | `:theme`       | list the themes, each with a sample in its colours, the current one marked `*` |
 | `:theme quiet` | switch to that theme for what is typed from then on              |
 
-An unknown theme lists the ones there are. Anything else after `:` is answered
-with `` `:x` is not something this prompt does: it has `:theme` ``.
+An unknown theme lists the ones there are. A name that is no command is
+answered with what there is: `` `:x` is not something this prompt does: it has
+`:type`, `:help`, `:quit`, `:theme` ``.
+
+Tab completes a command's name while the cursor is in it.
+
+### A language's own
+
+`commands` gives the prompt the language's commands, as a list. Each is four
+things: its name, what is written after it, what `:help` says of it, and what
+it does.
+
+```meadow
+repl! {
+  pub Prompt "miniml" for Session
+    …
+    | commands = promptCommands
+}
+
+def promptCommands =
+  [
+    ("type", "EXPR", "what an expression is, without running it", typeOfEntry),
+    (
+      "try",
+      "",
+      "enter an example",
+      \db rest -> Reply.Entry "let double = fun x -> x + x in double 21"
+    )
+  ]
+
+fun typeOfEntry db rest =
+  let u = setSessionSource db 0 rest in
+  match toResult (\() -> sessionTyped db 0) with
+  | Ok (Ok t) -> Reply.Said "${rest} : ${t}"
+  | Ok (Err ds) -> Reply.Said (renderToOutput "input.ml" rest ds)
+  | Err e -> Reply.Said "miniml: a query could not be answered"
+```
+
+What a command does is a function of the prompt's database and the rest of
+the line, trimmed. It answers a `Lingua.Repl.Reply`:
+
+| reply          | the prompt then                                              |
+| -------------- | ------------------------------------------------------------ |
+| `Said text`    | writes `text`, or nothing if it is empty, and reads on       |
+| `Entry text`   | enters `text` as if it had been typed: evaluated, and kept in the history file |
+| `Leave text`   | writes `text` and ends                                       |
+
+The database is the one the entries are typed into, so a command asks the
+compiler what an entry would: `:type` above sets the text and asks for its
+type. What a command has to remember between lines, such as which module
+entries are read in, it keeps in an input of the database.
+
+A language's command with the name of one of the prompt's own replaces it:
+give a `quit` to say something on the way out, or a `help` to write your own.
+`:help` lists the language's commands first.
 
 ## History
 
@@ -221,12 +279,16 @@ continuation, completion, the finder, colour and themes written this way.
   This waits on interrupt support in Meadow.
 - **The theme is not remembered.** `:theme` lasts for the run; set the starting
   one with `| theme = …`.
-- **`:theme` is the only command.**
+- **Tab completes a command's name, not what follows it.** A command that takes
+  an expression gets no completion inside it.
+- **A command cannot put text on the line to be edited.** `Entry` enters it at
+  once.
 
 ## By hand
 
 Everything `repl!` writes is a call into `Lingua.Repl`, which is usable
 directly: `unfinished`, `candidates`, `painted`, `coloured`, `finder`,
-`findKey`, `findDrawn`, `themes`, `themeNamed`, `command`, `editorOf`, `run`.
+`findKey`, `findDrawn`, `themes`, `themeNamed`, `command`, `commandOf`,
+`commandNames`, `commandCandidates`, `helped`, `editorOf`, `run`.
 The three packages underneath work without Lingua at all, for a compiler not
 written with it.

@@ -36,6 +36,21 @@
 --
 -- Only `text` is needed; the server says it can do what it was given.
 --
+-- **Requests of the language's own** are `requests`: each a method and what
+-- answers it, a function of the database and what was `Asked` -- the file,
+-- its text, the byte the editor points at, and the request's parameters as
+-- they came:
+--
+--   requests      [(String, db -> Asked -> Json)]
+--   capabilities  [(String, Json)]                 what else the server says
+--                                                  it can do
+--
+-- A method of the protocol's that Lingua answers nothing for -- inlay hints,
+-- code lenses, workspace symbols, resolving a completion -- is answered this
+-- way, and the server says it can; so is a method only this language has
+-- (`miniml/type`). One given for a method Lingua does answer is asked in its
+-- place. A request about no open file is asked with file `-1`.
+--
 -- **Colour** is the tree's tokens, each a class -- a keyword, a name, a
 -- number -- by its kind and its spelling; and, with `resolved`, by what the
 -- compiler knows of that occurrence:
@@ -64,7 +79,7 @@ use Std.Maybe as M
 use Std.Char as C
 use Std.Json as J
 use Std.Json (Json)
-use Std.Console (Console, readLine, readExact, writeOutput)
+use Std.Console (Console, readLine, readExact, writeOutput, withOutput)
 use Lingua.Lang (Meta)
 use Lingua.Lang.Meta.*
 use Lingua.Diagnostic (Diagnostic, Severity)
@@ -201,17 +216,71 @@ fun withText (d : Docs) (uri : String) (text : String) : (Docs, Int) =
              next
            ))
 
+-- --- what a language's own request is asked ---------------------------------
+
+-- A request, as a language's own answer to it is given it: its method, the
+-- file it is about -- `-1` for one about none that is open -- that file's
+-- text, the byte its `position` is at, its parameters as they came, and the
+-- documents open.
+@pub record Asked = {
+  @pub method : String,
+  @pub file : Int,
+  @pub text : String,
+  @pub offset : Int,
+  @pub params : Json,
+  @pub docs : Docs,
+}
+
+@pub fun asked
+    (docs : Docs)
+    (method : String)
+    (file : Int)
+    (text : String)
+    (offset : Int)
+    (params : Json)
+    : Asked =
+  Asked { method, file, text, offset, params, docs }
+
+-- Where `m` is in the file asked about, as the protocol says a range.
+@pub fun rangeIn (a : Asked) (m : Meta) : Json = rangeJson a.text (lineStarts a.text) m
+
+-- Byte `offset` of the file asked about, as the protocol says a position.
+@pub fun positionIn (a : Asked) (offset : Int) : Json =
+  posJson (position a.text (lineStarts a.text) offset)
+
+-- A place in any open file, as the protocol says a location.
+@pub fun locationIn (a : Asked) (place : (Int, Meta)) : Json = locationJson a.docs place
+
+-- The byte of the file asked about that a position among the parameters is
+-- at: `byteIn a ["range", "start"]`.
+@pub fun byteIn (a : Asked) (path : [String]) : Int =
+  let p = J.path path a.params in
+  let n = \k -> M.unwrapOr 0 (M.andThen J.asInt (M.andThen (J.get k) p)) in
+  offsetOf a.text (lineStarts a.text) (n "line") (n "character")
+
+-- The methods a language answers itself.
+@pub fun methodsOf requests : [String] = V.map (\r -> match r with | (m, _) -> m) requests
+
+-- A language's own answer to `method`, if it has one.
+@pub fun answered requests db (a : Asked) =
+  M.map (\r -> match r with | (_, act) -> act db a) (V.find (\r -> fst r == a.method) requests)
+
 -- --- serving -----------------------------------------------------------------
 
 -- A language server, until the editor says `exit`: `setText` told of every
 -- edit, `diagnose` asked what is wrong in each open file after it, and
 -- `answer` given every other request -- its method, the file it is about,
 -- the file's text and the byte it points at -- answering `None` for one it
--- cannot.
-@pub fun serve name features setText diagnose answer =
-  loop name features setText diagnose answer (emptyDocs ())
+-- cannot. `own` are the methods the language answers itself, which may be
+-- about no file, and `extra` what else it says the server can do.
+@pub fun serve name features (own : [String]) extra setText diagnose answer =
+  loop (name, features, own, extra) setText diagnose answer (emptyDocs ())
 
-fun loop name features setText diagnose answer docs =
+fun loop about setText diagnose answer docs =
+  match about with
+  | (name, features, own, extra) -> looping about name own setText diagnose answer docs
+
+fun looping about name own setText diagnose answer docs =
   match readMessage () with
   | None -> ()
   | Just msg ->
@@ -221,44 +290,50 @@ fun loop name features setText diagnose answer docs =
       let uri = M.unwrapOr "" (M.andThen J.asString (J.path ["textDocument", "uri"] params)) in
       if method == "exit" then ()
       else if method == "initialize" then
-        (let u = reply (M.unwrapOr (J.jNull ()) id) (initialized name features) in
-         loop name features setText diagnose answer docs)
+        (let u =
+           (match about with
+            | (_, features, _, extra) ->
+                reply (M.unwrapOr (J.jNull ()) id) (initialized name features own extra))
+         in loop about setText diagnose answer docs)
       else if method == "shutdown" then
         (let u = reply (M.unwrapOr (J.jNull ()) id) (J.jNull ()) in
-         loop name features setText diagnose answer docs)
+         loop about setText diagnose answer docs)
       else if method == "textDocument/didOpen" or method == "textDocument/didChange" then
         (let text =
            (if method == "textDocument/didOpen" then
               M.andThen J.asString (J.path ["textDocument", "text"] params)
             else lastChange params)
          in match text with
-            | None -> loop name features setText diagnose answer docs
+            | None -> loop about setText diagnose answer docs
             | Just t ->
                 (match withText docs uri t with
                  | (d2, file) ->
                      (let u = setText file t in
                       let w = publishAll name diagnose d2 in
-                      loop name features setText diagnose answer d2)))
+                      loop about setText diagnose answer d2)))
       else if method == "textDocument/didClose" then
         (let u =
            notify
              "textDocument/publishDiagnostics"
              (J.jObject [("uri", J.jString uri), ("diagnostics", J.jArray [])])
-         in loop name features setText diagnose answer docs)
+         in loop about setText diagnose answer docs)
       else
         match id with
-        | None -> loop name features setText diagnose answer docs
+        | None -> loop about setText diagnose answer docs
         | Just i ->
             (let u =
                (match fileOf docs uri with
-                | None -> reply i (J.jNull ())
+                | None ->
+                    if V.elem method own then
+                      reply i (M.unwrapOr (J.jNull ()) (answer docs method (0 - 1) "" 0 params))
+                    else reply i (J.jNull ())
                 | Just file ->
                     (let t = textOf docs file in
                      match answer docs method file t (offsetIn t params) params with
                      | Just r -> reply i r
                      | None ->
                          replyError i (0 - 32601) "`${method}` is not something this server does"))
-             in loop name features setText diagnose answer docs)
+             in loop about setText diagnose answer docs)
 
 -- The whole text of the last change: the server asks for whole documents.
 fun lastChange params =
@@ -314,10 +389,26 @@ fun severityCode s =
   | Severity.Warning -> 2
   | Severity.Advice -> 3
 
--- What the server can do, from the features it was given.
-fun initialized name features =
+-- What a language that answers `own` itself can do that the features do not
+-- say: the methods of the protocol an editor has to be told of.
+fun owned (own : [String]) : [(String, Json)] =
+  let has = \m -> V.elem m own in
+  V.concat [
+    if has "textDocument/inlayHint" then [("inlayHintProvider", J.jBool True)] else [],
+    if has "textDocument/codeLens" then
+      [("codeLensProvider", J.jObject [("resolveProvider", J.jBool (has "codeLens/resolve"))])]
+    else [],
+    if has "workspace/symbol" then [("workspaceSymbolProvider", J.jBool True)] else []
+  ]
+
+-- What the server can do, from the features it was given, the methods the
+-- language answers itself, and what else it says: of two that say the same
+-- thing, the later.
+fun initialized name features (own : [String]) (extra : [(String, Json)]) =
   let has = \f -> V.elem f features in
   let when = \f fields -> if has f then fields else [] in
+  let said = V.append (owned own) extra in
+  let over = \fields -> V.filter (\f -> not (V.any (\x -> fst x == fst f) said)) fields in
   J.jObject [
     (
       "capabilities",
@@ -351,10 +442,19 @@ fun initialized name features =
              ("documentHighlightProvider", J.jBool True),
              ("renameProvider", J.jObject [("prepareProvider", J.jBool True)])
            ],
-           when "completion" [("completionProvider", J.jObject [])],
+           if has "completion" or V.elem "textDocument/completion" own then
+             [(
+               "completionProvider",
+               J.jObject
+                 (if V.elem "completionItem/resolve" own then [("resolveProvider", J.jBool True)]
+                  else [])
+             )]
+           else [],
            when "symbols" [("documentSymbolProvider", J.jBool True)],
            when "format" [("documentFormattingProvider", J.jBool True)]
-         ])
+         ]
+           |> over
+           |> (\fields -> V.append fields said))
     ),
     ("serverInfo", J.jObject [("name", J.jString name)])
   ]
@@ -618,6 +718,38 @@ fun lineSegments t starts a b =
               ranges)
        positions)
 
+-- --- a server, without an editor ---------------------------------------------
+
+-- What `server` writes when it is sent `messages` and then no more: each of
+-- its replies and notifications, in order. For a test of a server, which
+-- otherwise reads what an editor sends it.
+@pub fun told (messages : [Json]) server =
+  let bodies = V.map J.render messages in
+  -- Which message is next, and how much of it has been read: nothing, the
+  -- line that says how long it is, or the empty line after that.
+  let feed =
+    handle withOutput server with {
+      readLine () k ->
+        \next part ->
+          (match V.get bodies next with
+           | None -> (k None) next part
+           | Just body ->
+               if part == 0 then (k (Just "Content-Length: ${show (stringByteLength body)}")) next 1
+               else (k (Just "")) next 2),
+      readExact n k -> \next part -> (k (V.get bodies next)) (next + 1) 0,
+      return x -> \next part -> x
+    }
+  in written (snd (feed 0 0))
+
+-- The messages in what a server wrote.
+@pub fun written (out : String) : [Json] =
+  V.concatMap
+    (\piece ->
+      match V.get (S.split "\r\n\r\n" piece) 1 with
+      | None -> []
+      | Just body -> (match J.parse body with | Ok j -> [j] | Err _ -> []))
+    (S.split "Content-Length: " out)
+
 -- --- lsp! --------------------------------------------------------------------
 
 use Std.Macro (TokenTree, Loc, isPunct, defineAs)
@@ -633,7 +765,7 @@ use Lingua.Pipe (named)
 def features : [String] =
   [
     "text", "diagnostics", "tree", "hover", "definition", "references", "completion", "symbols",
-    "format", "resolved"
+    "format", "resolved", "requests", "capabilities"
   ]
 
 -- `| hover = hoverAt`: a feature, where it was written, and the function.
@@ -688,6 +820,14 @@ fun lspCode pub name lang db fs =
     \f method reply ->
       if has f then "    else if method == \"${method}\" then Just (${reply})\n" else ""
   in
+  let requests = if has "requests" then fn "requests" else "[]" in
+  -- A language's own answer comes first, so that it may answer in Lingua's
+  -- place; and nothing of Lingua's is asked of no file.
+  let ownArm =
+    if has "requests" then
+      "    else if LinguaV.elem method (LinguaLsp.methodsOf ${requests}) then LinguaLsp.answered ${requests} db (LinguaLsp.asked docs method file t offset params)\n    else if file < 0 then None\n"
+    else ""
+  in
   let tree = "(${fn "tree"} db file)" in
   let refs = "(${fn "references"} db file offset)" in
   "use Lingua.Lsp as LinguaLsp
@@ -700,11 +840,13 @@ ${pub}fun serve${name} () =
   LinguaLsp.serve
     \"${lang}\"
     [${S.join ", " (V.map (\f -> "\"${fst (fst f)}\"") fs)}]
+    (LinguaLsp.methodsOf ${requests})
+    ${if has "capabilities" then fn "capabilities" else "[]"}
     (\\file t -> ${fn "text"} db file t)
     (\\file -> ${if has "diagnostics" then "${fn "diagnostics"} db file" else "[]"})
     (\\docs method file t offset params ->
     if False then None
-${arm "hover" "textDocument/hover" "LinguaLsp.hoverReply t (${fn "hover"} db file offset)"}${arm "tree" "textDocument/semanticTokens/full" "LinguaLsp.tokensReply t (tokens${name} db file)"}${arm "tree" "textDocument/foldingRange" "LinguaLsp.foldingReply t ${tree}"}${arm "tree" "textDocument/selectionRange" "LinguaLsp.selectionReply t ${tree} params"}${arm "definition" "textDocument/definition" "LinguaLsp.locationsReply docs (${fn "definition"} db file offset)"}${arm "references" "textDocument/references" "LinguaLsp.locationsReply docs ${refs}"}${arm "references" "textDocument/documentHighlight" "LinguaLsp.highlightsReply t file ${refs}"}${arm "references" "textDocument/prepareRename" "LinguaLsp.prepareRenameReply t file offset ${refs}"}${arm "references" "textDocument/rename" "LinguaLsp.renameReply docs ${refs} (LinguaLsp.newName params)"}${arm "completion" "textDocument/completion" "LinguaLsp.completionReply (${fn "completion"} db file offset)"}${arm "symbols" "textDocument/documentSymbol" "LinguaLsp.symbolsReply t (${fn "symbols"} db file)"}${arm "format" "textDocument/formatting" "LinguaLsp.formatReply t (${fn "format"} db file)"}    else None)
+${ownArm}${arm "hover" "textDocument/hover" "LinguaLsp.hoverReply t (${fn "hover"} db file offset)"}${arm "tree" "textDocument/semanticTokens/full" "LinguaLsp.tokensReply t (tokens${name} db file)"}${arm "tree" "textDocument/foldingRange" "LinguaLsp.foldingReply t ${tree}"}${arm "tree" "textDocument/selectionRange" "LinguaLsp.selectionReply t ${tree} params"}${arm "definition" "textDocument/definition" "LinguaLsp.locationsReply docs (${fn "definition"} db file offset)"}${arm "references" "textDocument/references" "LinguaLsp.locationsReply docs ${refs}"}${arm "references" "textDocument/documentHighlight" "LinguaLsp.highlightsReply t file ${refs}"}${arm "references" "textDocument/prepareRename" "LinguaLsp.prepareRenameReply t file offset ${refs}"}${arm "references" "textDocument/rename" "LinguaLsp.renameReply docs ${refs} (LinguaLsp.newName params)"}${arm "completion" "textDocument/completion" "LinguaLsp.completionReply (${fn "completion"} db file offset)"}${arm "symbols" "textDocument/documentSymbol" "LinguaLsp.symbolsReply t (${fn "symbols"} db file)"}${arm "format" "textDocument/formatting" "LinguaLsp.formatReply t (${fn "format"} db file)"}    else None)
 "
 
 -- --- tests -------------------------------------------------------------------
@@ -739,6 +881,88 @@ use Std.Collections.HashMap (HashMap)
      ])
     [Just 0, Just 4, Just 5, Just 7, Just 9, None]
     "keyword, name, number, operator, comment, nothing"
+
+fun request (id : Int) (method : String) (params : Json) : Json =
+  J.jObject [
+    ("jsonrpc", J.jString "2.0"),
+    ("id", J.jInt id),
+    ("method", J.jString method),
+    ("params", params)
+  ]
+
+fun opening (uri : String) (text : String) : Json =
+  J.jObject [
+    ("jsonrpc", J.jString "2.0"),
+    ("method", J.jString "textDocument/didOpen"),
+    (
+      "params",
+      J.jObject [("textDocument", J.jObject [("uri", J.jString uri), ("text", J.jString text)])]
+    )
+  ]
+
+fun about (uri : String) : Json = J.jObject [("textDocument", J.jObject [("uri", J.jString uri)])]
+
+-- A server with nothing but a language's own requests: how long the file
+-- asked about is, and one that is about no file.
+fun lengths () =
+  let own =
+    [
+      ("test/length", \db (a : Asked) -> J.jInt (stringByteLength a.text)),
+      ("workspace/symbol", \db (a : Asked) -> J.jInt a.file)
+    ]
+  in serve
+       "test"
+       ["text"]
+       (methodsOf own)
+       [("experimental", J.jBool True)]
+       (\file t -> ())
+       (\file -> [])
+       (\docs method file t offset params ->
+         answered own () (asked docs method file t offset params))
+
+fun resultOf (j : Json) : Maybe Json = J.get "result" j
+
+@test fun aLanguagesOwnRequestIsAnsweredOfTheFileAskedAbout () =
+  let said =
+    told
+      [
+        opening "file:///a" "let x = 1",
+        request 1 "test/length" (about "file:///a"),
+        request 2 "test/other" (about "file:///a")
+      ]
+      lengths
+  in
+  let a =
+    assertEq
+      (M.andThen resultOf (V.get said 1))
+      (Just (J.jInt 9))
+      "after the file's diagnostics, the language's answer: the text is what was opened"
+  in assertEq
+       (M.andThen (J.path ["error", "code"]) (V.get said 2))
+       (Just (J.jInt (0 - 32601)))
+       "and a method nobody answers is said not to be one"
+
+@test fun aRequestAboutNoFileIsAskedOfTheLanguageOnlyIfItIsItsOwn () =
+  let said =
+    told
+      [
+        request 1 "workspace/symbol" (J.jObject [("query", J.jString "x")]),
+        request 2 "textDocument/hover" (about "file:///nowhere")
+      ]
+      lengths
+  in
+  let a =
+    assertEq (M.andThen resultOf (V.get said 0)) (Just (J.jInt (0 - 1))) "its own, with file -1"
+  in assertEq (M.andThen resultOf (V.get said 1)) (Just (J.jNull ())) "and any other, nothing"
+
+@test fun aServerSaysItCanDoWhatTheLanguageAnswers () =
+  let said = told [request 1 "initialize" (J.jObject [])] lengths in
+  let can = \k -> M.andThen (J.path ["result", "capabilities", k]) (V.get said 0) in
+  let a =
+    assertEq (can "workspaceSymbolProvider") (Just (J.jBool True)) "a method of the protocol's"
+  in
+  let b = assertEq (can "experimental") (Just (J.jBool True)) "what else it says" in
+  assertEq (can "hoverProvider") None "and nothing it was not given"
 
 @test fun tokensAreEncodedFromTheOneBefore () =
   assertEq
