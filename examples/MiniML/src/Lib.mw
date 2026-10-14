@@ -52,6 +52,7 @@ mod Compiler
 mod Editor
 mod Units
 mod Bench
+mod Tool
 
 use Lingua (cli!)
 use Lingua.Diagnostic (renderToOutput)

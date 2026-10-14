@@ -819,7 +819,14 @@ constructor per command, holding what it was given, and `argsX ()`: the
 command the process was started with. `--help`, `help` and `help <command>`
 print help, `completions bash` a completion script, and a mistake is a
 diagnostic like any other -- drawn by Nettle against the command line itself,
-under the argument that is wrong.
+under the argument that is wrong. A flag is its field's name with a dash for
+each capital, and may be given a letter, other names, or its name exactly; an
+`Option [T]` is given any number of times and any other only once; an option
+may be one of a few values, or something where it is not given. Options that
+several commands take are declared once and held by each as one type, so
+what reads them is one function; those every command takes come before the
+command or after it; and a program may say its version, and the command it
+runs when it is given none.
 
 **`lsp!`** declares a language server over the compiler's database: `text` is
 how the editor's text becomes an input, and each other feature a function of
