@@ -56,6 +56,10 @@
 -- - `closeSession db`, which lets go of everything a database holds: its
 --   inputs and every answer. What a compiler calls when it is done with one;
 --   the database can be set and asked again after;
+-- - `interruptSession db`, which stops what a session is working out on
+--   another thread -- every read of it answers `Interrupted` -- and
+--   `allowSession db`, which lets it be asked again: how an input is set
+--   while something is being worked out;
 -- - when a query is `persisted`, `saveSession db path` and `loadSession db
 --   path`.
 --
@@ -181,7 +185,7 @@ fun databaseCode pub db decls : [TokenTree] =
     [Code "\nfun lingua${db}_compute key =\n  match key with"],
     V.concatMap (\d -> computeArm key value d) decls,
     [Code
-       "\n\n-- Let go of everything a `${db}` database holds: for a compiler that is done with one.\n${pub}fun close${db} db = LinguaQ.close db\n\n-- A `${db}` database, every input unset.\n${pub}fun new${db} () = LinguaQ.newDb lingua${db}_compute\n\n-- `${db}` as a batch: each query worked out once, and nothing else kept.\n${pub}fun batch${db} () = LinguaQ.newBatch lingua${db}_compute\n\n-- `db`, with several keys asked at once each on a thread of its own.\n${pub}fun parallel${db} db = LinguaQ.parallel db\n\n-- `parallel${db} db`, a batch's threads sharing the inputs in a compact region.\n${pub}fun shared${db} db = LinguaQ.shared db\n"],
+       "\n\n-- Let go of everything a `${db}` database holds: for a compiler that is done with one.\n${pub}fun close${db} db = LinguaQ.close db\n\n-- Tell a `${db}` database to stop what it is working out, on whatever thread: every read answers `Interrupted` until it is allowed again.\n${pub}fun interrupt${db} db = LinguaQ.interrupt db\n\n-- Let a `${db}` database be asked again, after `interrupt${db}`.\n${pub}fun allow${db} db = LinguaQ.allow db\n\n-- A `${db}` database, every input unset.\n${pub}fun new${db} () = LinguaQ.newDb lingua${db}_compute\n\n-- `${db}` as a batch: each query worked out once, and nothing else kept.\n${pub}fun batch${db} () = LinguaQ.newBatch lingua${db}_compute\n\n-- `db`, with several keys asked at once each on a thread of its own.\n${pub}fun parallel${db} db = LinguaQ.parallel db\n\n-- `parallel${db} db`, a batch's threads sharing the inputs in a compact region.\n${pub}fun shared${db} db = LinguaQ.shared db\n"],
     V.concatMap (\d -> outside pub db key value several d) decls,
     if keeps then [Code (codec pub db key value decls)] else []
   ]

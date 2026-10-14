@@ -93,6 +93,7 @@ fun failure (e : QueryError k) : String =
   match e with
   | QueryError.Unset _ -> "miniml: a query was read before it was set\n"
   | QueryError.Cycle ks -> "miniml: ${show (V.len ks)} queries need each other\n"
+  | QueryError.Interrupted -> "miniml: a query was stopped before it answered\n"
 
 fun command (cli : Cli) =
   match cli with

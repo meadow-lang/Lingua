@@ -842,7 +842,12 @@ What Lingua has no feature for is the language's to answer: `requests` are
 methods and what answers each, a function of the database and what was asked
 -- the file, its text, the byte pointed at, the parameters as they came -- so
 that hints, lenses, workspace symbols and a method only this language has
-(`miniml/type`) are each a query like any other.
+(`miniml/type`) are each a query like any other. A server does one thing at
+a time unless it is `threaded`: then one thread reads, one looks for what is
+wrong, and one answers, so that a request is answered while a file is being
+checked, and an edit stops the checking -- the database is interrupted, and
+every read of it answers `Interrupted` until it is allowed again -- before
+it sets the text.
 
 **`repl!`** declares a prompt over the compiler's database, with the
 server's features: what is being typed is a file of the session, and `text`,

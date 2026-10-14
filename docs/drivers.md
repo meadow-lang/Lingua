@@ -72,7 +72,8 @@ What stays the same in a batch:
 - **The interface.** `setSessionSource`, `sessionTyped`, `sessionTypedEach` and
   the rest are the functions a session has.
 - **Errors.** An input never set, or queries that read each other in a circle,
-  raise `QueryError` (`Unset key`, `Cycle keys`) through `Std.Exn`.
+  raise `QueryError` (`Unset key`, `Cycle keys`) through `Std.Exn`. A session
+  told to stop raises `Interrupted`; a batch never does.
 
 What differs:
 
@@ -137,6 +138,29 @@ with it:
   region refuses;
 - on a session that is not a batch it is the same as `parallelSession`, since
   a session already shares what it holds.
+
+## Stopping work under way
+
+Inputs are set between asks, not during one. A program that asks on one thread
+and may need to set an input from another, such as a language server whose
+edit arrives while a file is being checked, stops the asking first:
+
+```meadow
+interruptSession db          -- every read of db now answers Interrupted
+Thread.await checking        -- the thread ends at the next thing it reads
+allowSession db              -- db may be asked again
+setSessionSource db 1 text
+```
+
+After `interruptSession db`, a query under way ends where it next reads the
+database, its key is given back, and whoever asked is raised
+`QueryError.Interrupted`. What had already been worked out stays, so nothing
+finished is done again. `allowSession db` lets the database answer again.
+
+Stopping is cooperative: a query that reads nothing for a long time runs that
+long before it ends. A batch is not interrupted; `interruptSession` on one
+does nothing. `lsp!`'s `threaded` server does exactly the four lines above
+([server.md](server.md#on-threads)).
 
 ## Letting go of a database
 

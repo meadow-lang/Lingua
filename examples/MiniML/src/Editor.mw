@@ -24,7 +24,7 @@ use Std.Exn (toResult)
 use Std.Result.Result.*
 
 lsp! {
-  pub Server "miniml" for Session
+  pub Server "miniml" for Session threaded
     | text = setSessionSource
     | diagnostics = diagnosticsOf
     | tree = treeOf
@@ -530,7 +530,7 @@ fun opening (uri : String) (text : String) : Json =
   let said =
     told
       [opening "file:///a.ml" "1 + 2\n", asking 1 "miniml/type" (inFile "file:///a.ml")]
-      serveServer
+      serveServerInTurn
   in assertEq
        (M.andThen (J.get "result") (V.get said 1))
        (Just (J.jString "Int"))
@@ -544,7 +544,7 @@ fun opening (uri : String) (text : String) : Json =
         opening "file:///a.ml" "1 + 2\n",
         asking 2 "textDocument/inlayHint" (inFile "file:///a.ml")
       ]
-      serveServer
+      serveServerInTurn
   in
   let a =
     assertEq

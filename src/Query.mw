@@ -33,6 +33,14 @@
 -- so is a key a chain is already computing. Inputs are set between asks, not
 -- during one.
 --
+-- **Interrupting.** What is being worked out on another thread can be told to
+-- stop: after `interrupt db`, every read of the database answers
+-- `Interrupted`, so each query under way ends at the next thing it reads and
+-- gives its key back, and whoever asked is raised that. `allow db` lets the
+-- database be asked again. This is how an input is set while something is
+-- being worked out -- an editor's server, an edit arriving during analysis:
+-- interrupt, wait for the thread, set, allow. A batch is not interrupted.
+--
 -- **Between runs.** `snapshot` writes what a database has worked out, and
 -- `restore` reads it back into a new one. A result is kept with the inputs it
 -- read -- all of them, through every query in between -- and a fingerprint of
@@ -94,10 +102,11 @@ use QueryError.*
   fetchAll : [k] -> [v],
 }
 
--- What asking a database can go wrong with: an input that was never set, or
--- queries that read each other in a circle -- the keys around it, in order.
+-- What asking a database can go wrong with: an input that was never set;
+-- queries that read each other in a circle -- the keys around it, in order;
+-- or the database told to stop what it was working out (`interrupt`).
 @derive(Debug, Display, PartialEq)
-@pub data QueryError k = Unset k | Cycle [k]
+@pub data QueryError k = Unset k | Cycle [k] | Interrupted
 
 -- What a derived query answered, the revision that answer last changed at,
 -- the revision it was last checked at, and the keys it read to make it.
@@ -118,6 +127,7 @@ use Entry.*
 -- conflict; which chains wait for which; the last chain's number; the keys
 -- computed since the log was last taken; and the queries themselves.
 -- And how several keys asked at once are worked out: in turn, or on threads.
+-- And whether it has been told to stop what it is working out.
 data Live k v
   = Live
     (TVar Int)
@@ -128,6 +138,7 @@ data Live k v
     (TVar [k])
     (k -> Maybe v ! { Fetch k v })
     (Live k v -> Chain k -> [k] -> Result (QueryError k) [(v, Int)] ! { Thread, Mut })
+    (TVar Bool)
 
 -- A batch: the inputs, the answers so far, the inputs as a compact region
 -- once a `shared` batch's thread has needed them, the keys computed since the
@@ -162,7 +173,8 @@ data Chain k = Chain Int [k]
        (T.newTVarIO 0)
        (T.newTVarIO [])
        compute
-       inTurn)
+       inTurn
+       (T.newTVarIO False))
 
 -- A batch whose queries are `compute`: each key worked out once, and nothing
 -- else remembered.
@@ -181,7 +193,7 @@ data Chain k = Chain Int [k]
 -- the only ways to a thread: a program that calls neither has none.
 @pub fun parallel (db : Db k v) : Db k v =
   match db with
-  | Db.Incremental (Live r i s w c l f _) -> Db.Incremental (Live r i s w c l f inParallel)
+  | Db.Incremental (Live r i s w c l f _ h) -> Db.Incremental (Live r i s w c l f inParallel h)
   | Db.Batch (Once i m c l f _) -> Db.Batch (Once i m c l f onceOnThreads)
 
 -- `parallel db`, and in a batch the threads read the inputs from one compact
@@ -193,14 +205,15 @@ data Chain k = Chain Int [k]
   | Db.Batch (Once i m c l f _) -> Db.Batch (Once i m c l f onceOnThreadsShared)
   | _ -> parallel db
 
-fun revisionVar db = match db with | Live r _ _ _ _ _ _ _ -> r
-fun inputsVar db = match db with | Live _ i _ _ _ _ _ _ -> i
-fun slotsVar db = match db with | Live _ _ s _ _ _ _ _ -> s
-fun waitsVar db = match db with | Live _ _ _ w _ _ _ _ -> w
-fun chainsVar db = match db with | Live _ _ _ _ c _ _ _ -> c
-fun logVar db = match db with | Live _ _ _ _ _ l _ _ -> l
-fun computeOf db = match db with | Live _ _ _ _ _ _ f _ -> f
-fun severalOf db = match db with | Live _ _ _ _ _ _ _ g -> g
+fun revisionVar db = match db with | Live r _ _ _ _ _ _ _ _ -> r
+fun inputsVar db = match db with | Live _ i _ _ _ _ _ _ _ -> i
+fun slotsVar db = match db with | Live _ _ s _ _ _ _ _ _ -> s
+fun waitsVar db = match db with | Live _ _ _ w _ _ _ _ _ -> w
+fun chainsVar db = match db with | Live _ _ _ _ c _ _ _ _ -> c
+fun logVar db = match db with | Live _ _ _ _ _ l _ _ _ -> l
+fun computeOf db = match db with | Live _ _ _ _ _ _ f _ _ -> f
+fun severalOf db = match db with | Live _ _ _ _ _ _ _ g _ -> g
+fun haltedVar db = match db with | Live _ _ _ _ _ _ _ _ h -> h
 
 fun onceInputs o = match o with | Once i _ _ _ _ _ -> i
 fun onceMemo o = match o with | Once _ m _ _ _ _ -> m
@@ -313,6 +326,21 @@ fun setLive (db : Live k v) (key : k) (value : v) : () ! { Thread | e } =
         let b = T.writeTVar (slotsVar live) HashMap.empty in
         let c = T.writeTVar (waitsVar live) HashMap.empty in
         T.writeTVar (logVar live) [])
+
+-- Tell `db` to stop what it is working out: every read of it answers
+-- `Interrupted` until `allow db`, so a query under way on another thread
+-- ends at the next thing it reads, and its key is given back. What had been
+-- worked out stays. A batch is not interrupted.
+@pub fun interrupt (db : Db k v) : () ! { Thread | e } =
+  match db with
+  | Db.Incremental live -> T.atomically (\() -> T.writeTVar (haltedVar live) True)
+  | Db.Batch _ -> ()
+
+-- Let `db` be asked again, after `interrupt db`.
+@pub fun allow (db : Db k v) : () ! { Thread | e } =
+  match db with
+  | Db.Incremental live -> T.atomically (\() -> T.writeTVar (haltedVar live) False)
+  | Db.Batch _ -> ()
 
 -- --- a batch -----------------------------------------------------------------
 
@@ -467,25 +495,31 @@ data Look k v
   | Unchecked v [(k, Int)]
   | Absent
   | Busy Int
+  | Halted
 
 use Look.*
 
 fun look (db : Live k v) (key : k) : Look k v ! { Stm | e } =
-  match HashMap.lookup key (T.readTVar (inputsVar db)) with
-  | Just held -> Input held
-  | None ->
-      match slot db key with
-      | None -> Absent
-      | Just (Running owner _) -> Busy owner
-      | Just (Stored x ins) -> Unchecked x ins
-      | Just (Computed (Memo x changed checked deps)) ->
-          if checked == T.readTVar (revisionVar db) then Fresh x changed
-          else Stale (Memo x changed checked deps)
+  if T.readTVar (haltedVar db) then Halted
+  else
+    match HashMap.lookup key (T.readTVar (inputsVar db)) with
+    | Just held -> Input held
+    | None -> lookDerived db key
+
+fun lookDerived (db : Live k v) (key : k) : Look k v ! { Stm | e } =
+  match slot db key with
+  | None -> Absent
+  | Just (Running owner _) -> Busy owner
+  | Just (Stored x ins) -> Unchecked x ins
+  | Just (Computed (Memo x changed checked deps)) ->
+      if checked == T.readTVar (revisionVar db) then Fresh x changed
+      else Stale (Memo x changed checked deps)
 
 -- `key`'s answer, up to date, and the revision it last changed at.
 fun refresh (db : Live k v) (ch : Chain k) (key : k)
     : Result (QueryError k) (v, Int) ! { Thread, Mut | e } =
   match T.atomically (\() -> look db key) with
+  | Halted -> Err Interrupted
   | Input held -> Ok held
   | Fresh x changed -> Ok (x, changed)
   | Busy owner -> waitFor db ch key owner
@@ -1078,6 +1112,26 @@ fun filled () =
   let r = revision db in
   let a = set db (K.Cell 1) (Val.Text "abc") in
   assertEq (revision db) r "the same revision"
+
+@test fun aDatabaseInterruptedAnswersNothingUntilItIsAllowed () =
+  let db = filled () in
+  let a = interrupt db in
+  let b = assertEq (toResult (\() -> total db)) (Err Interrupted) "nothing is worked out" in
+  let c = assertEq (takeLog db) [] "and nothing was" in
+  let d = allow db in
+  let e = assertEq (toResult (\() -> total db)) (Ok 5) "allowed, it answers" in
+  assertEq (takeLog db) [K.Len 1, K.Len 2, K.Total] "having worked it out then"
+
+@test fun whatWasWorkedOutBeforeAnInterruptionStays () =
+  let db = filled () in
+  let a = toResult (\() -> total db) in
+  let b = takeLog db in
+  let c = interrupt db in
+  let d = assertEq (toResult (\() -> total db)) (Err Interrupted) "not even what it has" in
+  let e = allow db in
+  let f = set db (K.Cell 1) (Val.Text "abcd") in
+  let g = assertEq (toResult (\() -> total db)) (Ok 6) "an input set between, and it is right" in
+  assertEq (takeLog db) [K.Len 1, K.Total] "with only what the input changed run again"
 
 @test fun anUnsetInputIsSaidToBe () =
   let db = newDb sheet in

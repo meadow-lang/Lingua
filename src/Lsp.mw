@@ -36,6 +36,15 @@
 --
 -- Only `text` is needed; the server says it can do what it was given.
 --
+-- **On threads.** `for Session threaded` is a server that reads on one
+-- thread, looks for what is wrong on another, and answers on a third: a
+-- request is answered while a file is still being looked at, and an edit
+-- that arrives then stops the looking (`interrupt<Db>`) before it sets the
+-- text. `diagnostics` is then run on a thread of its own, and must answer
+-- and not raise -- a query stopped raises `Interrupted`. Such a server also
+-- writes `serve<Name>InTurn`, the same server a message at a time, which is
+-- what a test tells (`told`).
+--
 -- **Requests of the language's own** are `requests`: each a method and what
 -- answers it, a function of the database and what was `Asked` -- the file,
 -- its text, the byte the editor points at, and the request's parameters as
@@ -80,6 +89,8 @@ use Std.Char as C
 use Std.Json as J
 use Std.Json (Json)
 use Std.Console (Console, readLine, readExact, writeOutput, withOutput)
+use Std.Thread as Thread
+use Std.Stm as Stm
 use Lingua.Lang (Meta)
 use Lingua.Lang.Meta.*
 use Lingua.Diagnostic (Diagnostic, Severity)
@@ -321,19 +332,22 @@ fun looping about name own setText diagnose answer docs =
         match id with
         | None -> loop about setText diagnose answer docs
         | Just i ->
-            (let u =
-               (match fileOf docs uri with
-                | None ->
-                    if V.elem method own then
-                      reply i (M.unwrapOr (J.jNull ()) (answer docs method (0 - 1) "" 0 params))
-                    else reply i (J.jNull ())
-                | Just file ->
-                    (let t = textOf docs file in
-                     match answer docs method file t (offsetIn t params) params with
-                     | Just r -> reply i r
-                     | None ->
-                         replyError i (0 - 32601) "`${method}` is not something this server does"))
-             in loop about setText diagnose answer docs)
+            (let u = answering own answer docs method i uri params in
+             loop about setText diagnose answer docs)
+
+-- A request answered: by `answer`, of the file it is about; or, about no
+-- open file, only if its method is one of the language's `own`.
+fun answering (own : [String]) answer docs method i uri params =
+  match fileOf docs uri with
+  | None ->
+      if V.elem method own then
+        reply i (M.unwrapOr (J.jNull ()) (answer docs method (0 - 1) "" 0 params))
+      else reply i (J.jNull ())
+  | Just file ->
+      (let t = textOf docs file in
+       match answer docs method file t (offsetIn t params) params with
+       | Just r -> reply i r
+       | None -> replyError i (0 - 32601) "`${method}` is not something this server does")
 
 -- The whole text of the last change: the server asks for whole documents.
 fun lastChange params =
@@ -343,21 +357,151 @@ fun lastChange params =
 
 -- What is wrong in every open file: one edit can change what another says.
 fun publishAll name diagnose docs =
+  published name docs (V.map (\file -> (file, diagnose file)) (openFiles docs))
+
+-- The editor told what was `found` wrong, file by file.
+fun published name docs (found : [(Int, [Diagnostic])]) =
   V.foldl
-    (\u file ->
-      let t = textOf docs file in
-      let starts = lineStarts t in
-      notify
-        "textDocument/publishDiagnostics"
-        (J.jObject [
-           ("uri", J.jString (uriOf docs file)),
-           (
-             "diagnostics",
-             J.jArray (V.map (diagnosticJson name (uriOf docs file) t starts) (diagnose file))
-           )
-         ]))
+    (\u f ->
+      match f with
+      | (file, wrong) ->
+          let t = textOf docs file in
+          let starts = lineStarts t in
+          notify
+            "textDocument/publishDiagnostics"
+            (J.jObject [
+               ("uri", J.jString (uriOf docs file)),
+               (
+                 "diagnostics",
+                 J.jArray (V.map (diagnosticJson name (uriOf docs file) t starts) wrong)
+               )
+             ]))
     ()
-    (openFiles docs)
+    found
+
+-- --- serving, on threads -----------------------------------------------------
+--
+-- One thread reads what the editor sends, so that nothing waits to be read;
+-- one looks for what is wrong after an edit; and this one, which keeps the
+-- documents and is the only one that writes, answers. A request is answered
+-- while a file is still being looked at. An edit that arrives then stops the
+-- looking first -- `interrupt`, wait for the thread, `allow` -- since an
+-- input is set between asks and not during one; what the thread had found is
+-- for a text that is no longer there, and is not sent.
+
+-- What reaches the thread that answers: a message; no more of them; or word
+-- that the thread started at an edit has looked at every open file.
+data Arrived = Got Json | NoMore | Found Int
+
+-- A language server as `serve` is one, on threads. `diagnose` is run on a
+-- thread of its own, so it must answer and not raise; `interrupt` stops what
+-- that thread is working out and `allow` lets the database be asked again.
+@pub fun serveOnThreads
+    name
+    features
+    (own : [String])
+    extra
+    setText
+    diagnose
+    answer
+    interrupt
+    allow =
+  let inbox = Thread.newChannel () in
+  let reader = Thread.spawn (\() -> reading inbox) in
+  attending
+    (name, features, own, extra)
+    setText
+    diagnose
+    answer
+    interrupt
+    allow
+    inbox
+    (emptyDocs ())
+    0
+    None
+
+-- Each message, handed on as it is read. The thread gives way after each:
+-- one that went straight back to waiting on the editor would, on a runtime
+-- whose threads take turns, keep the thread it had just woken from running.
+fun reading inbox =
+  match readMessage () with
+  | None -> Thread.send inbox Arrived.NoMore
+  | Just msg ->
+      let u = Thread.send inbox (Arrived.Got msg) in
+      let w = Thread.yieldNow () in
+      -- Nothing is read after `exit`: a thread left waiting on the editor
+      -- would keep the server from ending.
+      if M.andThen J.asString (J.get "method" msg) == Just "exit" then () else reading inbox
+
+-- What the thread looking at the files found, published -- waiting for it,
+-- if it has not finished.
+fun finishing name docs working =
+  match working with
+  | None -> ()
+  | Just task -> published name docs (Thread.await task)
+
+-- The thread looking at the files, stopped: nothing it found is wanted.
+fun stopping working interrupt allow =
+  match working with
+  | None -> ()
+  | Just task ->
+      let a = interrupt () in
+      let b = Thread.await task in
+      allow ()
+
+-- `edit` counts the edits so far, and `working` is the thread looking at the
+-- files as the last of them left them, if it has not been heard from.
+fun attending about setText diagnose answer interrupt allow inbox docs (edit : Int) working =
+  let again = \d e w -> attending about setText diagnose answer interrupt allow inbox d e w in
+  match about with
+  | (name, features, own, extra) ->
+      match Thread.receive inbox with
+      | Arrived.NoMore -> finishing name docs working
+      | Arrived.Found at ->
+          if at != edit then again docs edit working
+          else (let u = finishing name docs working in again docs edit None)
+      | Arrived.Got msg ->
+          let method = M.unwrapOr "" (M.andThen J.asString (J.get "method" msg)) in
+          let id = J.get "id" msg in
+          let params = M.unwrapOr (J.jNull ()) (J.get "params" msg) in
+          let uri = M.unwrapOr "" (M.andThen J.asString (J.path ["textDocument", "uri"] params)) in
+          if method == "exit" then ()
+          else if method == "initialize" then
+            (let u = reply (M.unwrapOr (J.jNull ()) id) (initialized name features own extra) in
+             again docs edit working)
+          else if method == "shutdown" then
+            (let u = reply (M.unwrapOr (J.jNull ()) id) (J.jNull ()) in again docs edit working)
+          else if method == "textDocument/didOpen" or method == "textDocument/didChange" then
+            (let text =
+               (if method == "textDocument/didOpen" then
+                  M.andThen J.asString (J.path ["textDocument", "text"] params)
+                else lastChange params)
+             in match text with
+                | None -> again docs edit working
+                | Just t ->
+                    (let s = stopping working interrupt allow in
+                     match withText docs uri t with
+                     | (d2, file) ->
+                         let u = setText file t in
+                         let files = openFiles d2 in
+                         let at = edit + 1 in
+                         let task =
+                           Thread.spawn (\() ->
+                             let found = V.map (\f -> (f, diagnose f)) files in
+                             let w = Thread.send inbox (Arrived.Found at) in
+                             found)
+                         in again d2 at (Just task)))
+          else if method == "textDocument/didClose" then
+            (let u =
+               notify
+                 "textDocument/publishDiagnostics"
+                 (J.jObject [("uri", J.jString uri), ("diagnostics", J.jArray [])])
+             in again docs edit working)
+          else
+            match id with
+            | None -> again docs edit working
+            | Just i ->
+                (let u = answering own answer docs method i uri params in again docs edit working)
 
 fun diagnosticJson name uri t starts (d : Diagnostic) =
   match d with
@@ -776,20 +920,21 @@ def featureP : Parser Tokens ((String, Loc), String) =
 -- function it is.
 type LspFeature = ((String, Loc), String)
 
-def lspCall : Parser Tokens (Bool, String, String, String, [LspFeature]) =
-  P.pure (\pub name lang db fs -> (M.isSome pub, name, lang, db, fs))
+def lspCall : Parser Tokens (Bool, String, String, (String, Bool), [LspFeature]) =
+  P.pure (\pub name lang db threaded fs -> (M.isSome pub, name, lang, (db, M.isSome threaded), fs))
     |> keep (P.optional (keyword "pub"))
     |> keep ident
     |> keep stringLit
     |> skip (keyword "for")
     |> keep ident
+    |> keep (P.optional (keyword "threaded"))
     |> keep (P.some featureP)
 
 @macro
 @pub fun lsp (ts : [TokenTree]) : [TokenTree] ! { Expand | e } =
   match parseTokens lspCall ts with
   | Err failed -> failed
-  | Ok (pub, name, lang, db, fs) ->
+  | Ok (pub, name, lang, (db, threaded), fs) ->
       match V.find (\f -> not (V.elem (fst (fst f)) features)) fs with
       | Just f ->
           [Fail
@@ -808,12 +953,12 @@ def lspCall : Parser Tokens (Bool, String, String, String, [LspFeature]) =
             -- database to colour what is typed as the editor would.
             let u =
               if V.any (\f -> fst (fst f) == "tree") fs then defineAs (serverOf db) name else ()
-            in [Code (lspCode (if pub then "@pub " else "") name lang db fs)]
+            in [Code (lspCode (if pub then "@pub " else "") name lang db threaded fs)]
 
 -- What the server of database `db` is recorded under, for `repl!` to find.
 @pub fun serverOf (db : String) : String = "LinguaLspFor${db}"
 
-fun lspCode pub name lang db fs =
+fun lspCode pub name lang db (threaded : Bool) fs =
   let fn = \f -> M.unwrapOr "" (M.map snd (V.find (\x -> fst (fst x) == f) fs)) in
   let has = \f -> V.any (\x -> fst (fst x) == f) fs in
   let arm =
@@ -830,15 +975,8 @@ fun lspCode pub name lang db fs =
   in
   let tree = "(${fn "tree"} db file)" in
   let refs = "(${fn "references"} db file offset)" in
-  "use Lingua.Lsp as LinguaLsp
-use Std.Collections.Vector as LinguaV
-${if has "tree" then "\n-- What ${lang}'s editor colours in a file: each token's bytes, and its class.\n${pub}fun tokens${name} db file = ${if has "resolved" then "LinguaLsp.refined (LinguaLsp.classified display (${fn "tree"} db file)) (${fn "resolved"} db file)" else "LinguaLsp.classified display (${fn "tree"} db file)"}\n" else ""}
--- A language server for ${lang}, on standard input and output, until the
--- editor says `exit`.
-${pub}fun serve${name} () =
-  let db = new${db} () in
-  LinguaLsp.serve
-    \"${lang}\"
+  -- What a server is given, however it is run.
+  let args = "    \"${lang}\"
     [${S.join ", " (V.map (\f -> "\"${fst (fst f)}\"") fs)}]
     (LinguaLsp.methodsOf ${requests})
     ${if has "capabilities" then fn "capabilities" else "[]"}
@@ -847,7 +985,19 @@ ${pub}fun serve${name} () =
     (\\docs method file t offset params ->
     if False then None
 ${ownArm}${arm "hover" "textDocument/hover" "LinguaLsp.hoverReply t (${fn "hover"} db file offset)"}${arm "tree" "textDocument/semanticTokens/full" "LinguaLsp.tokensReply t (tokens${name} db file)"}${arm "tree" "textDocument/foldingRange" "LinguaLsp.foldingReply t ${tree}"}${arm "tree" "textDocument/selectionRange" "LinguaLsp.selectionReply t ${tree} params"}${arm "definition" "textDocument/definition" "LinguaLsp.locationsReply docs (${fn "definition"} db file offset)"}${arm "references" "textDocument/references" "LinguaLsp.locationsReply docs ${refs}"}${arm "references" "textDocument/documentHighlight" "LinguaLsp.highlightsReply t file ${refs}"}${arm "references" "textDocument/prepareRename" "LinguaLsp.prepareRenameReply t file offset ${refs}"}${arm "references" "textDocument/rename" "LinguaLsp.renameReply docs ${refs} (LinguaLsp.newName params)"}${arm "completion" "textDocument/completion" "LinguaLsp.completionReply (${fn "completion"} db file offset)"}${arm "symbols" "textDocument/documentSymbol" "LinguaLsp.symbolsReply t (${fn "symbols"} db file)"}${arm "format" "textDocument/formatting" "LinguaLsp.formatReply t (${fn "format"} db file)"}    else None)
-"
+" in
+  let inTurn =
+    \called -> "${pub}fun ${called} () =\n  let db = new${db} () in\n  LinguaLsp.serve\n${args}"
+  in
+  let serving =
+    if threaded then
+      "-- A language server for ${lang}, on standard input and output, until the\n-- editor says `exit`: reading, looking for what is wrong and answering each\n-- on a thread.\n${pub}fun serve${name} () =\n  let db = new${db} () in\n  LinguaLsp.serveOnThreads\n${args}    (\\() -> interrupt${db} db)\n    (\\() -> allow${db} db)\n\n-- The same server, a message at a time: what a test tells.\n${inTurn "serve${name}InTurn"}"
+    else
+      "-- A language server for ${lang}, on standard input and output, until the\n-- editor says `exit`.\n${inTurn "serve${name}"}"
+  in "use Lingua.Lsp as LinguaLsp
+use Std.Collections.Vector as LinguaV
+${if has "tree" then "\n-- What ${lang}'s editor colours in a file: each token's bytes, and its class.\n${pub}fun tokens${name} db file = ${if has "resolved" then "LinguaLsp.refined (LinguaLsp.classified display (${fn "tree"} db file)) (${fn "resolved"} db file)" else "LinguaLsp.classified display (${fn "tree"} db file)"}\n" else ""}
+${serving}"
 
 -- --- tests -------------------------------------------------------------------
 
@@ -963,6 +1113,93 @@ fun resultOf (j : Json) : Maybe Json = J.get "result" j
   in
   let b = assertEq (can "experimental") (Just (J.jBool True)) "what else it says" in
   assertEq (can "hoverProvider") None "and nothing it was not given"
+
+-- A server on threads, given what has arrived for it already: what it wrote.
+fun attended (arrived : [Arrived]) setText diagnose answer interrupt allow =
+  let inbox = Thread.newChannel () in
+  let u = V.foldl (\acc a -> Thread.send inbox a) () arrived in
+  written
+    (snd
+       (withOutput (\() ->
+          attending
+            ("test", ["text"], ["test/go"], [])
+            setText
+            diagnose
+            answer
+            interrupt
+            allow
+            inbox
+            (emptyDocs ())
+            0
+            None)))
+
+@test fun aRequestIsAnsweredWhileAFileIsStillBeingLookedAt () =
+  -- Looking at the file waits for the request to have been answered: a
+  -- server that did one thing at a time would never get to it.
+  let gate = Stm.newTVarIO False in
+  let said =
+    attended
+      [
+        Arrived.Got (opening "file:///a" "let x = 1"),
+        Arrived.Got (request 1 "test/go" (about "file:///a")),
+        Arrived.NoMore
+      ]
+      (\file t -> ())
+      (\file ->
+        let u = Stm.atomically (\() -> Stm.check (Stm.readTVar gate)) in
+        [])
+      (\docs method file t offset params ->
+        let u = Stm.atomically (\() -> Stm.writeTVar gate True) in
+        Just (J.jString "gone"))
+      (\() -> ())
+      (\() -> ())
+  in
+  let a =
+    assertEq (M.andThen resultOf (V.get said 0)) (Just (J.jString "gone")) "the answer, first"
+  in assertEq
+       (M.andThen (J.get "method") (V.get said 1))
+       (Just (J.jString "textDocument/publishDiagnostics"))
+       "and what is wrong in the file when that had been found"
+
+@test fun anEditStopsTheLookingBeforeItSetsTheText () =
+  -- Looking at the first text never ends by itself; the second edit
+  -- interrupts it, and only what is wrong in the second text is said.
+  let gate = Stm.newTVarIO False in
+  let held = Stm.newTVarIO "" in
+  let stops = Stm.newTVarIO 0 in
+  let said =
+    attended
+      [
+        Arrived.Got (opening "file:///a" "first"),
+        Arrived.Got (opening "file:///a" "second"),
+        Arrived.NoMore
+      ]
+      (\file t -> Stm.atomically (\() -> Stm.writeTVar held t))
+      (\file ->
+        let t = Stm.readTVarIO held in
+        if t == "first" then (let u = Stm.atomically (\() -> Stm.check (Stm.readTVar gate)) in [])
+        else [Diagnostic Severity.Error t (Meta 0 1) [] []])
+      (\docs method file t offset params -> None)
+      (\() ->
+        Stm.atomically (\() ->
+          let u = Stm.writeTVar gate True in
+          Stm.modifyTVar stops (\n -> n + 1)))
+      (\() -> ())
+  in
+  let a = assertEq (V.len said) 1 "one thing said, not two" in
+  let b =
+    assertEq
+      (M.andThen
+         (\j ->
+           M.andThen
+             (J.get "message")
+             (M.andThen
+                (\ds -> V.get ds 0)
+                (M.andThen J.asArray (J.path ["params", "diagnostics"] j))))
+         (V.get said 0))
+      (Just (J.jString "second"))
+      "what is wrong in the text that is there"
+  in assertEq (Stm.readTVarIO stops) 1 "and the looking was stopped once, by the edit"
 
 @test fun tokensAreEncodedFromTheOneBefore () =
   assertEq

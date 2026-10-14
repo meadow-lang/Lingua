@@ -134,14 +134,66 @@ so a request's reply comes after those.
 [Editor.mw](../examples/MiniML/src/Editor.mw) has the helpers `opening`,
 `asking` and `inFile`.
 
+## On threads
+
+By default a server does one thing at a time: a message is read when the one
+before it has been answered, and each edit publishes the diagnostics of every
+open file before the next message is looked at. A request waits behind that.
+
+`threaded`, after the database's name, makes it a server on three threads:
+
+```meadow
+lsp! {
+  pub Server "miniml" for Session threaded
+    | text = setSessionSource
+    …
+}
+```
+
+| thread            | does                                                          |
+| ----------------- | ------------------------------------------------------------- |
+| one that reads    | reads each message as it comes, so the editor is never kept waiting to be read |
+| one that looks    | runs `diagnostics` over every open file after an edit         |
+| one that answers  | keeps the open documents, answers requests, and is the only one that writes |
+
+What this changes:
+
+- **A request is answered while the files are still being looked at.**
+  Formatting a file needs only its tree, and no longer waits for it to be
+  checked. A request that needs what the other thread is working out waits
+  for that query and no longer.
+- **An edit stops the looking.** The answering thread interrupts the database
+  (`interrupt<Db>`, see [drivers.md](drivers.md#stopping-work-under-way)),
+  waits for the thread to end, sets the text and starts again. So a burst of
+  edits publishes diagnostics once, for the text that is there at the end.
+  Twenty edits sent together to MiniML's server publish once.
+- **What was found for a text that has gone is not sent.**
+
+What it asks of the language:
+
+- **`diagnostics` must answer and not raise.** It runs on a thread of its
+  own, and a query stopped under it raises `QueryError.Interrupted`. Catch
+  it and answer nothing, as MiniML's does with `Std.Exn.toResult`; what it
+  answers then is thrown away. A thread starts with no handlers
+  (`Std.Thread`), so there is nothing on it to catch what `diagnostics` lets
+  out.
+- Every other feature runs on the answering thread, as before.
+
+A threaded server also writes `serve<Name>InTurn ()`, the same server one
+thing at a time. It is what a test tells with `told`, since a thread that
+reads does not read what a test supplies.
+
+Leave `threaded` out for a server whose language checks a file faster than
+anyone types.
+
 ## Limits
 
-- **One thread.** A message is read when the one before it has been answered,
-  and each edit publishes diagnostics for every open file first. A request
-  waits behind that.
+- **Requests are answered one at a time.** On threads, a request that takes
+  long keeps the next request waiting, though not the reading of edits.
 - **Whole documents.** The server asks the editor for a file's whole text on
   each change.
-- **No request is cancelled.**
+- **A request is not cancelled.** `$/cancelRequest` is ignored; only looking
+  for what is wrong is stopped, and by an edit.
 - **Semantic tokens have classes and no modifiers.**
 - **The server sends nothing but replies and diagnostics.** A language's
   request cannot make the server ask the editor for something.
