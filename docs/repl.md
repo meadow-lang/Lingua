@@ -37,6 +37,7 @@ Only `text` and `eval` are required. Each of the others turns something on.
 | `completion`   | `db -> Int -> Int -> [(String, String)]`     | Tab: names and what each is, at a byte     |
 | `declarations` | `db -> Int -> [(String, String, String)]`    | Ctrl-F: name, what it is, what is said of it |
 | `search`       | `db -> Int -> String -> [Hit]`               | Ctrl-F, answered by the language: see [A language's own search](#a-languages-own-search) |
+| `panes`        | `[(String, db -> Int -> String -> Int -> Opened e)]` | the language's panes, each opened by a key or a command: see [Panes](#panes) |
 | `indent`       | `Green k -> String`                          | what a continuation line opens with        |
 | `commands`     | `[(String, String, String, db -> String -> Reply)]` | the language's own `:` lines        |
 | `prompt`       | text                                         | what a line starts with; `"> "` if omitted |
@@ -174,6 +175,62 @@ can use either and add what it finds by type.
 The search runs on every key, so it should be quick: a query over an index of
 declarations the database keeps, not a walk over the program.
 
+## Panes
+
+A pane is shown under the line until it is done with. The finder is one, and
+a language gives its own with `panes`: a view of what a definition compiles
+to, what a proof search found, a page of documentation.
+
+```meadow
+repl! {
+  pub Prompt "miniml" for Session
+    …
+    | panes = promptPanes
+}
+
+def promptPanes = [("ctrl-t", counter), (":count", counter)]
+
+def counter =
+  Lingua.Repl.pane
+    (\db file text at -> 0)
+    (\n (k : Key) ->
+      match k.code with
+      | Up -> Step.Go (n + 1)
+      | Enter -> Step.Put "n=${show n}" 3 ""
+      | _ -> Step.Close)
+    (\n cols -> D.writeIn (D.blank 20 1) (D.area (D.blank 20 1)) 0 0 D.style "count ${show n}")
+```
+
+Each pane is how it opens and the pane itself. `ctrl-x` opens it on a key,
+on the line being edited; `:name` opens it as a command, and what follows
+the command is the text it opens on.
+
+`Lingua.Repl.pane open key draw` makes a pane of three functions over a state
+of any type:
+
+| function | type                               | does                                       |
+| -------- | ---------------------------------- | ------------------------------------------ |
+| `open`   | `db -> Int -> String -> Int -> s`  | its state, from the database, the entry, the line's text and the cursor |
+| `key`    | `s -> Key -> Step s`               | what a key does                            |
+| `draw`   | `s -> Int -> Buffer`               | how it is drawn, so many columns wide ([Doodle](https://github.com/meadow-lang/Doodle)) |
+
+A `Lingua.Repl.Step` is what a key does:
+
+| step                  | the prompt then                                              |
+| --------------------- | ------------------------------------------------------------ |
+| `Go s`                | redraws the pane in state `s`                                |
+| `Put text at before`  | closes it and puts `text` on the line, the cursor at character `at`; `before` is an entry run just before the line, or empty |
+| `Enter text`          | closes it and enters `text` in place of the line             |
+| `Close`               | closes it, and the line is as it was                         |
+
+The finder is the pane Ctrl-F opens, unless a pane of the language's takes
+Ctrl-F. A pane's state is hidden in what `pane` makes, so panes of different
+states are one list.
+
+A pane a command opens has no line to put text on: what it puts begins the
+next entry instead, the cursor after it, for its user to go on with, and its
+`before` is entered with that entry.
+
 ## Colour
 
 What is typed is coloured token by token, each token having a class: `keyword`,
@@ -270,6 +327,7 @@ the line, trimmed. It answers a `Lingua.Repl.Reply`:
 | -------------- | ------------------------------------------------------------ |
 | `Said text`    | writes `text`, or nothing if it is empty, and reads on       |
 | `Entry text`   | enters `text` as if it had been typed: evaluated, and kept in the history file |
+| `Edit text`    | begins the next entry with `text`, the cursor after it, for its user to go on with |
 | `Leave text`   | writes `text` and ends                                       |
 
 The database is the one the entries are typed into, so a command asks the
@@ -323,8 +381,6 @@ continuation, completion, the finder, colour and themes written this way.
   one with `| theme = …`.
 - **Tab completes a command's name, not what follows it.** A command that takes
   an expression gets no completion inside it.
-- **A command cannot put text on the line to be edited.** `Entry` enters it at
-  once.
 
 ## By hand
 
@@ -332,6 +388,7 @@ Everything `repl!` writes is a call into `Lingua.Repl`, which is usable
 directly: `unfinished`, `candidates`, `painted`, `coloured`, `finder`,
 `findKey`, `findDrawn`, `themes`, `themeNamed`, `command`, `commandOf`,
 `commandNames`, `commandCandidates`, `helped`, `Hit`, `ranked`, `declared`,
-`finderOf`, `findWith`, `editorOf`, `run`.
+`finderOf`, `findWith`, `pane`, `opened`, `showing`, `finderPane`, `editorOf`,
+`run`.
 The three packages underneath work without Lingua at all, for a compiler not
 written with it.
