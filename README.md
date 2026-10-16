@@ -39,6 +39,14 @@ syntax! {
 -- parseMini : String -> (Green Mini, [(Int, String)])
 ```
 
+## AI disclosure
+
+Lingua is written with AI coding agents: Anthropic's Claude, through Claude
+Code. Most of the code, the tests, the documentation and the commit messages in
+this repository were written by an agent, under the direction of the project's
+author, who decides the design and what goes in. Read it, and rely on it, with
+that in mind.
+
 ## What there is
 
 - **`syntax!`** reads the ungrammar and two tables beside it — which lexer
