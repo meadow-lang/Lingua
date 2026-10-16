@@ -1,0 +1,246 @@
+-- A command line with everything `cli!` can say, and tests that it reads as
+-- it says: flags with dashes, letters and other names, an option given again
+-- and again, one of a few values, one that is something where it is not
+-- given, options several commands take, options every command takes, a
+-- version, what follows a `--`, and a command for when there is none, which
+-- has no name. MiniML's own command line
+-- (in `Lib`) needs none of it; a compiler's does.
+
+use Lingua (cli!)
+use Lingua.Cli.Asked.*
+use Lingua.Diagnostic (message)
+use Std.Collections.Vector as V
+use Std.Maybe as M
+use Std.String as S
+
+cli! {
+  Tool
+    "tool"
+    "A compiler's command line, for the tests"
+    version
+    "1.2.0"
+    default
+    repl
+    unnamed
+    options
+    {
+      offline : Flag "Never fetch a dependency"
+      locked : Flag "Refuse to change the lock file"
+    }
+    options
+    Build
+    {
+      release : Flag "Build with the release profile"
+      optLevel : Option Int "How hard to optimise" short "O" value "LEVEL"
+      runtime : Option ("glade" | "silo") = "glade" "The runtime system"
+      cfg : Option [String] "Turn on a flag" value "FLAG"
+      emit : Option [String] "What to write" split ","
+      workspace : Flag "Every member of the workspace" alias "all"
+      noPrune : Flag "Compile every definition"
+    }
+    | build "Build a package" { path : Maybe String "the package" } with Build
+    | run
+      "Build a package and run it"
+      {
+        path : Maybe String "the package"
+        rest : [String] "what the program is given" after "--"
+      }
+      with
+      Build
+    | fmt "Set files out" {
+      files : [String] "the files"
+      width : Option Int = 100 "How wide a line may be"
+      check : Flag "Say what would change, and change nothing"
+    }
+    | lsp "Be a language server" {
+      stdio : Flag "Speak on standard input and output, as it always does"
+      clientProcessId : Option Int "The editor's process" as "clientProcessId"
+    }
+    | repl "Read entries and evaluate them" {}
+}
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertEq)
+
+-- What a command line came to, in a line: the options every command takes,
+-- then the command and what it holds.
+fun built (b : ToolBuild) : String =
+  "release=${show b.release} O=${show b.optLevel} runtime=${b.runtime} cfg=${S.join "+" b.cfg} emit=${S.join "+" b.emit} workspace=${show b.workspace} noPrune=${show b.noPrune}"
+
+fun said args : String =
+  match askTool args with
+  | Ok (o, c) ->
+      let every = "offline=${show o.offline} locked=${show o.locked}" in
+      (match c with
+       | Tool.Build r -> "${every} | build ${M.unwrapOr "." r.path} | ${built r.build}"
+       | Tool.Run r ->
+           "${every} | run ${M.unwrapOr "." r.path} [${S.join " " r.rest}] | ${built r.build}"
+       | Tool.Fmt r ->
+           "${every} | fmt [${S.join " " r.files}] width=${show r.width} check=${show r.check}"
+       | Tool.Lsp r -> "${every} | lsp stdio=${show r.stdio} pid=${show r.clientProcessId}"
+       | Tool.Repl -> "${every} | repl")
+  | Err (Help h) -> V.getOr "" (S.split "\n" h) 0
+  | Err (Complete c) -> "completions"
+  | Err (Wrong d line) -> message d
+  | Err (Ran _ _) -> "?"
+
+def plain : String = "release=False O=None runtime=glade cfg= emit= workspace=False noPrune=False"
+
+@test fun aFlagIsItsFieldsNameWithDashes () =
+  assertEq
+    (V.map said [["build", "--no-prune"], ["build", "--opt-level", "2"], ["build", "--noPrune"]])
+    [
+      "offline=False locked=False | build . | release=False O=None runtime=glade cfg= emit= workspace=False noPrune=True",
+      "offline=False locked=False | build . | release=False O=Just(2) runtime=glade cfg= emit= workspace=False noPrune=False",
+      "`build` has no flag `--noPrune`"
+    ]
+    "a capital in the field is a dash on the line, and only that is the flag"
+
+@test fun aFlagHasALetterAndOtherNames () =
+  assertEq
+    (V.map said [
+       ["build", "-O", "2"],
+       ["build", "-O2"],
+       ["build", "-O=2"],
+       ["build", "--all"],
+       ["build", "-x"],
+       ["build", "-O"]
+     ])
+    [
+      "offline=False locked=False | build . | release=False O=Just(2) runtime=glade cfg= emit= workspace=False noPrune=False",
+      "offline=False locked=False | build . | release=False O=Just(2) runtime=glade cfg= emit= workspace=False noPrune=False",
+      "offline=False locked=False | build . | release=False O=Just(2) runtime=glade cfg= emit= workspace=False noPrune=False",
+      "offline=False locked=False | build . | release=False O=None runtime=glade cfg= emit= workspace=True noPrune=False",
+      "`build` has no flag `-x`",
+      "`-O` needs a value"
+    ]
+    "its letter with the value after it or on it, and its other name"
+
+@test fun aNameCanBeSaidExactly () =
+  assertEq
+    (V.map said [
+       ["lsp", "--stdio", "--clientProcessId", "4242"],
+       ["lsp", "--client-process-id", "1"]
+     ])
+    [
+      "offline=False locked=False | lsp stdio=True pid=Just(4242)",
+      "`lsp` has no flag `--client-process-id`"
+    ]
+    "as an editor writes it, capitals and all"
+
+@test fun anOptionOfSeveralHoldsEachAndAnyOtherIsGivenOnce () =
+  assertEq
+    (V.map said [
+       ["build", "--cfg", "fast", "--cfg=gpu"],
+       ["build", "--emit", "core,cut", "--emit", "expanded"],
+       ["build", "-O", "1", "--opt-level", "2"],
+       ["build", "--release", "--release"]
+     ])
+    [
+      "offline=False locked=False | build . | release=False O=None runtime=glade cfg=fast+gpu emit= workspace=False noPrune=False",
+      "offline=False locked=False | build . | release=False O=None runtime=glade cfg= emit=core+cut+expanded workspace=False noPrune=False",
+      "`--opt-level` is given twice",
+      "offline=False locked=False | build . | release=True O=None runtime=glade cfg= emit= workspace=False noPrune=False"
+    ]
+    "each of them kept, parted where it says; and a second value for one that takes one is a mistake, not the answer"
+
+@test fun anOptionOfAFewValuesTakesNoOther () =
+  assertEq
+    (V.map said [
+       ["build", "--runtime", "silo"],
+       ["build", "--runtime", "jvm"],
+       ["fmt"],
+       ["fmt", "--width", "80"]
+     ])
+    [
+      "offline=False locked=False | build . | release=False O=None runtime=silo cfg= emit= workspace=False noPrune=False",
+      "`jvm` is not one of `glade`, `silo`",
+      "offline=False locked=False | fmt [] width=100 check=False",
+      "offline=False locked=False | fmt [] width=80 check=False"
+    ]
+    "one of them, or it is said which there are; and what is not given is what it says it is"
+
+@test fun optionsSeveralCommandsTakeAreOneType () =
+  assertEq
+    (V.map said [["run", "--release", "app"], ["run", "-O2"]])
+    [
+      "offline=False locked=False | run app [] | release=True O=None runtime=glade cfg= emit= workspace=False noPrune=False",
+      "offline=False locked=False | run . [] | release=False O=Just(2) runtime=glade cfg= emit= workspace=False noPrune=False"
+    ]
+    "`run` takes what `build` does, read by the one function"
+
+@test fun whatFollowsTheDashesIsKeptApart () =
+  assertEq
+    (V.map said [
+       ["run", "app", "--", "a", "--release"],
+       ["run", "--", "a", "b"],
+       ["run", "app", "a"],
+       ["run", "--release", "--"]
+     ])
+    [
+      "offline=False locked=False | run app [a --release] | ${plain}",
+      "offline=False locked=False | run . [a b] | ${plain}",
+      "`run` takes nothing more",
+      "offline=False locked=False | run . [] | release=True O=None runtime=glade cfg= emit= workspace=False noPrune=False"
+    ]
+    "after `--` nothing is a flag and nothing is the package; before it, nothing is the program's"
+
+@test fun whatEveryCommandTakesComesBeforeItOrAfter () =
+  assertEq
+    (V.map said [
+       ["--offline", "build"],
+       ["build", "--offline", "--locked"],
+       ["--locked", "fmt", "--offline", "a.mw"],
+       ["--offline", "--offline"]
+     ])
+    [
+      "offline=True locked=False | build . | ${plain}",
+      "offline=True locked=True | build . | ${plain}",
+      "offline=True locked=True | fmt [a.mw] width=100 check=False",
+      "offline=True locked=False | repl"
+    ]
+    "on either side of the command, or both"
+
+@test fun aProgramGivenNoCommandRunsTheOneItSays () =
+  assertEq
+    (V.map said [[], ["--offline"], ["--version"], ["-V"], ["help"], ["bild"], ["repl"]])
+    [
+      "offline=False locked=False | repl", "offline=True locked=False | repl", "tool 1.2.0",
+      "tool 1.2.0", "tool -- A compiler's command line, for the tests",
+      "there is no command `bild`", "there is no command `repl`"
+    ]
+    "none, or only what every command takes; its version; a word that is no command is still a mistake -- and so is the name of the one run when there is none, which has no name"
+
+@test fun aCommandWithNoNameIsNotListed () =
+  let help = (match askTool ["help"] with | Err (Help h) -> h | _ -> "") in
+  let script =
+    (match askTool ["completions", "bash"] with
+     | Err (Complete c) -> c
+     | _ -> "")
+  in assertEq
+       (
+         S.contains "\n  repl" help,
+         S.contains "With no command: Read entries and evaluate them" help,
+         S.contains "compgen -W \"build run fmt lsp help completions\"" script
+       )
+       (False, True, True)
+       "not among the commands, in help or in what is completed; help says what happens with none"
+
+@test fun helpSaysHowAFlagIsWritten () =
+  let help =
+    (match askTool ["help", "build"] with
+     | Err (Help h) -> S.split "\n" h
+     | _ -> [])
+  in
+  let line = \start -> M.unwrapOr "" (V.find (\l -> S.startsWith start (S.trimStart l)) help) in
+  assertEq
+    (V.map (\l -> S.trim (line l)) ["-O,", "--runtime", "--workspace", "--cfg", "--offline"])
+    [
+      "-O, --opt-level <LEVEL>   How hard to optimise",
+      "--runtime <runtime>       The runtime system [possible values: glade, silo] [default: glade]",
+      "--workspace               Every member of the workspace [alias: --all]",
+      "--cfg <FLAG>              Turn on a flag",
+      "--offline   Never fetch a dependency"
+    ]
+    "its letter, what it takes, what that may be, what it is otherwise, its other name -- and what every command takes, apart"

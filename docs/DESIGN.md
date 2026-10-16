@@ -819,7 +819,14 @@ constructor per command, holding what it was given, and `argsX ()`: the
 command the process was started with. `--help`, `help` and `help <command>`
 print help, `completions bash` a completion script, and a mistake is a
 diagnostic like any other -- drawn by Nettle against the command line itself,
-under the argument that is wrong.
+under the argument that is wrong. A flag is its field's name with a dash for
+each capital, and may be given a letter, other names, or its name exactly; an
+`Option [T]` is given any number of times and any other only once; an option
+may be one of a few values, or something where it is not given. Options that
+several commands take are declared once and held by each as one type, so
+what reads them is one function; those every command takes come before the
+command or after it; and a program may say its version, and the command it
+runs when it is given none.
 
 **`lsp!`** declares a language server over the compiler's database: `text` is
 how the editor's text becomes an input, and each other feature a function of
@@ -838,6 +845,16 @@ that is worked out again, so hovering after an edit reads an elaboration that
 was only redone for the file that changed. The protocol is Lingua's -- its
 framing, which needs Meadow's `Console.readExact`, its UTF-16 positions, the
 documents open -- and the server says it can do exactly what it was given.
+What Lingua has no feature for is the language's to answer: `requests` are
+methods and what answers each, a function of the database and what was asked
+-- the file, its text, the byte pointed at, the parameters as they came -- so
+that hints, lenses, workspace symbols and a method only this language has
+(`miniml/type`) are each a query like any other. A server does one thing at
+a time unless it is `threaded`: then one thread reads, one looks for what is
+wrong, and one answers, so that a request is answered while a file is being
+checked, and an edit stops the checking -- the database is interrupted, and
+every read of it answers `Interrupted` until it is allowed again -- before
+it sets the text.
 
 **`repl!`** declares a prompt over the compiler's database, with the
 server's features: what is being typed is a file of the session, and `text`,
@@ -857,7 +874,11 @@ is -- `tokensServer`, which is also what it tells the editor, name resolution
 and all -- and where it has none, from the tree. How each class is shown is a
 theme, of which a prompt has several built in; a line that starts with `:` is
 for the prompt and not the language, and `:theme` lists them, each in its own
-colours, while `:theme quiet` turns one on. What is written is `runRepl ()`.
+colours, while `:theme quiet` turns one on; `:help` says what such lines
+there are and `:quit` ends the prompt. `commands` are the language's own:
+each a name, what is written after it, what help says of it, and a function
+of the database and the rest of the line that says something, enters an
+entry, or ends the prompt. What is written is `runRepl ()`.
 
 The line, the finder's matching and its drawing are packages of their own,
 which a compiler not written with Lingua can use as well:
