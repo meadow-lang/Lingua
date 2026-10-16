@@ -36,6 +36,7 @@ Only `text` and `eval` are required. Each of the others turns something on.
 | `errors`       | `db -> Int -> [Int]`                         | where the parser's errors are, in bytes    |
 | `completion`   | `db -> Int -> Int -> [(String, String)]`     | Tab: names and what each is, at a byte     |
 | `declarations` | `db -> Int -> [(String, String, String)]`    | Ctrl-F: name, what it is, what is said of it |
+| `search`       | `db -> Int -> String -> [Hit]`               | Ctrl-F, answered by the language: see [A language's own search](#a-languages-own-search) |
 | `indent`       | `Green k -> String`                          | what a continuation line opens with        |
 | `commands`     | `[(String, String, String, db -> String -> Reply)]` | the language's own `:` lines        |
 | `prompt`       | text                                         | what a line starts with; `"> "` if omitted |
@@ -110,7 +111,8 @@ The prompt converts from the cursor's character position.
 
 ## The finder
 
-Ctrl-F opens a finder under the line, listing what `declarations` answered.
+Ctrl-F opens a finder under the line, listing what `declarations` answered,
+or what the language's `search` finds.
 
 - Typing narrows the list to the declarations the letters are found in, the
   likeliest first. Matching is [Fuzzy](https://github.com/meadow-lang/Fuzzy)'s,
@@ -131,6 +133,46 @@ Ctrl-F opens a finder under the line, listing what `declarations` answered.
 
 It is drawn with [Doodle](https://github.com/meadow-lang/Doodle), twelve rows
 high and up to a hundred columns wide.
+
+### A language's own search
+
+`declarations` is a list the finder ranks by the letters typed. A language
+that knows more, such as what fits a type, gives `search` instead:
+
+```meadow
+search : db -> Int -> String -> [Hit]
+```
+
+It is asked on every keystroke with the query as typed, and what it answers
+is shown in its order: the language decides what a query means and ranks what
+it finds. A query that looks like a type can be matched against signatures,
+up to argument order or instantiation, with the closest first. With `search`,
+`declarations` is not used.
+
+A `Lingua.Repl.Hit` is six texts:
+
+| part     | is                                                              |
+| -------- | --------------------------------------------------------------- |
+| name     | what the list shows                                             |
+| kind     | what it is: its type, its kind                                  |
+| from     | where it is from: a module                                      |
+| doc      | what is said of it                                              |
+| insert   | the text choosing it puts on the line, in place of the partial name before the cursor |
+| before   | an entry to run before the line it was chosen for, or nothing  |
+
+The pane beside the list shows the kind, where it is from, what is said of
+it, and what choosing it will do: `first runs: use Std.List as List` when it
+brings an entry with it, or `puts: List.map` when what it puts is not its
+name. A name that is not in scope is chosen as `List.map` with the `use` that
+brings it in; the `use` is entered just before the line, when the line is
+entered.
+
+For names, `Lingua.Repl.ranked query textOf xs` is the finder's own ranking,
+and `declared query decls` is what it does with `declarations`; a `search`
+can use either and add what it finds by type.
+
+The search runs on every key, so it should be quick: a query over an index of
+declarations the database keeps, not a walk over the program.
 
 ## Colour
 
@@ -289,6 +331,7 @@ continuation, completion, the finder, colour and themes written this way.
 Everything `repl!` writes is a call into `Lingua.Repl`, which is usable
 directly: `unfinished`, `candidates`, `painted`, `coloured`, `finder`,
 `findKey`, `findDrawn`, `themes`, `themeNamed`, `command`, `commandOf`,
-`commandNames`, `commandCandidates`, `helped`, `editorOf`, `run`.
+`commandNames`, `commandCandidates`, `helped`, `Hit`, `ranked`, `declared`,
+`finderOf`, `findWith`, `editorOf`, `run`.
 The three packages underneath work without Lingua at all, for a compiler not
 written with it.

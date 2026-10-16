@@ -33,6 +33,9 @@
 --   declarations  db -> Int -> [(String, String, String)]    Ctrl-F: each a
 --                                                  name, what it is, and what
 --                                                  is said of it
+--   search        db -> Int -> String -> [Hit]     Ctrl-F, answered by the
+--                                                  language: what a query
+--                                                  finds, the likeliest first
 --   indent        Green k -> String                what the line after an
 --                                                  unfinished entry opens
 --                                                  with: a formatter's
@@ -358,54 +361,81 @@ fun isNameChar (c : Char) : Bool = C.isAlphaNum c or C.code c == 95 or C.code c 
 
 -- --- the finder --------------------------------------------------------------
 
--- A finder: what has been typed in it, which of what that finds is chosen,
--- and everything there is to find -- each a name, what it is, and what is
--- said of it.
-@pub data Finder = Finder String Int [(String, String, String)]
-
-@pub fun finder (decls : [(String, String, String)]) : Finder = Finder "" 0 decls
-
--- What a key did: the finder goes on; a name was chosen; or it was put away.
+-- What the finder finds: a name; what it is -- its type, its kind; where it
+-- is from; what is said of it; the text choosing it puts on the line; and an
+-- entry to run before the line it is chosen for, or nothing -- a `use` that
+-- brings the name into scope.
 @derive(Debug, PartialEq)
-@pub data Found = Looking | Chose String | PutAway
+@pub data Hit = Hit String String String String String String
+
+@pub fun hitName (h : Hit) : String = match h with | Hit n _ _ _ _ _ -> n
+
+@pub fun hitInsert (h : Hit) : String = match h with | Hit _ _ _ _ i _ -> i
+
+@pub fun hitBefore (h : Hit) : String = match h with | Hit _ _ _ _ _ b -> b
+
+-- `xs` as a query ranks them: what the query's letters are found in, the
+-- likeliest first, by the text `textOf` gives each -- and all of them, as
+-- they came, for a query of nothing. Fuzzy's ranking, for a language's
+-- `search` to use for names.
+@pub fun ranked (query : String) (textOf : a -> String) (xs : [a]) : [a] =
+  if S.isEmpty (S.trim query) then xs else V.map fst (F.rank query textOf xs)
+
+-- What a query finds among declarations, each a name, what it is and what is
+-- said of it: what a finder with no `search` shows.
+@pub fun declared (query : String) (decls : [(String, String, String)]) : [Hit] =
+  V.map
+    (\d -> match d with | (n, what, said) -> Hit n what "" said n "")
+    (ranked query (\d -> match d with | (n, what, _) -> n ++ " " ++ what) decls)
+
+-- A finder: what has been typed in it, which of what that finds is chosen,
+-- and what a query finds.
+@pub data Finder e = Finder String Int (String -> [Hit] ! e)
+
+@pub fun finder (decls : [(String, String, String)]) : Finder e =
+  Finder "" 0 (\q -> declared q decls)
+
+-- A finder whose queries `look` answers.
+@pub fun finderOf (look : String -> [Hit] ! e) : Finder e = Finder "" 0 look
+
+-- What a key did: the finder goes on; something was chosen; or it was put
+-- away.
+@derive(Debug, PartialEq)
+@pub data Found = Looking | Chose Hit | PutAway
 
 use Found.*
 
--- What the finder shows: everything, as it came, while nothing is typed;
--- then what the query is found in, the likeliest first.
-@pub fun shownIn (f : Finder) : [(String, String, String)] =
-  match f with
-  | Finder query _ decls ->
-      if S.isEmpty (S.trim query) then decls
-      else V.map fst (F.rank query (\d -> match d with | (n, what, _) -> n ++ " " ++ what) decls)
+-- What the finder shows: what its query finds.
+@pub fun shownIn (f : Finder e) : [Hit] ! e = match f with | Finder query _ look -> look query
 
-@pub fun findKey (f : Finder) (key : Key) : (Finder, Found) =
+@pub fun findKey (f : Finder e) (key : Key) : (Finder e, Found) ! e =
   match f with
-  | Finder query at decls ->
+  | Finder query at look ->
       let count = V.len (shownIn f) in
-      let to = \i -> (Finder query (max 0 (min (count - 1) i)) decls, Looking) in
+      let to = \i -> (Finder query (max 0 (min (count - 1) i)) look, Looking) in
       match key.code with
       | Escape -> (f, PutAway)
       | Enter ->
           (match V.get (shownIn f) at with
-           | Just (n, _, _) -> (f, Chose n)
+           | Just h -> (f, Chose h)
            | None -> (f, PutAway))
       | Up -> to (at - 1)
       | Down -> to (at + 1)
       | Backspace ->
-          (Finder (S.fromChars (V.take (S.chars query) (S.charLength query - 1))) 0 decls, Looking)
+          (Finder (S.fromChars (V.take (S.chars query) (S.charLength query - 1))) 0 look, Looking)
       | Character c ->
           if key.ctrl then
             (if c == "c" or c == "g" or c == "f" then (f, PutAway)
              else if c == "p" then to (at - 1)
              else if c == "n" then to (at + 1)
              else (f, Looking))
-          else (Finder (query ++ c) 0 decls, Looking)
+          else (Finder (query ++ c) 0 look, Looking)
       | _ -> (f, Looking)
 
 -- The finder, drawn `cols` wide: the query, what it finds with the chosen
--- one marked, and beside them what the chosen one is and what is said of it.
-@pub fun findDrawn (f : Finder) (cols : Int) : Buffer =
+-- one marked, and beside them what the chosen one is, where it is from, what
+-- is said of it, and what choosing it will do.
+@pub fun findDrawn (f : Finder e) (cols : Int) : Buffer ! e =
   match f with
   | Finder query at _ ->
       let found = shownIn f in
@@ -419,30 +449,36 @@ use Found.*
       let names = V.getOr rest sides 0 in
       let about = V.getOr rest sides 2 in
       let b2 = D.writeSpans b1 top 0 0 [("> ", D.dimmed D.style), (query, D.style)] in
-      let b3 =
-        D.list
-          b2
-          names
-          (V.map (\d -> match d with | (n, _, _) -> (n, D.style)) found)
-          at
-          (D.invert D.style)
-      in match V.get found at with
-         | None -> D.writeIn b3 about 0 0 (D.dimmed D.style) "nothing found"
-         | Just (n, what, said) ->
-             let b4 = D.writeIn b3 about 0 0 (D.bold D.style) n in
-             let b5 = D.paragraph b4 (D.rect about.x (about.y + 1) about.w 2) D.style what in
-             D.paragraph
-               b5
-               (D.rect about.x (about.y + 4) about.w (about.h - 4))
-               (D.dimmed D.style)
-               said
+      let b3 = D.list b2 names (V.map (\h -> (hitName h, D.style)) found) at (D.invert D.style) in
+      match V.get found at with
+      | None -> D.writeIn b3 about 0 0 (D.dimmed D.style) "nothing found"
+      | Just (Hit n what from said insert before) ->
+          let b4 = D.writeIn b3 about 0 0 (D.bold D.style) n in
+          let b5 = D.paragraph b4 (D.rect about.x (about.y + 1) about.w 2) D.style what in
+          let b6 = if S.isEmpty from then b5 else D.writeIn b5 about 0 3 (D.dimmed D.style) from in
+          let b7 =
+            D.paragraph
+              b6
+              (D.rect about.x (about.y + 4) about.w (about.h - 5))
+              (D.dimmed D.style)
+              said
+          in
+          let doing =
+            if not (S.isEmpty before) then "first runs: ${before}"
+            else if insert != n then "puts: ${insert}"
+            else ""
+          in if S.isEmpty doing then b7
+             else D.writeIn b7 about 0 (about.h - 1) (D.dimmed D.style) doing
 
--- The finder shown under the cursor's line until a name is chosen or it is
--- put away, and then gone: the name, if one was.
+-- The finder shown under the cursor's line until something is chosen or it
+-- is put away, and then gone: the name, if one was.
 @pub fun find (decls : [(String, String, String)]) : Maybe String ! { Console | e } =
-  finding (finder decls)
+  M.map hitName (finding (finder decls))
 
-fun finding (f : Finder) : Maybe String ! { Console | e } =
+-- The same, of any finder: what was chosen, if anything was.
+@pub fun findWith f = finding f
+
+fun finding f =
   let cols = fst (T.size ()) in
   let u = writeOutput (D.below (findDrawn f (if cols > 0 then cols else 80))) in
   match T.nextEvent () with
@@ -450,7 +486,7 @@ fun finding (f : Finder) : Maybe String ! { Console | e } =
   | Event.Pressed key ->
       (match findKey f key with
        | (f2, Looking) -> finding f2
-       | (_, Chose n) -> (let w = writeOutput D.eraseBelow in Just n)
+       | (_, Chose h) -> (let w = writeOutput D.eraseBelow in Just h)
        | (_, PutAway) -> (let w = writeOutput D.eraseBelow in None))
   | _ -> finding f
 
@@ -458,10 +494,13 @@ fun finding (f : Finder) : Maybe String ! { Console | e } =
 
 -- The line's editor, of what the compiler says of a text: its tree, where
 -- the parser's errors are, what a kind is called, what the next line opens
--- with, what could be written at a byte of it, what there is to find --
--- none, for a prompt with no finder -- and the names of its commands.
+-- with, what could be written at a byte of it, what a query of the finder
+-- finds in it -- nothing, for a prompt with no finder -- and the names of
+-- its commands. `pending` is where an entry to run before the line is kept
+-- when the finder's choice has one.
 @pub fun editorOf
     theme
+    pending
     (prompt : String)
     paint
     treeOf
@@ -469,17 +508,21 @@ fun finding (f : Finder) : Maybe String ! { Console | e } =
     name
     indentOf
     completionsOf
-    declsOf
+    lookOf
     (commands : [String]) =
   let found =
     \text at ->
-      match find (declsOf text) with
-      | Just n ->
+      match findWith (finderOf (\q -> lookOf text q)) with
+      | Just h ->
+          let n = hitInsert h in
           let cs = S.chars text in
           let from = nameStart text at in
-          Bound.Edited
-            (S.fromChars (V.concat [V.take cs from, S.chars n, V.drop cs at]))
-            (from + S.charLength n)
+          let u =
+            if S.isEmpty (hitBefore h) then ()
+            else setRef pending (V.pushBack (getRef pending) (hitBefore h))
+          in Bound.Edited
+               (S.fromChars (V.concat [V.take cs from, S.chars n, V.drop cs at]))
+               (from + S.charLength n)
       | None -> Bound.Kept
   in {
        LE.editor | prompt,
@@ -504,14 +547,17 @@ fun finding (f : Finder) : Maybe String ! { Console | e } =
 
 -- Entries read with `editor` and each printed as `eval` says, until there
 -- are no more: kept in the file `history`, when it names one.
--- `editorOn` is the editor, given the cell the theme that is on is kept in:
--- a line that starts with `:` is a command, and may change it. `commands`
+-- `editorOn` is the editor, given the cell the theme that is on is kept in
+-- -- a line that starts with `:` is a command, and may change it -- and the
+-- one the entries the finder's choices bring with them wait in. `commands`
 -- are the language's own, each given `db` and the rest of its line.
 @pub fun run editorOn (theme : String) (history : String) eval db commands =
   let on = newRef (themeOr theme) in
+  let pending = newRef [] in
   entering
-    (editorOn on)
+    (editorOn on pending)
     on
+    pending
     history
     eval
     db
@@ -527,12 +573,12 @@ fun entered (history : String) eval (text : String) =
   let u = if S.isEmpty history then () else LE.saveEntry history text in
   writeOutput (eval text ++ "\n")
 
-fun entering editor on (history : String) eval db commands (before : [String]) =
+fun entering editor on pending (history : String) eval db commands (before : [String]) =
   match LE.readEntry editor before with
   | Outcome.Ended -> ()
-  | Outcome.Interrupted -> entering editor on history eval db commands before
+  | Outcome.Interrupted -> entering editor on pending history eval db commands before
   | Outcome.Entered text ->
-      if S.isEmpty (S.trim text) then entering editor on history eval db commands before
+      if S.isEmpty (S.trim text) then entering editor on pending history eval db commands before
       else if isCommand text then
         let again = V.pushBack before text in
         let say = \said -> if S.isEmpty said then () else writeOutput (said ++ "\n") in
@@ -542,25 +588,31 @@ fun entering editor on (history : String) eval db commands (before : [String]) =
              | Just (_, _, _, act) ->
                  (match act db rest with
                   | Reply.Said said ->
-                      (let w = say said in entering editor on history eval db commands again)
+                      (let w = say said in
+                       entering editor on pending history eval db commands again)
                   | Reply.Entry entry ->
                       (let w = entered history eval entry in
-                       entering editor on history eval db commands again)
+                       entering editor on pending history eval db commands again)
                   | Reply.Leave said -> say said)
              | None ->
                  if name == "quit" then ()
                  else if name == "help" then
                    (let w = say (helped commands) in
-                    entering editor on history eval db commands again)
+                    entering editor on pending history eval db commands again)
                  else
                    (match command text (getRef on) (commandNames commands) with
                     | (said, now) ->
                         let u = setRef on now in
                         let w = say said in
-                        entering editor on history eval db commands again))
+                        entering editor on pending history eval db commands again))
       else
+        -- What the finder's choices on this line bring with them -- a `use`
+        -- for a name not in scope -- is run first.
+        let first = getRef pending in
+        let u = setRef pending [] in
+        let r = V.foldl (\acc b -> entered history eval b) () first in
         let w = entered history eval text in
-        entering editor on history eval db commands (V.pushBack before text)
+        entering editor on pending history eval db commands (V.pushBack before text)
 
 -- --- repl! -------------------------------------------------------------------
 
@@ -599,8 +651,8 @@ def replCall : Parser Tokens (Bool, String, String, String, [ReplFeature]) =
 
 def replFeatures : [String] =
   [
-    "text", "eval", "tree", "errors", "completion", "declarations", "indent", "commands", "prompt",
-    "history", "theme"
+    "text", "eval", "tree", "errors", "completion", "declarations", "search", "indent", "commands",
+    "prompt", "history", "theme"
   ]
 
 def replWritten : [String] = ["prompt", "history", "theme"]
@@ -669,10 +721,13 @@ fun replCode pub name lang db (server : Maybe String) fs =
      | Just f -> "(\\t at -> ${setting "t"}${f} db 0 at))"
      | None -> "(\\t at -> [])")
   in
+  -- What the finder shows: what the language's `search` finds, or else its
+  -- declarations ranked by the letters of the query.
   let decls =
-    (match given "declarations" with
-     | Just f -> "(\\t -> ${setting "t"}${f} db 0))"
-     | None -> "(\\t -> [])")
+    (match (given "search", given "declarations") with
+     | (Just f, _) -> "(\\t q -> ${setting "t"}${f} db 0 q))"
+     | (None, Just f) -> "(\\t q -> LinguaRepl.declared q (${setting "t"}${f} db 0)))"
+     | (None, None) -> "(\\t q -> [])")
   in
   let commands = M.unwrapOr "[]" (given "commands") in
   "use Lingua.Repl as LinguaRepl
@@ -681,7 +736,7 @@ fun replCode pub name lang db (server : Maybe String) fs =
 ${pub}fun run${name} () =
   let db = new${db} () in
   LinguaRepl.run
-    (\\theme -> LinguaRepl.editorFor theme ${quoted (M.unwrapOr "> " (given "prompt"))} ${paint} ${tree} ${errors} (\\k -> display k) ${indent} ${completion} ${decls} (LinguaRepl.commandNames ${commands}))
+    (\\theme pending -> LinguaRepl.editorFor theme pending ${quoted (M.unwrapOr "> " (given "prompt"))} ${paint} ${tree} ${errors} (\\k -> display k) ${indent} ${completion} ${decls} (LinguaRepl.commandNames ${commands}))
     ${quoted (fn "theme")}
     ${quoted (fn "history")}
     (\\t -> ${setting "t"}${fn "eval"} db 0))
@@ -707,6 +762,7 @@ fun quoted (s : String) : String =
 -- that colours nothing and takes every entry as finished.
 @pub fun editorFor
     theme
+    pending
     (prompt : String)
     paint
     treeOf
@@ -714,11 +770,11 @@ fun quoted (s : String) : String =
     name
     indentOf
     completionsOf
-    declsOf
+    lookOf
     (commands : [String]) =
   match treeOf with
   | Just tree ->
-      editorOf theme prompt paint tree errorsOf name indentOf completionsOf declsOf commands
+      editorOf theme pending prompt paint tree errorsOf name indentOf completionsOf lookOf commands
   | None ->
       {
         LE.editor | prompt,
@@ -763,11 +819,14 @@ def things : [(String, String, String)] =
 
 fun keys (text : String) : [Key] = V.map (\c -> T.key (Character (C.toString c))) (S.chars text)
 
-fun after (ks : [Key]) : (Finder, Found) =
+fun after (ks : [Key]) : (Finder e, Found) =
   V.foldl (\acc k -> findKey (fst acc) k) (finder things, Looking) ks
 
+-- The name of what was chosen, if anything was.
+fun chosen (f : Found) : Maybe String = match f with | Chose h -> Just (hitName h) | _ -> None
+
 @test fun theFinderNarrowsAsItIsTypedIn () =
-  let names = \f -> V.map (\d -> match d with | (n, _, _) -> n) (shownIn f) in
+  let names = \f -> V.map hitName (shownIn f) in
   let a =
     assertEq (names (finder things)) ["length", "lines", "map"] "everything, with nothing typed"
   in
@@ -785,15 +844,20 @@ fun after (ks : [Key]) : (Finder, Found) =
     "and what there was, with the letter taken back"
 
 @test fun theFinderChoosesOrIsPutAway () =
-  let a = assertEq (snd (after [T.key Down, T.key Enter])) (Chose "lines") "the second, chosen" in
+  let a =
+    assertEq (chosen (snd (after [T.key Down, T.key Enter]))) (Just "lines") "the second, chosen"
+  in
   let b =
     assertEq
-      (snd (after [T.key Down, T.key Down, T.key Down, T.key Up, T.key Enter]))
-      (Chose "lines")
+      (chosen (snd (after [T.key Down, T.key Down, T.key Down, T.key Up, T.key Enter])))
+      (Just "lines")
       "no further down than the last"
   in
   let c =
-    assertEq (snd (after (V.append (keys "ma") [T.key Enter]))) (Chose "map") "the one found"
+    assertEq
+      (chosen (snd (after (V.append (keys "ma") [T.key Enter]))))
+      (Just "map")
+      "the one found"
   in
   let d = assertEq (snd (after [T.key Escape])) PutAway "Escape puts it away" in
   assertEq
@@ -922,3 +986,60 @@ def spoken : [(String, String, String, () -> String -> Reply)] =
   in
   let b = assertEq (commandCandidates ":" 1 names) (1, names) "every one, after the colon alone" in
   assertEq (commandCandidates ":type qu" 8 names) (8, []) "and nothing after the name"
+
+-- A language's own search: `map`'s type, from a library not in scope.
+fun library (q : String) : [Hit] =
+  if q == "(a -> b) -> [a] -> [b]" or S.isEmpty q then
+    [Hit
+       "map"
+       "(a -> b) -> [a] -> [b]"
+       "Std.List"
+       "Each, through a function."
+       "List.map"
+       "use Std.List as List"]
+  else []
+
+@test fun aLanguagesSearchAnswersTheFinder () =
+  let typed = \text -> V.map (\c -> T.key (Character (C.toString c))) (S.chars text) in
+  let f =
+    V.foldl (\acc k -> fst (findKey acc k)) (finderOf library) (typed "(a -> b) -> [a] -> [b]")
+  in
+  let a = assertEq (V.map hitName (shownIn f)) ["map"] "found by its type" in
+  let drawn = D.plain (findDrawn f 80) in
+  let b =
+    assertEq
+      (
+        V.any (\l -> S.contains "Std.List" l) drawn,
+        V.any (\l -> S.contains "first runs: use Std.List as List" l) drawn
+      )
+      (True, True)
+      "where it is from, and that choosing it runs the `use` that brings it in"
+  in assertEq (chosen (snd (findKey f (T.key Enter)))) (Just "map") "and it is what Enter chooses"
+
+@test fun aChoiceRunsWhatItBringsBeforeItsLine () =
+  -- The finder's choice puts `List.map` on the line, and the `use` it needs
+  -- is entered just before that line is.
+  let editorOn =
+    \theme pending ->
+      editorOf
+        theme
+        pending
+        "> "
+        None
+        (\t -> G.token "Text" t)
+        (\t -> [])
+        (\k -> "")
+        (\g -> "")
+        (\t at -> [])
+        (\t q -> library q)
+        []
+  in
+  let events = V.map (\k -> Event.Pressed k) [T.ctrl "f", T.key Enter, T.key Enter] in
+  let out =
+    snd
+      (withOutput (\() ->
+         T.withEvents events (\() -> run editorOn "plain" "" (\t -> "ran ${t}") () [])))
+  in assertEq
+       (S.contains "ran use Std.List as List\nran List.map\n" out)
+       True
+       "the `use`, then the line"
