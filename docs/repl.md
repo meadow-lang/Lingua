@@ -227,9 +227,9 @@ The finder is the pane Ctrl-F opens, unless a pane of the language's takes
 Ctrl-F. A pane's state is hidden in what `pane` makes, so panes of different
 states are one list.
 
-A pane a command opens has no line to put text on. Until the prompt can start
-an entry from given text, what such a pane puts is entered, after its
-`before`.
+A pane a command opens has no line to put text on: what it puts begins the
+next entry instead, the cursor after it, for its user to go on with, and its
+`before` is entered with that entry.
 
 ## Colour
 
@@ -327,6 +327,7 @@ the line, trimmed. It answers a `Lingua.Repl.Reply`:
 | -------------- | ------------------------------------------------------------ |
 | `Said text`    | writes `text`, or nothing if it is empty, and reads on       |
 | `Entry text`   | enters `text` as if it had been typed: evaluated, and kept in the history file |
+| `Edit text`    | begins the next entry with `text`, the cursor after it, for its user to go on with |
 | `Leave text`   | writes `text` and ends                                       |
 
 The database is the one the entries are typed into, so a command asks the
@@ -380,8 +381,6 @@ continuation, completion, the finder, colour and themes written this way.
   one with `| theme = …`.
 - **Tab completes a command's name, not what follows it.** A command that takes
   an expression gets no completion inside it.
-- **A command cannot put text on the line to be edited.** `Entry` enters it at
-  once.
 
 ## By hand
 

@@ -287,9 +287,14 @@ fun sample (theme : Theme) : String =
 -- does, given the database and the rest of the line.
 
 -- What a command answers: something said; an entry, entered as if it had
--- been typed; or something said, and the prompt ended.
+-- been typed; text the next entry begins with, for its user to go on with;
+-- or something said, and the prompt ended.
 @derive(Debug, PartialEq)
-@pub data Reply = Said String | Entry String | Leave String
+@pub data Reply
+  = Said String
+  | Entry String
+  | Edit String
+  | Leave String
 
 -- The commands every prompt has: each its name, what is written after it,
 -- and what help says of it.
@@ -641,7 +646,7 @@ fun paneBindings pending lookOf panes =
       | Step.Enter t ->
           (let u =
              (match getRef pending with
-              | (first, _) -> setRef pending (first, Just t))
+              | (first, _, next) -> setRef pending (first, Just t, next))
            in Bound.Entering)
       | _ -> Bound.Kept
   in
@@ -657,7 +662,12 @@ fun paneBindings pending lookOf panes =
 
 fun broughtFirst pending (entry : String) =
   match getRef pending with
-  | (first, instead) -> setRef pending (V.pushBack first entry, instead)
+  | (first, instead, next) -> setRef pending (V.pushBack first entry, instead, next)
+
+-- The text the next entry begins with.
+fun beginNext pending (text : String) =
+  match getRef pending with
+  | (first, instead, _) -> setRef pending (first, instead, text)
 
 -- Entries read with `editor` and each printed as `eval` says, until there
 -- are no more: kept in the file `history`, when it names one.
@@ -668,7 +678,7 @@ fun broughtFirst pending (entry : String) =
 -- `panes` are the language's; those a command opens are opened here.
 @pub fun run editorOn (theme : String) (history : String) eval db commands panes =
   let on = newRef (themeOr theme) in
-  let pending = newRef ([], None) in
+  let pending = newRef ([], None, "") in
   entering
     (editorOn on pending)
     on
@@ -690,63 +700,75 @@ fun entered (history : String) eval (text : String) =
   writeOutput (eval text ++ "\n")
 
 fun entering editor on pending (history : String) eval db commands panes (before : [String]) =
-  match LE.readEntry editor before with
-  | Outcome.Ended -> ()
-  | Outcome.Interrupted -> entering editor on pending history eval db commands panes before
-  | Outcome.Entered typed ->
-      -- A pane that entered text entered it in place of the line.
-      let text =
-        (match getRef pending with
-         | (first, Just t) -> (let u = setRef pending (first, None) in t)
-         | _ -> typed)
-      in if S.isEmpty (S.trim text) then
-           entering editor on pending history eval db commands panes before
-         else if isCommand text then
-           let again = V.pushBack before text in
-           let say = \said -> if S.isEmpty said then () else writeOutput (said ++ "\n") in
-           (match commandOf text with
-            | (name, rest) ->
-                match V.find (\p -> fst p == ":${name}") panes with
-                | Just (_, make) ->
-                    (match showing (make rest (S.charLength rest)) with
-                     | Step.Put t _ first ->
-                         (let u = if S.isEmpty first then () else entered history eval first in
-                          let w = entered history eval t in
-                          entering editor on pending history eval db commands panes again)
-                     | Step.Enter t ->
-                         (let w = entered history eval t in
-                          entering editor on pending history eval db commands panes again)
-                     | _ -> entering editor on pending history eval db commands panes again)
-                | None ->
-                    match V.find (\c -> match c with | (n, _, _, _) -> n == name) commands with
-                    | Just (_, _, _, act) ->
-                        (match act db rest with
-                         | Reply.Said said ->
-                             (let w = say said in
+  -- What a command or a pane left on the line, to begin the entry with.
+  let next =
+    (match getRef pending with
+     | (first, instead, n) -> (let u = setRef pending (first, instead, "") in n))
+  in match LE.readEntryFrom editor before next with
+     | Outcome.Ended -> ()
+     | Outcome.Interrupted -> entering editor on pending history eval db commands panes before
+     | Outcome.Entered typed ->
+         -- A pane that entered text entered it in place of the line.
+         let text =
+           (match getRef pending with
+            | (first, Just t, n) -> (let u = setRef pending (first, None, n) in t)
+            | _ -> typed)
+         in if S.isEmpty (S.trim text) then
+              entering editor on pending history eval db commands panes before
+            else if isCommand text then
+              let again = V.pushBack before text in
+              let say = \said -> if S.isEmpty said then () else writeOutput (said ++ "\n") in
+              (match commandOf text with
+               | (name, rest) ->
+                   match V.find (\p -> fst p == ":${name}") panes with
+                   | Just (_, make) ->
+                       (match showing (make rest (S.charLength rest)) with
+                        | Step.Put t _ first ->
+                            -- There is no line to put it on: the next entry
+                            -- begins with it, and what it brings waits for that.
+                            (let u = if S.isEmpty first then () else broughtFirst pending first in
+                             let w = beginNext pending t in
+                             entering editor on pending history eval db commands panes again)
+                        | Step.Enter t ->
+                            (let w = entered history eval t in
+                             entering editor on pending history eval db commands panes again)
+                        | _ -> entering editor on pending history eval db commands panes again)
+                   | None ->
+                       match V.find (\c -> match c with | (n, _, _, _) -> n == name) commands with
+                       | Just (_, _, _, act) ->
+                           (match act db rest with
+                            | Reply.Said said ->
+                                (let w = say said in
+                                 entering editor on pending history eval db commands panes again)
+                            | Reply.Edit text ->
+                                (let w = beginNext pending text in
+                                 entering editor on pending history eval db commands panes again)
+                            | Reply.Entry entry ->
+                                (let w = entered history eval entry in
+                                 entering editor on pending history eval db commands panes again)
+                            | Reply.Leave said -> say said)
+                       | None ->
+                           if name == "quit" then ()
+                           else if name == "help" then
+                             (let w = say (helped commands) in
                               entering editor on pending history eval db commands panes again)
-                         | Reply.Entry entry ->
-                             (let w = entered history eval entry in
-                              entering editor on pending history eval db commands panes again)
-                         | Reply.Leave said -> say said)
-                    | None ->
-                        if name == "quit" then ()
-                        else if name == "help" then
-                          (let w = say (helped commands) in
-                           entering editor on pending history eval db commands panes again)
-                        else
-                          (match command text (getRef on) (commandNames commands) with
-                           | (said, now) ->
-                               let u = setRef on now in
-                               let w = say said in
-                               entering editor on pending history eval db commands panes again))
-         else
-           -- What the finder's choices on this line bring with them -- a `use`
-           -- for a name not in scope -- is run first.
-           let first = (match getRef pending with | (f, _) -> f) in
-           let u = setRef pending ([], None) in
-           let r = V.foldl (\acc b -> entered history eval b) () first in
-           let w = entered history eval text in
-           entering editor on pending history eval db commands panes (V.pushBack before text)
+                           else
+                             (match command text (getRef on) (commandNames commands) with
+                              | (said, now) ->
+                                  let u = setRef on now in
+                                  let w = say said in
+                                  entering editor on pending history eval db commands panes again))
+            else
+              -- What the finder's choices on this line bring with them -- a `use`
+              -- for a name not in scope -- is run first.
+              let first = (match getRef pending with | (f, _, _) -> f) in
+              let u =
+                (match getRef pending with
+                 | (_, _, n) -> setRef pending ([], None, n))
+              in
+              let r = V.foldl (\acc b -> entered history eval b) () first in
+              let w = entered history eval text in
+              entering editor on pending history eval db commands panes (V.pushBack before text)
 
 -- --- repl! -------------------------------------------------------------------
 
@@ -1255,9 +1277,47 @@ fun counting (events : [Key]) =
        False
        "closed, it leaves nothing"
 
-@test fun aPaneACommandOpensIsShownToo () =
-  let typed = V.map (\c -> T.key (Character (C.toString c))) (S.chars ":count") in
+@test fun aPaneACommandOpensPutsItsTextOnTheNextLine () =
+  let typed = \text -> V.map (\c -> T.key (Character (C.toString c))) (S.chars text) in
   assertEq
-    (S.contains "ran n=1\n" (counting (V.concat [typed, [T.key Enter, T.key Up, T.key Enter]])))
+    (S.contains
+       "ran n=1 + 1\n"
+       (counting
+          (V.concat [
+             typed ":count",
+             [T.key Enter, T.key Up, T.key Enter],
+             typed " + 1",
+             [T.key Enter]
+           ])))
     True
-    "opened by its command, and what it puts entered"
+    "opened by its command; what it puts begins the next entry, and is gone on with there"
+
+@test fun aCommandMayPutTextOnTheNextLine () =
+  let edits = [("again", "", "the last entry, to go on with", \db rest -> Reply.Edit "1 + 2")] in
+  let editorOn =
+    \theme pending ->
+      editorOf
+        theme
+        pending
+        "> "
+        (Just (\th t -> t))
+        (\t -> G.token "Text" t)
+        (\t -> [])
+        (\k -> "")
+        (\g -> "")
+        (\t at -> [])
+        (\t q -> [])
+        (commandNames edits)
+        []
+  in
+  let typed = \text -> V.map (\c -> T.key (Character (C.toString c))) (S.chars text) in
+  let events =
+    V.map
+      (\k -> Event.Pressed k)
+      (V.concat [typed ":again", [T.key Enter], typed " * 3", [T.key Enter]])
+  in
+  let out =
+    snd
+      (withOutput (\() ->
+         T.withEvents events (\() -> run editorOn "plain" "" (\t -> "ran ${t}") () edits [])))
+  in assertEq (S.contains "ran 1 + 2 * 3\n" out) True "the text it gave, gone on with and entered"
