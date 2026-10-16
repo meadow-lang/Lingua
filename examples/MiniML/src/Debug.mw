@@ -287,7 +287,7 @@ use MiniML.Compiler (runSource)
 
 -- The machine run to its end, as the evaluator runs a program.
 fun runToEnd (source : String) =
-  let path = written source in
+  let path = written "run${show (stringByteLength source)}" source in
   match launched path (J.jObject []) with
   | Err why -> why
   | Ok m ->
@@ -298,9 +298,11 @@ fun runToEnd (source : String) =
 
 def fact : String = "let rec fact n =\n  if n < 2 then 1\n  else n * fact (n - 1)\nin\nfact 3\n"
 
-fun written (source : String) =
+-- `source` in a file of its own, named for the test that runs it: tests run
+-- at once, and two that wrote one file would read each other's half-written.
+fun written (name : String) (source : String) =
   let u = createDirAll "target/debug-tests" in
-  let path = "target/debug-tests/${show (stringByteLength source)}.ml" in
+  let path = "target/debug-tests/${name}.ml" in
   let w = writeString (path, source) in
   path
 
@@ -340,7 +342,7 @@ fun response (said : [Json]) (seq : Int) : Maybe Json =
        "each program's value, or why it failed, as `Eval` says"
 
 @test fun aBreakpointInARecursiveFunctionStopsEachTimeItIsReached () =
-  let path = written fact in
+  let path = written "breakpoint" fact in
   let said =
     debugged
       (V.append (launching path 3) [
@@ -373,7 +375,7 @@ fun response (said : [Json]) (seq : Int) : Maybe Json =
     "and then it finishes, with 6"
 
 @test fun aStepIntoACallStopsInsideIt () =
-  let path = written fact in
+  let path = written "step" fact in
   let said =
     debugged
       (V.append (launching path 3) [req 5 "stepIn" [], req 6 "stackTrace" []])
@@ -387,7 +389,7 @@ fun response (said : [Json]) (seq : Int) : Maybe Json =
     "on the first line of the call it stepped into, one frame deeper"
 
 @test fun aFailureStopsTheProgramForGood () =
-  let path = written "let x = 1 in\nx / 0\n" in
+  let path = written "failure" "let x = 1 in\nx / 0\n" in
   let said =
     debugged
       [
