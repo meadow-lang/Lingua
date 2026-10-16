@@ -889,6 +889,14 @@ editor and the finder are each a state and a function of a key, so a prompt
 is tested by giving it keys. Where the input is not a terminal, entries are
 read a line at a time and nothing is drawn.
 
+**`dap!`** declares a debugger. The machine is the language's -- a value
+that runs a program a slice of steps at a time and says where it is, its
+frames, what each holds -- and the Debug Adapter Protocol is Lingua's: a
+thread reads what the editor sends, the program runs in slices with what has
+arrived answered between them, so a pause lands, and what the program wrote
+is sent to the editor's console. MiniML's machine is a CEK machine over
+`Core`, checked against the evaluator.
+
 **`format!`** declares a formatter against a grammar's rules. A rule of the
 formatter is a rule of the grammar written again as what a node of it holds,
 in the grammar's order -- a token as it is written, a child by its label --

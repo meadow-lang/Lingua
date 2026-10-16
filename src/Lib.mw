@@ -26,6 +26,7 @@
 @pub mod Make
 @pub mod Format
 @pub mod Repl
+@pub mod Dap
 
 @pub use Lingua.Gen (syntax)
 @pub use Lingua.Pass (lang, pass)
@@ -35,3 +36,4 @@
 @pub use Lingua.Make (make)
 @pub use Lingua.Format (format)
 @pub use Lingua.Repl (repl)
+@pub use Lingua.Dap (dap)

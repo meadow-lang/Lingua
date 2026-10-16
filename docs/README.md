@@ -15,6 +15,7 @@ write, what gets generated, the defaults, the errors and the limits.
 | [format.md](format.md)             | `format!`: rules, layout within a width, indent-only mode, and the next line's indent |
 | [cli.md](cli.md)                   | `cli!`: commands and fields, how a flag is written (dashes, a letter, other names), options given more than once, one of a few values, options several commands or every command takes, a version and a default command |
 | [server.md](server.md)             | `lsp!`: features, a language's own requests, what the server says it can do, and testing one |
+| [debugger.md](debugger.md)       | `dap!`: a debugger from a machine the language can step -- breakpoints, steps, pause, frames, variables, the console -- and testing one |
 | [repl.md](repl.md)                 | `repl!`: features, multi-line entries, keys, completion, the finder, themes, and commands: `:help`, `:quit`, `:theme` and a language's own |
 | [highlighting.md](highlighting.md) | semantic tokens: how a token gets its class, `resolved`, and how the editor and the prompt share one answer |
 

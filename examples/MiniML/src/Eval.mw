@@ -13,13 +13,13 @@ use Std.String as S
 -- A value. A function holds its parameter's id and the environment it was
 -- made in, binders by id; a recursive one binds its own id again each time it
 -- is applied: no cell, and so nothing to mutate.
-data Value
+@pub(pkg) data Value
   = Int Int
   | Bool Bool
   | Closure Int CoreExpr (List (Int, Value))
   | Rec Int Int CoreExpr (List (Int, Value))
 
-fun showValue v =
+@pub(pkg) fun showValue v =
   match v with
   | Value.Int n -> S.fromInt n
   | Value.Bool b -> if b then "true" else "false"
@@ -59,7 +59,7 @@ fun apply a at f x =
   | Value.Rec name p body env -> eval a ((p, x) :: (name, f) :: env) body
   | other -> raise (errorAt at "not a function: ${showValue other}")
 
-fun primitive at op l r =
+@pub(pkg) fun primitive at op l r =
   match (l, r) with
   | (Value.Int a, Value.Int b) ->
       if op == "+" then Value.Int (a + b)

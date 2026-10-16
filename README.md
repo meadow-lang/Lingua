@@ -130,6 +130,10 @@ that in mind.
   parser faults only at its end goes on to a new line, indented as the
   formatter says, Tab completes, and Ctrl-F finds a declaration by a few of
   its letters.
+- **`dap!`** declares a debugger: the language gives a machine that runs a
+  program a step at a time and says where it is and what it holds, and the
+  Debug Adapter Protocol, the request queue and the console are written for
+  it -- breakpoints, steps, pause, frames, variables and evaluation.
 - **`make!`** declares a build over compilation units: each compiled in
   dependency order, those that can be at once, and again only when its files
   or an interface it read changed -- what happens inside a unit being the
