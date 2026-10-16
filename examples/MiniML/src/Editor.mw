@@ -75,9 +75,50 @@ repl! {
     | declarations = declarationsOf
     | indent = indentStyle
     | commands = promptCommands
+    | modes = promptModes
     | prompt = "> "
     | history = ".miniml_history"
 }
+
+-- A mode (`repl!` written `for Session mode`): a prompt of its own, entered
+-- with `:scratch`, where each entry is run as at the prompt, and `:keep`
+-- leaves it, handing the last entry back to begin the next line below.
+repl! {
+  Scratch "scratch" for Session mode
+    | text = setSessionSource
+    | eval = keptIn
+    | commands = scratchCommands
+    | start = scratchStarted
+    | status = scratchStatus
+    | prompt = "scratch> "
+}
+
+def promptModes = [("scratch", modeScratch)]
+
+-- What the mode keeps between lines goes in an input of the database: the
+-- last entry, as file 99. The entry being typed is file 0, and its text is
+-- whatever is on the line.
+def keptFile : Int = 99
+
+fun keptIn db file =
+  let u = setSessionSource db keptFile (answered "" (\() -> sessionSource db file)) in
+  shownIn db file
+
+fun scratchStarted db (arg : String) =
+  if S.isEmpty arg then "scratch: try things, and :keep the last" else "scratch: ${arg}"
+
+fun scratchStatus db file = "-- scratch --"
+
+def scratchCommands =
+  [
+    (
+      "keep",
+      "",
+      "leave, with the last entry for the line below",
+      \db rest -> Reply.Back (answered "" (\() -> sessionSource db keptFile))
+    ),
+    ("drop", "", "leave, with nothing", \db rest -> Reply.Leave "")
+  ]
 
 -- What entering a program prints: its value and type, or its diagnostics
 -- drawn against it.
@@ -97,7 +138,8 @@ def promptCommands =
       "",
       "enter an example",
       \db rest -> Reply.Entry "let double = fun x -> x + x in double 21"
-    )
+    ),
+    ("scratch", "[NOTE]", "try things in a scratch prompt", \db rest -> Reply.Mode "scratch" rest)
   ]
 
 fun typeOfEntry db rest =
@@ -561,3 +603,30 @@ fun opening (uri : String) (text : String) : Json =
                 ("paddingLeft", J.jBool True)
               ]]))
        "a hint where the program ends, saying what it is"
+
+@test fun aModeIsEnteredWorkedInAndLeftWithWhatItKept () =
+  let out =
+    prompted
+      (V.concat [
+         typing ":scratch",
+         [T.key Enter],
+         typing "40 + 1",
+         [T.key Enter],
+         typing "40 + 2",
+         [T.key Enter],
+         typing ":keep",
+         [T.key Enter],
+         [T.key Enter]
+       ])
+  in
+  let a =
+    assertEq
+      (S.contains "scratch: try things" out and S.contains "-- scratch --" out)
+      True
+      "it says it began, and shows its status above its lines"
+  in
+  let b = assertEq (S.contains "41 : Int" out) True "what is entered in it is run" in
+  assertEq
+    (S.contains "scratch> " out and V.len (S.split "42 : Int" out) == 3)
+    True
+    "under its own prompt; and what it kept begins the next line below, entered there too"

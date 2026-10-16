@@ -38,6 +38,9 @@ Only `text` and `eval` are required. Each of the others turns something on.
 | `declarations` | `db -> Int -> [(String, String, String)]`    | Ctrl-F: name, what it is, what is said of it |
 | `search`       | `db -> Int -> String -> [Hit]`               | Ctrl-F, answered by the language: see [A language's own search](#a-languages-own-search) |
 | `panes`        | `[(String, db -> Int -> String -> Int -> Opened e)]` | the language's panes, each opened by a key or a command: see [Panes](#panes) |
+| `modes`        | `[(String, db -> String -> Maybe String)]`   | the modes a command may enter: see [Modes](#modes) |
+| `status`       | `db -> Int -> String`                        | what is written above every line           |
+| `start`        | `db -> String -> String`                     | a mode's: what entering it with a text does and says |
 | `indent`       | `Green k -> String`                          | what a continuation line opens with        |
 | `commands`     | `[(String, String, String, db -> String -> Reply)]` | the language's own `:` lines        |
 | `prompt`       | text                                         | what a line starts with; `"> "` if omitted |
@@ -328,7 +331,9 @@ the line, trimmed. It answers a `Lingua.Repl.Reply`:
 | `Said text`    | writes `text`, or nothing if it is empty, and reads on       |
 | `Entry text`   | enters `text` as if it had been typed: evaluated, and kept in the history file |
 | `Edit text`    | begins the next entry with `text`, the cursor after it, for its user to go on with |
-| `Leave text`   | writes `text` and ends                                       |
+| `Leave text`   | writes `text` and ends the prompt; in a mode, leaves the mode with nothing |
+| `Mode name text` | enters the mode `name` with `text` (see [Modes](#modes))   |
+| `Back text`    | in a mode: leaves it, and the next entry of the prompt below begins with `text` |
 
 The database is the one the entries are typed into, so a command asks the
 compiler what an entry would: `:type` above sets the text and asks for its
@@ -338,6 +343,56 @@ entries are read in, it keeps in an input of the database.
 A language's command with the name of one of the prompt's own replaces it:
 give a `quit` to say something on the way out, or a `help` to write your own.
 `:help` lists the language's commands first.
+
+## Modes
+
+A mode is a prompt of its own inside the prompt: its own evaluation, grammar,
+completion, commands, panes and prompt string, such as a proof assistant's
+tactic mode, where each line is a tactic. It is a `repl!` written
+`for Session mode`:
+
+```meadow
+repl! {
+  Scratch "scratch" for Session mode
+    | text = setSessionSource
+    | eval = keptIn
+    | commands = scratchCommands
+    | start = scratchStarted
+    | status = scratchStatus
+    | prompt = "scratch> "
+}
+
+def promptModes = [("scratch", modeScratch)]
+```
+
+That writes `modeScratch db text` rather than `runScratch ()`. The prompt
+that can enter it lists it in `modes`, by name, and one of its commands
+enters it:
+
+```meadow
+("scratch", "[NOTE]", "try things in a scratch prompt", \db rest -> Reply.Mode "scratch" rest)
+```
+
+- **Entering.** `Reply.Mode name text` enters the mode. Its `start`, a
+  function of the database and `text`, sets the mode up (a tactic mode's
+  goal) and answers what to say on entering.
+- **Leaving.** In the mode, a command answers `Reply.Back text` to leave it
+  and hand `text` back: the next entry of the prompt below begins with it,
+  such as the term a tactic block built. `Reply.Leave` leaves with nothing,
+  and so does Ctrl-D.
+- **Nesting.** A mode may have `modes` of its own; leaving one returns to the
+  one below.
+- **State.** A mode shares the database of the prompt that entered it. What
+  it keeps between lines, such as a goal stack, goes in an input of the
+  database. The entry being typed is file 0, and its text is whatever is on
+  the line, so state cannot be kept there.
+- **History.** Each mode has its own `history` file, or none.
+
+**`status`**, a function of the database and the entry, is written above
+every line, for a prompt or a mode: a goal and the context it is proved in.
+For now it is written again before each line, not drawn in place.
+
+MiniML's `:scratch` is a mode ([Editor.mw](../examples/MiniML/src/Editor.mw)).
 
 ## History
 
@@ -389,6 +444,6 @@ directly: `unfinished`, `candidates`, `painted`, `coloured`, `finder`,
 `findKey`, `findDrawn`, `themes`, `themeNamed`, `command`, `commandOf`,
 `commandNames`, `commandCandidates`, `helped`, `Hit`, `ranked`, `declared`,
 `finderOf`, `findWith`, `pane`, `opened`, `showing`, `finderPane`, `editorOf`,
-`run`.
+`run`, `runMode`.
 The three packages underneath work without Lingua at all, for a compiler not
 written with it.
