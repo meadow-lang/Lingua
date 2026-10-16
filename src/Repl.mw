@@ -36,6 +36,11 @@
 --   search        db -> Int -> String -> [Hit]     Ctrl-F, answered by the
 --                                                  language: what a query
 --                                                  finds, the likeliest first
+--   panes         [(String, db -> Int -> String -> Int -> Opened e)]
+--                                                  the language's own panes,
+--                                                  each opened by a key
+--                                                  (`ctrl-x`) or a command
+--                                                  (`:name`) -- see below
 --   indent        Green k -> String                what the line after an
 --                                                  unfinished entry opens
 --                                                  with: a formatter's
@@ -60,6 +65,12 @@
 -- that starts with `:` is for the prompt and not the language: `:theme`
 -- lists them, each with a line in its colours and the one that is on
 -- marked, and `:theme quiet` turns one on, for what is typed from then on.
+--
+-- **Panes.** A pane is shown under the line until it is done with -- the
+-- finder is one -- and is a state, what a key does to it and how it is
+-- drawn (`pane`). A key `Go`es on to another state, `Put`s text on the line
+-- (with an entry to run before it), `Enter`s text, or `Close`s it. A
+-- language gives its own with `panes`, each opened by a key or a command.
 --
 -- **Commands.** `:help` says what such lines there are, and `:quit` ends the
 -- prompt. A language adds its own with `commands`: each a name, what is
@@ -490,14 +501,100 @@ fun finding f =
        | (_, PutAway) -> (let w = writeOutput D.eraseBelow in None))
   | _ -> finding f
 
+-- --- panes -------------------------------------------------------------------
+--
+-- A pane is shown under the line until it is done with: the finder is one,
+-- and a language may give others -- a view of what a definition compiles to,
+-- what a proof search found, a page of documentation. It is a state, what a
+-- key does to it, and how it is drawn; what it ends with is put on the line,
+-- entered, or nothing.
+
+-- What a key does to a pane: it goes on, in another state; it puts text on
+-- the line, the cursor at a character of it, with an entry to run before
+-- the line or nothing; it enters text; or it closes.
+@pub data Step a
+  = Go a
+  | Put String Int String
+  | Enter String
+  | Close
+
+-- A pane, opened: what a key does to it, and how it is drawn, `cols` wide.
+-- Its state is in the two functions, so panes of any state are one type.
+@pub data Opened e
+  = Opened (Key -> Step (Opened e) ! e) (Int -> Buffer ! e)
+
+-- A pane in state `s`, opened: `key` is what a key does to a state, and
+-- `draw` how one is drawn.
+@pub fun opened key draw s = Opened (\k -> stepped key draw (key s k)) (\cols -> draw s cols)
+
+fun stepped key draw step =
+  match step with
+  | Step.Go s2 -> Step.Go (opened key draw s2)
+  | Step.Put t at before -> Step.Put t at before
+  | Step.Enter t -> Step.Enter t
+  | Step.Close -> Step.Close
+
+-- A pane as a language gives it: `open` makes its state from the database,
+-- the entry, the entry's text and the cursor; `key` and `draw` as above.
+@pub fun pane open key draw = \db file text at -> opened key draw (open db file text at)
+
+@pub fun keyOf (o : Opened e) (k : Key) : Step (Opened e) ! e = match o with | Opened f _ -> f k
+
+@pub fun drawOf (o : Opened e) (cols : Int) : Buffer ! e = match o with | Opened _ d -> d cols
+
+-- A pane shown under the cursor's line until it puts, enters or closes, and
+-- then gone: what it came to.
+@pub fun showing o =
+  let cols = fst (T.size ()) in
+  let u = writeOutput (D.below (drawOf o (if cols > 0 then cols else 80))) in
+  match T.nextEvent () with
+  | Event.Closed -> (let w = writeOutput D.eraseBelow in Step.Close)
+  | Event.Pressed key ->
+      (match keyOf o key with
+       | Step.Go o2 -> showing o2
+       | other -> (let w = writeOutput D.eraseBelow in other))
+  | _ -> showing o
+
+-- The finder, as a pane over the line `text` with the cursor at character
+-- `at`: what it chooses is put in place of the name before the cursor.
+@pub fun finderPane look (text : String) (at : Int) =
+  opened finderKey finderDraw (finderOf (\q -> look text q), text, at)
+
+fun finderKey st k =
+  match st with
+  | (f, text, at) ->
+      (match findKey f k with
+       | (f2, Looking) -> Step.Go (f2, text, at)
+       | (_, Chose h) ->
+           (match replacedName text at (hitInsert h) with
+            | (t2, c2) -> Step.Put t2 c2 (hitBefore h))
+       | (_, PutAway) -> Step.Close)
+
+fun finderDraw st cols = match st with | (f, _, _) -> findDrawn f cols
+
+-- `text` with the name before character `at` replaced by `n`: the text, and
+-- where the cursor goes, after `n`.
+fun replacedName (text : String) (at : Int) (n : String) : (String, Int) =
+  let cs = S.chars text in
+  let from = nameStart text at in
+  (S.fromChars (V.concat [V.take cs from, S.chars n, V.drop cs at]), from + S.charLength n)
+
+-- The key a pane opens with, written `ctrl-x`: none, for an opening that is
+-- a command.
+@pub fun openingKey (opening : String) : Maybe Key =
+  if S.startsWith "ctrl-" opening and S.charLength opening == 6 then
+    Just (T.ctrl (S.drop opening 5))
+  else None
+
 -- --- the prompt --------------------------------------------------------------
 
 -- The line's editor, of what the compiler says of a text: its tree, where
 -- the parser's errors are, what a kind is called, what the next line opens
 -- with, what could be written at a byte of it, what a query of the finder
 -- finds in it -- nothing, for a prompt with no finder -- and the names of
--- its commands. `pending` is where an entry to run before the line is kept
--- when the finder's choice has one.
+-- its commands, and the panes a key opens. `pending` is where what a pane
+-- brings is kept until the line is entered: the entries to run before it,
+-- and the text to enter in its place, if a pane entered one.
 @pub fun editorOf
     theme
     pending
@@ -509,41 +606,58 @@ fun finding f =
     indentOf
     completionsOf
     lookOf
-    (commands : [String]) =
-  let found =
-    \text at ->
-      match findWith (finderOf (\q -> lookOf text q)) with
-      | Just h ->
-          let n = hitInsert h in
-          let cs = S.chars text in
-          let from = nameStart text at in
-          let u =
-            if S.isEmpty (hitBefore h) then ()
-            else setRef pending (V.pushBack (getRef pending) (hitBefore h))
-          in Bound.Edited
-               (S.fromChars (V.concat [V.take cs from, S.chars n, V.drop cs at]))
-               (from + S.charLength n)
-      | None -> Bound.Kept
-  in {
-       LE.editor | prompt,
-       continued = S.repeat " " (S.charLength prompt),
-       -- A line for the prompt itself -- `:theme` -- is not the language's
-       -- to colour, or to call unfinished.
-       highlight =
-         \t ->
-           if isCommand t then t
-           else
-             match paint with
-             | Just shown -> shown (getRef theme) t
-             | None -> coloured (getRef theme) name (treeOf t),
-       finished = \t -> isCommand t or not (unfinished t (errorsOf t)),
-       indent = \t -> indentOf (treeOf t),
-       complete =
-         \t at ->
-           if isCommand t then commandCandidates t at commands
-           else candidates t at (completionsOf t (byteAt t at)),
-       bindings = [(T.ctrl "f", found)]
-     }
+    (commands : [String])
+    panes =
+  let bindings = paneBindings pending lookOf panes in
+  {
+    LE.editor | prompt,
+    continued = S.repeat " " (S.charLength prompt),
+    -- A line for the prompt itself -- `:theme` -- is not the language's
+    -- to colour, or to call unfinished.
+    highlight =
+      \t ->
+        if isCommand t then t
+        else
+          match paint with
+          | Just shown -> shown (getRef theme) t
+          | None -> coloured (getRef theme) name (treeOf t),
+    finished = \t -> isCommand t or not (unfinished t (errorsOf t)),
+    indent = \t -> indentOf (treeOf t),
+    complete =
+      \t at ->
+        if isCommand t then commandCandidates t at commands
+        else candidates t at (completionsOf t (byteAt t at)),
+    bindings
+  }
+
+-- What each pane a key opens is bound to: shown, and what it ends with made
+-- of the line. The finder is Ctrl-F, unless a pane of the language's is.
+fun paneBindings pending lookOf panes =
+  let act =
+    \make text at ->
+      match showing (make text at) with
+      | Step.Put t c before ->
+          (let u = if S.isEmpty before then () else broughtFirst pending before in Bound.Edited t c)
+      | Step.Enter t ->
+          (let u =
+             (match getRef pending with
+              | (first, _) -> setRef pending (first, Just t))
+           in Bound.Entering)
+      | _ -> Bound.Kept
+  in
+  let keyed =
+    V.concatMap
+      (\p ->
+        match openingKey (fst p) with
+        | Just k -> [(k, \text at -> act (snd p) text at)]
+        | None -> [])
+      panes
+  in if V.any (\b -> fst b == T.ctrl "f") keyed then keyed
+     else V.pushBack keyed (T.ctrl "f", \text at -> act (finderPane lookOf) text at)
+
+fun broughtFirst pending (entry : String) =
+  match getRef pending with
+  | (first, instead) -> setRef pending (V.pushBack first entry, instead)
 
 -- Entries read with `editor` and each printed as `eval` says, until there
 -- are no more: kept in the file `history`, when it names one.
@@ -551,9 +665,10 @@ fun finding f =
 -- -- a line that starts with `:` is a command, and may change it -- and the
 -- one the entries the finder's choices bring with them wait in. `commands`
 -- are the language's own, each given `db` and the rest of its line.
-@pub fun run editorOn (theme : String) (history : String) eval db commands =
+-- `panes` are the language's; those a command opens are opened here.
+@pub fun run editorOn (theme : String) (history : String) eval db commands panes =
   let on = newRef (themeOr theme) in
-  let pending = newRef [] in
+  let pending = newRef ([], None) in
   entering
     (editorOn on pending)
     on
@@ -562,6 +677,7 @@ fun finding f =
     eval
     db
     commands
+    panes
     (if S.isEmpty history then [] else LE.loadHistory history)
 
 -- Whether a line is for the prompt itself, not the language.
@@ -573,46 +689,64 @@ fun entered (history : String) eval (text : String) =
   let u = if S.isEmpty history then () else LE.saveEntry history text in
   writeOutput (eval text ++ "\n")
 
-fun entering editor on pending (history : String) eval db commands (before : [String]) =
+fun entering editor on pending (history : String) eval db commands panes (before : [String]) =
   match LE.readEntry editor before with
   | Outcome.Ended -> ()
-  | Outcome.Interrupted -> entering editor on pending history eval db commands before
-  | Outcome.Entered text ->
-      if S.isEmpty (S.trim text) then entering editor on pending history eval db commands before
-      else if isCommand text then
-        let again = V.pushBack before text in
-        let say = \said -> if S.isEmpty said then () else writeOutput (said ++ "\n") in
-        (match commandOf text with
-         | (name, rest) ->
-             match V.find (\c -> match c with | (n, _, _, _) -> n == name) commands with
-             | Just (_, _, _, act) ->
-                 (match act db rest with
-                  | Reply.Said said ->
-                      (let w = say said in
-                       entering editor on pending history eval db commands again)
-                  | Reply.Entry entry ->
-                      (let w = entered history eval entry in
-                       entering editor on pending history eval db commands again)
-                  | Reply.Leave said -> say said)
-             | None ->
-                 if name == "quit" then ()
-                 else if name == "help" then
-                   (let w = say (helped commands) in
-                    entering editor on pending history eval db commands again)
-                 else
-                   (match command text (getRef on) (commandNames commands) with
-                    | (said, now) ->
-                        let u = setRef on now in
-                        let w = say said in
-                        entering editor on pending history eval db commands again))
-      else
-        -- What the finder's choices on this line bring with them -- a `use`
-        -- for a name not in scope -- is run first.
-        let first = getRef pending in
-        let u = setRef pending [] in
-        let r = V.foldl (\acc b -> entered history eval b) () first in
-        let w = entered history eval text in
-        entering editor on pending history eval db commands (V.pushBack before text)
+  | Outcome.Interrupted -> entering editor on pending history eval db commands panes before
+  | Outcome.Entered typed ->
+      -- A pane that entered text entered it in place of the line.
+      let text =
+        (match getRef pending with
+         | (first, Just t) -> (let u = setRef pending (first, None) in t)
+         | _ -> typed)
+      in if S.isEmpty (S.trim text) then
+           entering editor on pending history eval db commands panes before
+         else if isCommand text then
+           let again = V.pushBack before text in
+           let say = \said -> if S.isEmpty said then () else writeOutput (said ++ "\n") in
+           (match commandOf text with
+            | (name, rest) ->
+                match V.find (\p -> fst p == ":${name}") panes with
+                | Just (_, make) ->
+                    (match showing (make rest (S.charLength rest)) with
+                     | Step.Put t _ first ->
+                         (let u = if S.isEmpty first then () else entered history eval first in
+                          let w = entered history eval t in
+                          entering editor on pending history eval db commands panes again)
+                     | Step.Enter t ->
+                         (let w = entered history eval t in
+                          entering editor on pending history eval db commands panes again)
+                     | _ -> entering editor on pending history eval db commands panes again)
+                | None ->
+                    match V.find (\c -> match c with | (n, _, _, _) -> n == name) commands with
+                    | Just (_, _, _, act) ->
+                        (match act db rest with
+                         | Reply.Said said ->
+                             (let w = say said in
+                              entering editor on pending history eval db commands panes again)
+                         | Reply.Entry entry ->
+                             (let w = entered history eval entry in
+                              entering editor on pending history eval db commands panes again)
+                         | Reply.Leave said -> say said)
+                    | None ->
+                        if name == "quit" then ()
+                        else if name == "help" then
+                          (let w = say (helped commands) in
+                           entering editor on pending history eval db commands panes again)
+                        else
+                          (match command text (getRef on) (commandNames commands) with
+                           | (said, now) ->
+                               let u = setRef on now in
+                               let w = say said in
+                               entering editor on pending history eval db commands panes again))
+         else
+           -- What the finder's choices on this line bring with them -- a `use`
+           -- for a name not in scope -- is run first.
+           let first = (match getRef pending with | (f, _) -> f) in
+           let u = setRef pending ([], None) in
+           let r = V.foldl (\acc b -> entered history eval b) () first in
+           let w = entered history eval text in
+           entering editor on pending history eval db commands panes (V.pushBack before text)
 
 -- --- repl! -------------------------------------------------------------------
 
@@ -651,8 +785,8 @@ def replCall : Parser Tokens (Bool, String, String, String, [ReplFeature]) =
 
 def replFeatures : [String] =
   [
-    "text", "eval", "tree", "errors", "completion", "declarations", "search", "indent", "commands",
-    "prompt", "history", "theme"
+    "text", "eval", "tree", "errors", "completion", "declarations", "search", "panes", "indent",
+    "commands", "prompt", "history", "theme"
   ]
 
 def replWritten : [String] = ["prompt", "history", "theme"]
@@ -730,18 +864,26 @@ fun replCode pub name lang db (server : Maybe String) fs =
      | (None, None) -> "(\\t q -> [])")
   in
   let commands = M.unwrapOr "[]" (given "commands") in
-  "use Lingua.Repl as LinguaRepl
+  -- The language's panes, each given the database and the entry.
+  let panes =
+    (match given "panes" with
+     | Just f ->
+         "(LinguaV.map (\\lingua_p -> match lingua_p with | (lingua_o, lingua_mk) -> (lingua_o, \\t at -> ${setting "t"}lingua_mk db 0 t at))) ${f})"
+     | None -> "[]")
+  in "use Lingua.Repl as LinguaRepl
+use Std.Collections.Vector as LinguaV
 
 -- ${lang}'s prompt: entries read and evaluated until there are no more.
 ${pub}fun run${name} () =
   let db = new${db} () in
   LinguaRepl.run
-    (\\theme pending -> LinguaRepl.editorFor theme pending ${quoted (M.unwrapOr "> " (given "prompt"))} ${paint} ${tree} ${errors} (\\k -> display k) ${indent} ${completion} ${decls} (LinguaRepl.commandNames ${commands}))
+    (\\theme pending -> LinguaRepl.editorFor theme pending ${quoted (M.unwrapOr "> " (given "prompt"))} ${paint} ${tree} ${errors} (\\k -> display k) ${indent} ${completion} ${decls} (LinguaRepl.commandNames ${commands}) ${panes})
     ${quoted (fn "theme")}
     ${quoted (fn "history")}
     (\\t -> ${setting "t"}${fn "eval"} db 0))
     db
     ${commands}
+    ${panes}
 "
 
 fun quoted (s : String) : String =
@@ -771,10 +913,23 @@ fun quoted (s : String) : String =
     indentOf
     completionsOf
     lookOf
-    (commands : [String]) =
+    (commands : [String])
+    panes =
   match treeOf with
   | Just tree ->
-      editorOf theme pending prompt paint tree errorsOf name indentOf completionsOf lookOf commands
+      editorOf
+        theme
+        pending
+        prompt
+        paint
+        tree
+        errorsOf
+        name
+        indentOf
+        completionsOf
+        lookOf
+        commands
+        panes
   | None ->
       {
         LE.editor | prompt,
@@ -784,7 +939,8 @@ fun quoted (s : String) : String =
             match paint with
             | Just shown -> if isCommand t then t else shown (getRef theme) t
             | None -> t,
-        complete = \t at -> if isCommand t then commandCandidates t at commands else (at, [])
+        complete = \t at -> if isCommand t then commandCandidates t at commands else (at, []),
+        bindings = paneBindings pending lookOf panes
       }
 
 -- --- tests -------------------------------------------------------------------
@@ -1033,13 +1189,75 @@ fun library (q : String) : [Hit] =
         (\t at -> [])
         (\t q -> library q)
         []
+        []
   in
   let events = V.map (\k -> Event.Pressed k) [T.ctrl "f", T.key Enter, T.key Enter] in
   let out =
     snd
       (withOutput (\() ->
-         T.withEvents events (\() -> run editorOn "plain" "" (\t -> "ran ${t}") () [])))
+         T.withEvents events (\() -> run editorOn "plain" "" (\t -> "ran ${t}") () [] [])))
   in assertEq
        (S.contains "ran use Std.List as List\nran List.map\n" out)
        True
        "the `use`, then the line"
+
+-- A pane that counts: Up counts one more, Enter puts the count on the line,
+-- `x` enters text of its own, and Escape closes it.
+def counter =
+  pane
+    (\db file text at -> 0)
+    (\n (k : Key) ->
+      match k.code with
+      | Up -> Step.Go (n + 1)
+      | Enter -> Step.Put "n=${show n}" 3 ""
+      | Character c -> if c == "x" then Step.Enter "x!" else Step.Go n
+      | _ -> Step.Close)
+    (\n cols -> D.writeIn (D.blank 20 1) (D.area (D.blank 20 1)) 0 0 D.style "count ${show n}")
+
+-- What a prompt with `counter` opened by Ctrl-T and by `:count` writes for
+-- `events`, evaluating an entry as `ran` and it.
+fun counting (events : [Key]) =
+  let panes = [("ctrl-t", \t at -> counter () 0 t at), (":count", \t at -> counter () 0 t at)] in
+  let editorOn =
+    \theme pending ->
+      editorOf
+        theme
+        pending
+        "> "
+        (Just (\th t -> t))
+        (\t -> G.token "Text" t)
+        (\t -> [])
+        (\k -> "")
+        (\g -> "")
+        (\t at -> [])
+        (\t q -> [])
+        []
+        panes
+  in snd
+       (withOutput (\() ->
+          T.withEvents (V.map (\k -> Event.Pressed k) events) (\() ->
+            run editorOn "plain" "" (\t -> "ran ${t}") () [] panes)))
+
+@test fun aPaneAKeyOpensPutsWhatItEndsWithOnTheLine () =
+  let a =
+    assertEq
+      (S.contains "ran n=2\n" (counting [T.ctrl "t", T.key Up, T.key Up, T.key Enter, T.key Enter]))
+      True
+      "two counted, put on the line, and the line entered"
+  in
+  let b =
+    assertEq
+      (S.contains "ran x!\n" (counting [T.ctrl "t", T.key (Character "x")]))
+      True
+      "and text it enters is entered"
+  in assertEq
+       (S.contains "ran" (counting [T.ctrl "t", T.key Escape]))
+       False
+       "closed, it leaves nothing"
+
+@test fun aPaneACommandOpensIsShownToo () =
+  let typed = V.map (\c -> T.key (Character (C.toString c))) (S.chars ":count") in
+  assertEq
+    (S.contains "ran n=1\n" (counting (V.concat [typed, [T.key Enter, T.key Up, T.key Enter]])))
+    True
+    "opened by its command, and what it puts entered"
