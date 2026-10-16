@@ -88,7 +88,7 @@ use Std.Maybe as M
 use Std.Char as C
 use Std.Json as J
 use Std.Json (Json)
-use Std.Console (Console, readLine, readExact, writeOutput, withOutput)
+use Std.Console (Console, readLine, readExact, writeOutput, writeError, withOutput)
 use Std.Thread as Thread
 use Std.Stm as Stm
 use Lingua.Lang (Meta)
@@ -119,9 +119,15 @@ fun contentLength (n : Int) : Maybe Int ! { Console | e } =
         contentLength (M.unwrapOr 0 (S.toInt (S.trim (S.drop line 15))))
       else contentLength n
 
+-- A message, written. A body ends with no line break, and standard output
+-- is written a line at a time, so the body would wait for whatever is written
+-- next -- the next message's header -- and an editor would have each answer
+-- only when the one after it came. Writing nothing to standard error sends
+-- what standard output holds first.
 @pub fun send (j : Json) : () ! { Console | e } =
   let body = J.render j in
-  writeOutput "Content-Length: ${show (stringByteLength body)}\r\n\r\n${body}"
+  let u = writeOutput "Content-Length: ${show (stringByteLength body)}\r\n\r\n${body}" in
+  writeError ""
 
 fun reply id result =
   send (J.jObject [("jsonrpc", J.jString "2.0"), ("id", id), ("result", result)])

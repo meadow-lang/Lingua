@@ -1,0 +1,888 @@
+-- `dap!`: a debugger, from a machine a language can step.
+--
+--   dap! {
+--     pub Debugger "miniml"
+--     | launch = launchDebug
+--     | resume = resumeDebug
+--     | run = runDebug
+--     | breakpoints = breakpointsDebug
+--     | frames = framesDebug
+--     | scopes = scopesDebug
+--     | variables = variablesDebug
+--     | evaluate = evaluateDebug
+--   }
+--
+-- A debugger is two things: a machine that runs a program a little at a time
+-- and can say where it is and what it holds, which is the language's; and the
+-- Debug Adapter Protocol an editor speaks to it, which is the same for every
+-- language and is here. The machine is a value, `m`, and each feature a
+-- function of it:
+--
+--   launch        String -> Json -> Result String m
+--                 the program's path and the launch's arguments as they
+--                 came: a machine at its start, or why there is none
+--   resume        m -> Mode -> m           how it is to run until it next stops
+--   run           m -> Int -> (m, Maybe Stop)
+--                 run it so many steps at most: why it stopped, if it did
+--   breakpoints   m -> String -> [Int] -> (m, [Maybe Int])
+--                 a file's breakpoints, by line from 1: the line each landed
+--                 on, or none where there is nothing to stop at
+--   frames        m -> [Frame]             where it is, innermost first
+--   scopes        m -> Int -> [Scope]      a frame's scopes, by its place
+--   variables     m -> Int -> [Variable]   what a scope or a value holds
+--   evaluate      m -> Int -> String -> Maybe Variable
+--                 an expression, in a frame: hover and the console
+--   output        m -> (m, String)         what the program wrote since
+--
+-- `evaluate` and `output` may be left out; the rest are needed. What is
+-- written is `debug<Name> ()`: the adapter, on standard input and output,
+-- until the editor disconnects.
+--
+-- **Running without blocking.** While the program runs the adapter still
+-- answers: a pause has to land, and an editor sets breakpoints and asks for
+-- threads when it likes. So one thread reads what the editor sends, and the
+-- program is run in slices of a few thousand steps with what has arrived
+-- looked at between them.
+--
+-- **Output.** The program's own output cannot go to standard output, which
+-- is the protocol. A machine keeps it, and `output` hands it over after each
+-- slice, sent as `output` events: the editor's debug console.
+
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Maybe as M
+use Std.Json as J
+use Std.Json (Json)
+use Std.Console (Console, withOutput)
+use Std.Thread as Thread
+use Std.Stm as Stm
+use Std.Result.Result.*
+use Lingua.Lsp (readMessage, send, written)
+
+-- --- what a machine says -------------------------------------------------------
+
+-- How a machine is to run until it next stops: until a breakpoint; to the
+-- next place anywhere; to the next in this function or the one it returns
+-- to; or to the next in the function it returns to.
+@derive(Debug, PartialEq)
+@pub data Mode = Continue | StepIn | StepOver | StepOut
+
+-- Why a machine stopped: it was asked to stop before it began; at a
+-- breakpoint; a step finished; it was paused; it failed, and can be looked
+-- at but not run on; it finished, with what it came to; or it failed and
+-- ended.
+@derive(Debug, PartialEq)
+@pub data Stop
+  = Entry
+  | Breakpoint
+  | Step
+  | Pause
+  | Exception String
+  | Exited String
+  | Failed String
+
+-- A frame of the program's stack: what it is part of, the file it is in --
+-- its path, or nothing -- and where, by line and column from 1.
+@pub record Frame = {
+  @pub name : String,
+  @pub path : String,
+  @pub line : Int,
+  @pub column : Int
+}
+
+-- A scope a frame offers: its name, the number its variables are asked for
+-- by, and whether to leave it closed until it is opened.
+@pub record Scope = {
+  @pub name : String,
+  @pub reference : Int,
+  @pub expensive : Bool
+}
+
+-- A row of what a scope holds: its name, its value as text, its type -- or
+-- nothing -- and, if it can be opened, the number what is in it is asked for
+-- by; 0 if it cannot.
+@pub record Variable = {
+  @pub name : String,
+  @pub value : String,
+  @pub kind : String,
+  @pub reference : Int,
+}
+
+-- A machine, as the adapter is given it: the features above.
+@pub record Machine m e = {
+  @pub launch : String -> Json -> Result String m ! e,
+  @pub resume : m -> Mode -> m ! e,
+  @pub run : m -> Int -> (m, Maybe Stop) ! e,
+  @pub breakpoints : m -> String -> [Int] -> (m, [Maybe Int]) ! e,
+  @pub frames : m -> [Frame] ! e,
+  @pub scopes : m -> Int -> [Scope] ! e,
+  @pub variables : m -> Int -> [Variable] ! e,
+  @pub evaluate : m -> Int -> String -> Maybe Variable ! e,
+  @pub output : m -> (m, String) ! e,
+}
+
+-- A machine of its features, as `dap!` writes one: a constructor cannot be
+-- reached through a module's alias.
+@pub fun machine launch resume run breakpoints frames scopes variables evaluate output =
+  Machine { launch, resume, run, breakpoints, frames, scopes, variables, evaluate, output }
+
+-- --- the adapter's state -------------------------------------------------------
+
+-- The machine, once launched; whether it is running, and whether it can
+-- never run again; the number the next message is sent as; breakpoints set
+-- before there was a machine to set them on; whether to stop before the
+-- program begins; whether the editor counts lines and columns from 1; and
+-- whether it has disconnected.
+type Adapter m =
+  {
+    machine : Maybe m,
+    running : Bool,
+    finished : Bool,
+    seq : Int,
+    pending : [(String, [Int])],
+    entry : Bool,
+    lines : Bool,
+    columns : Bool,
+    done : Bool,
+  }
+
+fun fresh () =
+  {
+    machine = None,
+    running = False,
+    finished = False,
+    seq = 1,
+    pending = [],
+    entry = False,
+    lines = True,
+    columns = True,
+    done = False,
+  }
+
+-- What the thread that reads hands on: a message, or that there are no more.
+data Arrived = Got Json | NoMore
+
+use Arrived.*
+
+-- How many steps a slice is: small enough that a pause lands at once, large
+-- enough that looking between them costs nothing to speak of.
+def slice : Int = 20000
+
+-- --- messages ------------------------------------------------------------------
+
+-- `msg`, sent as the next message.
+fun said st (msg : Json) =
+  let u = send (J.jObject (V.pushBack (M.unwrapOr [] (J.asObject msg)) ("seq", J.jInt st.seq))) in
+  { st | seq = st.seq + 1 }
+
+fun event st (name : String) (body : Json) =
+  said st (J.jObject [("type", J.jString "event"), ("event", J.jString name), ("body", body)])
+
+fun respond st (req : Json) (body : Json) =
+  said
+    st
+    (J.jObject [
+       ("type", J.jString "response"),
+       ("request_seq", M.unwrapOr (J.jNull ()) (J.get "seq" req)),
+       ("command", M.unwrapOr (J.jNull ()) (J.get "command" req)),
+       ("success", J.jBool True),
+       ("body", body)
+     ])
+
+fun refuse st (req : Json) (message : String) =
+  said
+    st
+    (J.jObject [
+       ("type", J.jString "response"),
+       ("request_seq", M.unwrapOr (J.jNull ()) (J.get "seq" req)),
+       ("command", M.unwrapOr (J.jNull ()) (J.get "command" req)),
+       ("success", J.jBool False),
+       ("message", J.jString message),
+       (
+         "body",
+         J.jObject
+           [(
+             "error",
+             J.jObject [("id", J.jInt 1), ("format", J.jString message), ("showUser", J.jBool True)]
+           )]
+       )
+     ])
+
+fun numberAt (args : Json) (path : [String]) (otherwise : Int) : Int =
+  M.unwrapOr otherwise (M.andThen J.asInt (J.path path args))
+
+fun textAt (args : Json) (path : [String]) : Maybe String = M.andThen J.asString (J.path path args)
+
+fun flagAt (args : Json) (path : [String]) (otherwise : Bool) : Bool =
+  M.unwrapOr otherwise (M.andThen J.asBool (J.path path args))
+
+-- A line as the editor counts, and back.
+fun lineIn st (l : Int) : Int = if st.lines then l else l + 1
+
+fun lineOut st (l : Int) : Int = if st.lines then l else l - 1
+
+fun columnOut st (c : Int) : Int = if st.columns then c else c - 1
+
+-- --- answering -----------------------------------------------------------------
+
+-- What the machine wrote since it was last asked, sent to the console.
+fun flushed (mach : Machine m e) st =
+  match st.machine with
+  | None -> st
+  | Just m ->
+      (match mach.output m with
+       | (m2, text) ->
+           let st2 = { st | machine = Just m2 } in
+           if S.isEmpty text then st2
+           else
+             event
+               st2
+               "output"
+               (J.jObject [("category", J.jString "stdout"), ("output", J.jString text)]))
+
+-- Why it stopped, told: an end is the program's end; anything else a stop
+-- the editor shows, everything stopped with it.
+fun reported st (stop : Stop) =
+  let stopped =
+    \reason extra ->
+      event
+        st
+        "stopped"
+        (J.jObject
+           (V.append
+              [
+                ("reason", J.jString reason),
+                ("threadId", J.jInt 1),
+                ("allThreadsStopped", J.jBool True)
+              ]
+              extra))
+  in
+  let ended =
+    \text code ->
+      let a =
+        if S.isEmpty text then st
+        else
+          event
+            st
+            "output"
+            (J.jObject [
+               ("category", J.jString (if code == 0 then "console" else "stderr")),
+               ("output", J.jString "${text}\n")
+             ])
+      in
+      let b = event a "exited" (J.jObject [("exitCode", J.jInt code)]) in
+      { (event b "terminated" (J.jObject [])) | finished = True }
+  in match stop with
+     | Stop.Entry -> stopped "entry" []
+     | Stop.Breakpoint -> stopped "breakpoint" []
+     | Stop.Step -> stopped "step" []
+     | Stop.Pause -> stopped "pause" []
+     | Stop.Exception why ->
+         {
+           (stopped "exception" [
+              ("description", J.jString "Runtime error"),
+              ("text", J.jString why)
+            ])
+             | finished = True
+         }
+     | Stop.Exited value -> ended (if S.isEmpty value or value == "()" then "" else "=> ${value}") 0
+     | Stop.Failed why -> ended why 1
+
+-- A request answered, and the state after it.
+fun answered (mach : Machine m e) st (req : Json) =
+  let args = M.unwrapOr (J.jObject []) (J.get "arguments" req) in
+  let command = M.unwrapOr "" (M.andThen J.asString (J.get "command" req)) in
+  if M.andThen J.asString (J.get "type" req) != Just "request" then st
+  else if command == "initialize" then
+    respond
+      {
+        st | lines = flagAt args ["linesStartAt1"] True,
+        columns = flagAt args ["columnsStartAt1"] True
+      }
+      req
+      (J.jObject [
+         ("supportsConfigurationDoneRequest", J.jBool True),
+         ("supportsEvaluateForHovers", J.jBool True),
+         ("supportsTerminateRequest", J.jBool True)
+       ])
+  else if command == "launch" then
+    match textAt args ["program"] with
+    | None -> refuse st req "`program` is required: the program to debug"
+    | Just program ->
+        (match mach.launch program args with
+         | Err why ->
+             refuse
+               (event
+                  st
+                  "output"
+                  (J.jObject [("category", J.jString "stderr"), ("output", J.jString "${why}\n")]))
+               req
+               why
+         | Ok m ->
+             let placed =
+               V.foldl
+                 (\acc p ->
+                   match acc with
+                   | m1 -> fst (mach.breakpoints m1 (fst p) (snd p)))
+                 m
+                 st.pending
+             in
+             let st2 =
+               {
+                 st | machine = Just placed,
+                 pending = [],
+                 entry = flagAt args ["stopOnEntry"] False
+               }
+             in event (respond st2 req (J.jObject [])) "initialized" (J.jObject []))
+  else if command == "setBreakpoints" then
+    match textAt args ["source", "path"] with
+    | None -> respond st req (J.jObject [("breakpoints", J.jArray [])])
+    | Just path ->
+        let lines =
+          V.concatMap
+            (\b ->
+              match M.andThen J.asInt (J.get "line" b) with
+              | Just l -> [lineIn st l]
+              | None -> [])
+            (M.unwrapOr [] (M.andThen J.asArray (J.get "breakpoints" args)))
+        in
+        let (st2, landed) =
+          (match st.machine with
+           | Just m ->
+               (match mach.breakpoints m path lines with
+                | (m2, ls) -> ({ st | machine = Just m2 }, ls))
+           | None ->
+               (
+                 {
+                   st
+                     | pending =
+                       V.pushBack (V.filter (\p -> fst p != path) st.pending) (path, lines)
+                 },
+                 V.map (\l -> Just l) lines
+               ))
+        in respond
+             st2
+             req
+             (J.jObject
+                [(
+                  "breakpoints",
+                  J.jArray
+                    (V.map
+                       (\l ->
+                         match l with
+                         | Just line ->
+                             J.jObject [
+                               ("verified", J.jBool True),
+                               ("line", J.jInt (lineOut st line))
+                             ]
+                         | None ->
+                             J.jObject [
+                               ("verified", J.jBool False),
+                               (
+                                 "message",
+                                 J.jString "nothing to stop at on or just after this line"
+                               )
+                             ])
+                       landed)
+                )])
+  else if command == "setExceptionBreakpoints" then respond st req (J.jObject [])
+  else if command == "configurationDone" then
+    let st2 = respond st req (J.jObject []) in
+    match st2.machine with
+    | None -> st2
+    | Just m ->
+        if st2.entry then reported st2 Stop.Entry
+        else { st2 | machine = Just (mach.resume m Mode.Continue), running = True }
+  else if command == "threads" then
+    respond
+      st
+      req
+      (J.jObject [("threads", J.jArray [J.jObject [("id", J.jInt 1), ("name", J.jString "main")]])])
+  else if command == "stackTrace" then
+    let start = numberAt args ["startFrame"] 0 in
+    let levels = numberAt args ["levels"] 0 in
+    let frames = (match st.machine with | Just m -> mach.frames m | None -> []) in
+    let shown = V.take (V.drop frames start) (if levels <= 0 then V.len frames else levels) in
+    respond
+      st
+      req
+      (J.jObject [
+         (
+           "stackFrames",
+           J.jArray
+             (V.map
+                (\i ->
+                  let f = V.getOr (Frame { name = "", path = "", line = 0, column = 0 }) shown i in
+                  J.jObject
+                    (V.append
+                       [
+                         ("id", J.jInt (start + i)),
+                         ("name", J.jString f.name),
+                         ("line", J.jInt (if f.line > 0 then lineOut st f.line else 0)),
+                         ("column", J.jInt (if f.column > 0 then columnOut st f.column else 0))
+                       ]
+                       (if S.isEmpty f.path then []
+                        else
+                          [(
+                            "source",
+                            J.jObject [
+                              ("name", J.jString (baseName f.path)),
+                              ("path", J.jString f.path)
+                            ]
+                          )])))
+                (V.range 0 (V.len shown)))
+         ),
+         ("totalFrames", J.jInt (V.len frames))
+       ])
+  else if command == "scopes" then
+    let frame = numberAt args ["frameId"] 0 in
+    respond
+      st
+      req
+      (J.jObject
+         [(
+           "scopes",
+           J.jArray
+             (V.map
+                (\(s : Scope) ->
+                  J.jObject [
+                    ("name", J.jString s.name),
+                    ("variablesReference", J.jInt s.reference),
+                    ("expensive", J.jBool s.expensive)
+                  ])
+                (match st.machine with
+                 | Just m -> mach.scopes m frame
+                 | None -> []))
+         )])
+  else if command == "variables" then
+    let reference = numberAt args ["variablesReference"] 0 in
+    respond
+      st
+      req
+      (J.jObject
+         [(
+           "variables",
+           J.jArray
+             (V.map
+                (\(v : Variable) ->
+                  J.jObject
+                    (V.append
+                       [
+                         ("name", J.jString v.name),
+                         ("value", J.jString v.value),
+                         ("variablesReference", J.jInt v.reference)
+                       ]
+                       (if S.isEmpty v.kind then [] else [("type", J.jString v.kind)])))
+                (match st.machine with
+                 | Just m -> mach.variables m reference
+                 | None -> []))
+         )])
+  else if command == "evaluate" then
+    let expr = M.unwrapOr "" (textAt args ["expression"]) in
+    match M.andThen (\m -> mach.evaluate m (numberAt args ["frameId"] 0) expr) st.machine with
+    | Just v ->
+        respond
+          st
+          req
+          (J.jObject
+             (V.append
+                [("result", J.jString v.value), ("variablesReference", J.jInt v.reference)]
+                (if S.isEmpty v.kind then [] else [("type", J.jString v.kind)])))
+    | None -> refuse st req "`${expr}` is not something that can be shown here"
+  else if V.elem command ["continue", "next", "stepIn", "stepOut"] then
+    let mode =
+      if command == "continue" then Mode.Continue
+      else if command == "next" then Mode.StepOver
+      else if command == "stepIn" then Mode.StepIn
+      else Mode.StepOut
+    in match st.machine with
+       | None -> refuse st req "nothing is running"
+       | Just m ->
+           if st.finished then
+             refuse st req "the program has stopped for good: it failed or finished"
+           else
+             respond
+               { st | machine = Just (mach.resume m mode), running = True }
+               req
+               (if command == "continue" then J.jObject [("allThreadsContinued", J.jBool True)]
+                else J.jObject [])
+  else if command == "pause" then
+    let st2 = respond st req (J.jObject []) in
+    if st2.running then reported (flushed mach { st2 | running = False }) Stop.Pause else st2
+  else if command == "disconnect" or command == "terminate" then
+    let st2 = respond st req (J.jObject []) in
+    let st3 = if command == "terminate" then event st2 "terminated" (J.jObject []) else st2 in
+    { st3 | running = False, done = command == "disconnect" }
+  else refuse st req "`${command}` is not something this debugger does"
+
+fun baseName (path : String) : String =
+  V.getOr
+    path
+    (S.split "/" (S.join "/" (S.split "\\" path)))
+    (V.len (S.split "/" (S.join "/" (S.split "\\" path))) - 1)
+
+-- The machine run one slice: on, or stopped and said so.
+fun sliced (mach : Machine m e) st =
+  match st.machine with
+  | None -> { st | running = False }
+  | Just m ->
+      (match mach.run m slice with
+       | (m2, stop) ->
+           let st2 = flushed mach { st | machine = Just m2 } in
+           (match stop with
+            | None -> st2
+            | Just s -> reported { st2 | running = False } s))
+
+-- --- serving -------------------------------------------------------------------
+
+-- What has arrived, all of it, now; and the same, waiting until something
+-- has. The thread that reads adds to one shared list.
+fun taken queue =
+  Stm.atomically (\() ->
+    let got = Stm.readTVar queue in
+    let u = Stm.writeTVar queue [] in
+    got)
+
+fun waited queue =
+  Stm.atomically (\() ->
+    let got = Stm.readTVar queue in
+    let u = Stm.check (not (V.isEmpty got)) in
+    let w = Stm.writeTVar queue [] in
+    got)
+
+-- What has arrived, answered in order: the state after, and whether the
+-- messages have ended.
+fun handled (mach : Machine m e) st (arrived : [Arrived]) =
+  V.foldl
+    (\acc a ->
+      match acc with
+      | (s, True) -> (s, True)
+      | (s, False) ->
+          (match a with
+           | Arrived.NoMore -> (s, True)
+           | Arrived.Got msg -> (answered mach s msg, False)))
+    (st, False)
+    arrived
+
+-- Until the editor disconnects or there are no more messages: while the
+-- program runs, what has arrived is answered between slices; while it does
+-- not, the adapter waits for something to arrive.
+fun attending (mach : Machine m e) queue st =
+  if st.done then ()
+  else
+    match handled mach st (if st.running then taken queue else waited queue) with
+    | (_, True) -> ()
+    | (st2, False) ->
+        if st2.running and not st2.done then attending mach queue (sliced mach st2)
+        else attending mach queue st2
+
+-- The thread that reads: each message onto the queue as it comes, and the
+-- thread given way after each, since on Glade a thread woken by another does
+-- not run until that one waits or gives way. Nothing is read after
+-- `disconnect`.
+fun reading queue =
+  match readMessage () with
+  | None -> Stm.atomically (\() -> Stm.modifyTVar queue (\q -> V.pushBack q Arrived.NoMore))
+  | Just msg ->
+      let u = Stm.atomically (\() -> Stm.modifyTVar queue (\q -> V.pushBack q (Arrived.Got msg))) in
+      let w = Thread.yieldNow () in
+      if M.andThen J.asString (J.get "command" msg) == Just "disconnect" then () else reading queue
+
+-- A debug adapter for `mach`, on standard input and output, until the editor
+-- disconnects.
+@pub fun serve (mach : Machine m e) =
+  let queue = Stm.newTVarIO [] in
+  let reader = Thread.spawn (\() -> reading queue) in
+  attending mach queue (fresh ())
+
+-- --- an adapter, without an editor -----------------------------------------------
+
+-- What an adapter for `mach` writes when it is sent `messages`, one at a time:
+-- after each, the program is run until it stops, or for `slices` slices if
+-- it does not. Each message it wrote, as JSON. For a test.
+@pub fun debugged (messages : [Json]) (slices : Int) (mach : Machine m e) =
+  written (snd (withOutput (\() -> settling mach messages slices (fresh ()))))
+
+fun settling (mach : Machine m e) (messages : [Json]) (slices : Int) st =
+  match V.get messages 0 with
+  | None -> ()
+  | Just msg ->
+      let st2 = answered mach st msg in
+      if st2.done then () else settling mach (V.drop messages 1) slices (ran mach st2 slices)
+
+fun ran (mach : Machine m e) st (left : Int) =
+  if not st.running or left <= 0 then st else ran mach (sliced mach st) (left - 1)
+
+-- --- dap! ----------------------------------------------------------------------
+
+use Std.Macro (TokenTree, Loc)
+use Std.Macro.TokenTree.*
+use Std.Macro.Loc.*
+use Std.Macro.Parse (Tokens, parseTokens, ident, keyword, punct, stringLit)
+use Std.String.Parse as P
+use Std.String.Parse (Parser)
+use Std.String.Parse (keep, skip)
+use Std.Macro (Expand)
+use Lingua.Pipe (named)
+
+def dapFeatures : [String] =
+  ["launch", "resume", "run", "breakpoints", "frames", "scopes", "variables", "evaluate", "output"]
+
+def dapNeeded : [String] =
+  ["launch", "resume", "run", "breakpoints", "frames", "scopes", "variables"]
+
+def dapFeature : Parser Tokens ((String, Loc), String) =
+  P.pure (\f fn -> (f, fn)) |> skip (punct "|") |> keep named |> skip (punct "=") |> keep ident
+
+def dapCall : Parser Tokens (Bool, String, String, [((String, Loc), String)]) =
+  P.pure (\pub name lang fs -> (M.isSome pub, name, lang, fs))
+    |> keep (P.optional (keyword "pub"))
+    |> keep ident
+    |> keep stringLit
+    |> keep (P.some dapFeature)
+
+@macro
+@pub fun dap (ts : [TokenTree]) : [TokenTree] ! { Expand | e } =
+  match parseTokens dapCall ts with
+  | Err failed -> failed
+  | Ok (pub, name, lang, fs) ->
+      match V.find (\f -> not (V.elem (fst (fst f)) dapFeatures)) fs with
+      | Just f ->
+          [Fail
+             "a debugger has no feature `${fst (fst f)}`: the features are ${S.join ", " (V.map (\x -> "`${x}`") dapFeatures)}"
+             (snd (fst f))]
+      | None ->
+          match V.find (\k -> not (V.any (\f -> fst (fst f) == k) fs)) dapNeeded with
+          | Just k -> [Fail "a debugger needs `${k}`: see `Lingua.Dap`" Nowhere]
+          | None -> [Code (dapCode (if pub then "@pub " else "") name lang fs)]
+
+fun dapCode pub name lang fs =
+  let fn = \k -> M.map snd (V.find (\f -> fst (fst f) == k) fs) in
+  let given = \k -> M.unwrapOr "" (fn k) in
+  "use Lingua.Dap as LinguaDap
+
+-- ${lang}'s debugger, as the adapter is given it.
+${pub}def machine${name} =
+  LinguaDap.machine
+    ${given "launch"}
+    ${given "resume"}
+    ${given "run"}
+    ${given "breakpoints"}
+    ${given "frames"}
+    ${given "scopes"}
+    ${given "variables"}
+    ${M.unwrapOr "(\\m frame expr -> None)" (fn "evaluate")}
+    ${M.unwrapOr "(\\m -> (m, \"\"))" (fn "output")}
+
+-- A debug adapter for ${lang}, on standard input and output, until the editor
+-- disconnects.
+${pub}fun debug${name} () = LinguaDap.serve machine${name}
+"
+
+-- --- tests ---------------------------------------------------------------------
+
+use Std.Test (assertEq)
+
+-- A program of `limit` lines, one step each -- or of no end, for a `limit`
+-- below 1: where it is, its last line, its breakpoints, and how it is to
+-- run.
+type Toy = { at : Int, limit : Int, stops : [Int], mode : Mode, from : Int }
+
+def toy : Machine Toy e =
+  Machine {
+    launch =
+      \path args ->
+        if path == "/p.toy" then
+          Ok {
+            at = 1,
+            limit = numberAt args ["lines"] 5,
+            stops = [],
+            mode = Mode.Continue,
+            from = 1
+          }
+        else Err "there is no ${path}",
+    resume = \t mode -> { t | mode, from = t.at },
+    run = \t budget -> toyRun t budget,
+    breakpoints = \t path lines -> ({ t | stops = lines }, V.map (\l -> Just l) lines),
+    frames = \t -> [Frame { name = "main", path = "/p.toy", line = t.at, column = 1 }],
+    scopes = \t frame -> [Scope { name = "Locals", reference = 1, expensive = False }],
+    variables =
+      \t reference ->
+        if reference == 1 then
+          [Variable { name = "line", value = show t.at, kind = "Int", reference = 0 }]
+        else [],
+    evaluate =
+      \t frame expr ->
+        if expr == "line" then
+          Just (Variable { name = "line", value = show t.at, kind = "Int", reference = 0 })
+        else None,
+    output = \t -> (t, ""),
+  }
+
+-- One step at a time: a step stops after one line; a run stops at a line
+-- with a breakpoint other than the one it began on, and ends after the last.
+fun toyRun (t : Toy) (budget : Int) : (Toy, Maybe Stop) =
+  if budget <= 0 then (t, None)
+  else if t.limit > 0 and t.at >= t.limit then (t, Just (Stop.Exited "done"))
+  else
+    let next = { t | at = t.at + 1 } in
+    if t.mode != Mode.Continue then (next, Just Stop.Step)
+    else if V.elem next.at t.stops then (next, Just Stop.Breakpoint)
+    else toyRun next (budget - 1)
+
+fun req (n : Int) (command : String) (args : [(String, Json)]) : Json =
+  J.jObject [
+    ("seq", J.jInt n),
+    ("type", J.jString "request"),
+    ("command", J.jString command),
+    ("arguments", J.jObject args)
+  ]
+
+fun launching (lines : Int) : [Json] =
+  [
+    req 1 "initialize" [],
+    req 2 "launch" [("program", J.jString "/p.toy"), ("lines", J.jInt lines)],
+    req 3 "setBreakpoints" [
+      ("source", J.jObject [("path", J.jString "/p.toy")]),
+      ("breakpoints", J.jArray [J.jObject [("line", J.jInt 3)]])
+    ],
+    req 4 "configurationDone" []
+  ]
+
+-- Each message as one line: an event's name and what matters of it, or the
+-- command a response is to and whether it succeeded.
+fun brief (j : Json) : String =
+  let t = M.unwrapOr "" (M.andThen J.asString (J.get "type" j)) in
+  if t == "event" then
+    let name = M.unwrapOr "" (M.andThen J.asString (J.get "event" j)) in
+    let reason = M.unwrapOr "" (M.andThen J.asString (J.path ["body", "reason"] j)) in
+    if S.isEmpty reason then "event ${name}" else "event ${name} ${reason}"
+  else
+    "${M.unwrapOr "" (M.andThen J.asString (J.get "command" j))} ${if M.andThen J.asBool (J.get "success" j) == Just True then "ok" else "refused"}"
+
+@test fun aProgramStopsAtItsBreakpointAndRunsToItsEnd () =
+  let said =
+    debugged
+      (V.append (launching 5) [
+         req 5 "stackTrace" [],
+         req 6 "variables" [("variablesReference", J.jInt 1)],
+         req 7 "continue" []
+       ])
+      100
+      toy
+  in
+  let a =
+    assertEq
+      (V.map brief said)
+      [
+        "initialize ok", "launch ok", "event initialized", "setBreakpoints ok",
+        "configurationDone ok", "event stopped breakpoint", "stackTrace ok", "variables ok",
+        "continue ok", "event output", "event exited", "event terminated"
+      ]
+      "launched, stopped where it was asked to, looked at, and run on to its end"
+  in
+  let b =
+    assertEq
+      (M.andThen (J.path ["body", "stackFrames"]) (V.get said 6)
+         |> M.andThen J.asArray
+         |> M.andThen (\fs -> V.get fs 0)
+         |> M.andThen (J.get "line"))
+      (Just (J.jInt 3))
+      "on the line of the breakpoint"
+  in
+  let c =
+    assertEq
+      (M.andThen (J.path ["body", "variables"]) (V.get said 7)
+         |> M.andThen J.asArray
+         |> M.andThen (\vs -> V.get vs 0)
+         |> M.andThen (J.get "value"))
+      (Just (J.jString "3"))
+      "holding what it holds there"
+  in assertEq
+       (V.map (\j -> M.andThen J.asInt (J.get "seq" j)) said)
+       (V.map (\i -> Just (i + 1)) (V.range 0 (V.len said)))
+       "each message numbered after the one before"
+
+@test fun aStepStopsAtTheNextLine () =
+  let said = debugged (V.append (launching 5) [req 5 "next" [], req 6 "stackTrace" []]) 100 toy in
+  let a =
+    assertEq
+      (V.map brief (V.drop said 5))
+      ["event stopped breakpoint", "next ok", "event stopped step", "stackTrace ok"]
+      "a step, and a stop after it"
+  in assertEq
+       (M.andThen (J.path ["body", "stackFrames"]) (V.get said 8)
+          |> M.andThen J.asArray
+          |> M.andThen (\fs -> V.get fs 0)
+          |> M.andThen (J.get "line"))
+       (Just (J.jInt 4))
+       "one line on"
+
+@test fun aRunningProgramIsPaused () =
+  -- A program with no end, and no breakpoint it reaches: only a pause stops it.
+  let said =
+    debugged
+      [
+        req 1 "initialize" [],
+        req 2 "launch" [("program", J.jString "/p.toy"), ("lines", J.jInt 0)],
+        req 3 "configurationDone" [],
+        req 4 "pause" [],
+        req 5 "evaluate" [("expression", J.jString "line")]
+      ]
+      3
+      toy
+  in
+  let a =
+    assertEq
+      (V.map brief (V.drop said 3))
+      ["configurationDone ok", "pause ok", "event stopped pause", "evaluate ok"]
+      "it ran, and stopped when it was asked to"
+  in assertEq
+       (M.andThen (J.path ["body", "result"]) (V.get said 6))
+       (Just (J.jString "60001"))
+       "three slices on, where it was paused"
+
+@test fun whatCannotBeDoneIsRefused () =
+  let said =
+    debugged
+      [
+        req 1 "launch" [("program", J.jString "/nowhere.toy")],
+        req 2 "continue" [],
+        req 3 "launch" [],
+        req 4 "restartFrame" []
+      ]
+      1
+      toy
+  in assertEq
+       (V.map brief said)
+       [
+         "event output",
+         "launch refused",
+         "continue refused",
+         "launch refused",
+         "restartFrame refused"
+       ]
+       "a program that is not there, said why; running nothing; a launch of nothing; a request it has not"
+
+@test fun linesAreCountedAsTheEditorCountsThem () =
+  let said =
+    debugged
+      [
+        req 1 "initialize" [("linesStartAt1", J.jBool False)],
+        req 2 "launch" [("program", J.jString "/p.toy")],
+        req 3 "setBreakpoints" [
+          ("source", J.jObject [("path", J.jString "/p.toy")]),
+          ("breakpoints", J.jArray [J.jObject [("line", J.jInt 2)]])
+        ],
+        req 4 "configurationDone" [],
+        req 5 "stackTrace" []
+      ]
+      100
+      toy
+  in assertEq
+       (M.andThen (J.path ["body", "stackFrames"]) (V.get said 6)
+          |> M.andThen J.asArray
+          |> M.andThen (\fs -> V.get fs 0)
+          |> M.andThen (J.get "line"))
+       (Just (J.jInt 2))
+       "line 2 from 0 is line 3 from 1, and is said as 2"

@@ -53,11 +53,13 @@ mod Editor
 mod Units
 mod Bench
 mod Tool
+mod Debug
 
 use Lingua (cli!)
 use Lingua.Diagnostic (renderToOutput)
 use MiniML.Compiler
 use MiniML.Editor
+use MiniML.Debug
 use MiniML.Units
 use MiniML.Bench (benchmark, drivers)
 use Std.Collections.Vector as V
@@ -79,6 +81,7 @@ cli! {
       root : Maybe String "the unit's directory; this one if none is given"
     }
     | lsp "Be a language server, on standard input and output" {}
+    | debug "Be a debug adapter, on standard input and output" {}
     | bench "Time each phase of the compiler on a generated program" {
       lines : Maybe String "how many lets; 2000 if none is given"
     }
@@ -104,6 +107,7 @@ fun command (cli : Cli) =
   | Cli.Demo -> demo ()
   | Cli.Build r -> finish (buildBuild (M.unwrapOr "." r.root))
   | Cli.Lsp -> serveServer ()
+  | Cli.Debug -> debugDebugger ()
   | Cli.Bench r ->
       (let n = M.unwrapOr 2000 (M.andThen S.toInt r.lines) in
        let u = benchmark n in
@@ -192,6 +196,7 @@ fun asked args =
   | Ok Cli.Demo -> "demo"
   | Ok (Cli.Build r) -> "build ${M.unwrapOr "." r.root}"
   | Ok Cli.Lsp -> "lsp"
+  | Ok Cli.Debug -> "debug"
   | Ok (Cli.Bench _) -> "bench"
   | Err (Help h) -> V.getOr "" (S.split "\n" h) 0
   | Err (Complete c) -> "completions"
@@ -246,7 +251,9 @@ fun asked args =
   match askCli ["completions", "bash"] with
   | Err (Complete script) ->
       assertEq
-        (S.contains "compgen -W \"check run repl demo build lsp bench help completions\"" script)
+        (S.contains
+           "compgen -W \"check run repl demo build lsp debug bench help completions\""
+           script)
         True
         script
   | _ -> assertEq True False "a script"

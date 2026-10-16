@@ -1,0 +1,417 @@
+-- The debugger (`dap!`): MiniML's `Core` run a step at a time by a CEK
+-- machine -- the expression being worked on, the environment it is worked on
+-- in, and what is waiting for its value -- so that it can stop between any
+-- two steps, say where it is, and say what each name in scope holds.
+--
+-- The evaluator in `Eval` is the reference: it is the same program run
+-- through in one go, and the tests here check the machine comes to what it
+-- does.
+
+use Lingua (dap!)
+use Lingua.Dap (Frame, Scope, Variable, Mode, Stop)
+use Lingua.Lang (Meta)
+use Lingua.Lang.Meta.*
+use Lingua.Diagnostic (message)
+use MiniML.Syntax
+use MiniML.Desugar
+use MiniML.Desugar.Core.Expr as Expr
+use MiniML.Names
+use MiniML.Eval
+use MiniML.Compiler (compile)
+use Std.Collections.Vector as V
+use Std.Collections.List as L
+use Std.String as S
+use Std.Maybe as M
+use Std.Json (Json)
+use Std.Exn (toResult)
+use Std.Fs (readToString)
+use Std.Result.Result.*
+
+dap! {
+  pub Debugger "miniml"
+    | launch = launched
+    | resume = resumed
+    | run = ran
+    | breakpoints = placed
+    | frames = framesOf
+    | scopes = scopesOf
+    | variables = variablesOf
+    | evaluate = evaluated
+}
+
+-- --- the machine ---------------------------------------------------------------
+
+type Env = List (Int, Value)
+
+-- What the machine is doing: working out an expression in an environment;
+-- handing a value to what waits for it; finished, with what it came to; or
+-- failed, with why.
+data Control
+  = Eval CoreExpr Env
+  | Return Value
+  | Done Value
+  | Failed String
+
+-- What waits for a value: an application's argument, to be worked out next;
+-- an application's function, given its argument; a function's body, which
+-- hands its value back to where it was called from -- its name, where it was
+-- called, and the environment it was called in; what a `let` binds; an
+-- `if`'s condition; and an operator's two operands.
+data Kont
+  = Arg CoreExpr Env Meta
+  | Call Value Meta Env
+  | Body String Meta Env
+  | Bind Int CoreExpr Env
+  | Branch CoreExpr CoreExpr Env
+  | Left String CoreExpr Env Meta
+  | Right String Value Meta
+
+-- The machine and what the debugger keeps beside it: the program's tables,
+-- its text and path, its binders by id; the control, the continuation and
+-- the environment last worked in; the lines with breakpoints; how it is to
+-- run, how deep it was and on which line when it was set to; and the line it
+-- last worked on.
+type Machine =
+  {
+    arena : CoreArena,
+    text : String,
+    path : String,
+    names : [Binder],
+    control : Control,
+    kont : List Kont,
+    env : Env,
+    stops : [Int],
+    mode : Mode,
+    depth : Int,
+    line : Int,
+    last : Int,
+  }
+
+-- One step.
+fun step (m : Machine) : Machine =
+  match m.control with
+  | Control.Eval e env -> (let n = evalStep m.arena m e env in { n | env = env })
+  | Control.Return v -> returned m v
+  | _ -> m
+
+fun evalStep (a : CoreArena) (m : Machine) (e : CoreExpr) (env : Env) : Machine =
+  let to = \c -> { m | control = c } in
+  let push = \k c -> { m | control = c, kont = k :: m.kont } in
+  match (a, e) with
+  | Expr.Int n -> to (Control.Return (Value.Int n))
+  | Expr.Bool b -> to (Control.Return (Value.Bool b))
+  | Expr.Var id ->
+      (match L.lookupAssoc id env with
+       | Just v -> to (Control.Return v)
+       | None -> to (Control.Failed "binder ${show id} has no value"))
+  | Expr.Lam param body -> to (Control.Return (Value.Closure param body env))
+  | Expr.App func arg -> push (Kont.Arg arg env (Expr.meta a e)) (Control.Eval func env)
+  | Expr.Let id value body -> push (Kont.Bind id body env) (Control.Eval value env)
+  | Expr.LetRec id param value body ->
+      to (Control.Eval body ((id, Value.Rec id param value env) :: env))
+  | Expr.If cond yes no -> push (Kont.Branch yes no env) (Control.Eval cond env)
+  | Expr.Prim op args ->
+      (match (V.get args 0, V.get args 1) with
+       | (Just x, Just y) -> push (Kont.Left op y env (Expr.meta a e)) (Control.Eval x env)
+       | _ -> to (Control.Failed "`${op}` wants two operands"))
+
+fun returned (m : Machine) (v : Value) : Machine =
+  let to = \c rest -> { m | control = c, kont = rest } in
+  match m.kont with
+  | [;] -> to (Control.Done v) [;]
+  | k :: rest ->
+      match k with
+      | Kont.Arg arg env at -> to (Control.Eval arg env) (Kont.Call v at m.env :: rest)
+      | Kont.Call f at caller ->
+          (match f with
+           | Value.Closure p body env ->
+               to (Control.Eval body ((p, v) :: env)) (Kont.Body "fun" at caller :: rest)
+           | Value.Rec name p body env ->
+               to
+                 (Control.Eval body ((p, v) :: (name, f) :: env))
+                 (Kont.Body (nameOf m name) at caller :: rest)
+           | other -> to (Control.Failed "not a function: ${showValue other}") rest)
+      | Kont.Body _ _ _ -> to (Control.Return v) rest
+      | Kont.Bind id body env -> to (Control.Eval body ((id, v) :: env)) rest
+      | Kont.Branch yes no env ->
+          (match v with
+           | Value.Bool True -> to (Control.Eval yes env) rest
+           | _ -> to (Control.Eval no env) rest)
+      | Kont.Left op y env at -> to (Control.Eval y env) (Kont.Right op v at :: rest)
+      | Kont.Right op l at ->
+          (match toResult (\() -> primitive at op l v) with
+           | Ok r -> to (Control.Return r) rest
+           | Err d -> to (Control.Failed (message d)) rest)
+
+fun nameOf (m : Machine) (id : Int) : String =
+  match V.get m.names id with
+  | Just b -> b.name
+  | None -> "fun"
+
+-- How many function bodies are running.
+fun depthOf (m : Machine) : Int =
+  L.foldl (\n k -> match k with | Kont.Body _ _ _ -> n + 1 | _ -> n) 0 m.kont
+
+-- The line byte `at` is on, from 1, and its column.
+fun lineAt (text : String) (at : Int) : (Int, Int) =
+  let before = stringSlice text 0 (max 0 (min at (stringByteLength text))) in
+  let lines = S.split "\n" before in
+  (V.len lines, S.charLength (V.getOr "" lines (V.len lines - 1)) + 1)
+
+fun startOf (m : Meta) : Int = match m with | Meta s _ -> s
+
+-- --- what the debugger asks of it ------------------------------------------------
+
+fun launched (path : String) (args : Json) =
+  match readToString path with
+  | Err _ -> Err "there is no file ${path} to debug"
+  | Ok text ->
+      match compile [] (parseMini text) with
+      | (Just p, binders, []) ->
+          Ok {
+            arena = coreArena p,
+            text,
+            path,
+            names = binders,
+            control = Control.Eval (programExpr p) [;],
+            kont = [;],
+            env = [;],
+            stops = [],
+            mode = Mode.Continue,
+            depth = 0,
+            line = 0,
+            last = 0,
+          }
+      | (_, _, ds) -> Err "${path} does not compile: ${S.join "; " (V.map message ds)}"
+
+fun resumed (m : Machine) (mode : Mode) : Machine = { m | mode, depth = depthOf m, line = m.last }
+
+-- At most `budget` steps, stopping where the way it was set to run says.
+fun ran (m : Machine) (budget : Int) : (Machine, Maybe Stop) =
+  match m.control with
+  | Control.Done v -> (m, Just (Stop.Exited (showValue v)))
+  | Control.Failed why -> (m, Just (Stop.Exception why))
+  | _ ->
+      if budget <= 0 then (m, None)
+      else
+        let next = step m in
+        match next.control with
+        | Control.Eval e _ ->
+            let l = fst (lineAt m.text (startOf (Expr.meta m.arena e))) in
+            let entered = l != m.last in
+            let moved = { next | last = l } in
+            let stop =
+              (match m.mode with
+               | Mode.Continue -> entered and V.elem l m.stops
+               | Mode.StepIn -> entered
+               | Mode.StepOver -> l != m.line and depthOf next <= m.depth
+               | Mode.StepOut -> depthOf next < m.depth)
+            in if stop then
+                 (moved, Just (if m.mode == Mode.Continue then Stop.Breakpoint else Stop.Step))
+               else ran moved (budget - 1)
+        | _ -> ran next (budget - 1)
+
+-- Breakpoints by line: each on a line the program has.
+fun placed (m : Machine) (path : String) (lines : [Int]) : (Machine, [Maybe Int]) =
+  let count = V.len (S.split "\n" m.text) in
+  ({ m | stops = lines }, V.map (\l -> if l >= 1 and l <= count then Just l else None) lines)
+
+-- Where the machine is, innermost first: the function running, and the place
+-- in it; then each function waiting for one it called, at the call.
+fun framesOf (m : Machine) : [Frame] =
+  V.map (\f -> match f with | (name, at, _) -> frameAt m name at) (stack m)
+
+-- Each frame: its function's name, where it is, and the names it sees.
+fun stack (m : Machine) : [(String, Int, Env)] =
+  let bodies =
+    L.foldr
+      (\k acc ->
+        match k with
+        | Kont.Body n at env -> V.pushFront acc (n, startOf at, env)
+        | _ -> acc)
+      []
+      m.kont
+  in
+  let bodies = V.reverse bodies in
+  let here =
+    (match m.control with
+     | Control.Eval e _ -> startOf (Expr.meta m.arena e)
+     | _ -> 0)
+  in
+  let name =
+    \i ->
+      match V.get bodies i with
+      | Just (n, _, _) -> n
+      | None -> "main"
+  in V.pushFront
+       (V.map
+          (\i ->
+            match V.getOr ("", 0, [;]) bodies i with
+            | (_, at, env) -> (name (i + 1), at, env))
+          (V.range 0 (V.len bodies)))
+       (name 0, here, m.env)
+
+fun frameAt (m : Machine) (name : String) (at : Int) : Frame =
+  match lineAt m.text at with
+  | (line, column) -> Frame { name, path = m.path, line, column }
+
+fun scopesOf (m : Machine) (frame : Int) : [Scope] =
+  [Scope { name = "Locals", reference = frame + 1, expensive = False }]
+
+-- What frame `reference - 1` sees: each name once, the nearest.
+fun variablesOf (m : Machine) (reference : Int) : [Variable] =
+  match V.get (stack m) (reference - 1) with
+  | None -> []
+  | Just (_, _, env) ->
+      V.map
+        (\p ->
+          match p with
+          | (id, v) ->
+              Variable { name = nameOf m id, value = showValue v, kind = "", reference = 0 })
+        (L.foldl
+           (\acc p -> if V.any (\q -> fst q == fst p) acc then acc else V.pushBack acc p)
+           []
+           env)
+
+-- A name, in a frame.
+fun evaluated (m : Machine) (frame : Int) (expr : String) : Maybe Variable =
+  V.find (\(v : Variable) -> v.name == S.trim expr) (variablesOf m (frame + 1))
+
+-- --- tests ---------------------------------------------------------------------
+
+use Std.Test (assertEq)
+use Std.Json as J
+use Std.Fs (writeString, createDirAll)
+use Lingua.Dap (debugged)
+use MiniML.Compiler (runSource)
+
+-- The machine run to its end, as the evaluator runs a program.
+fun runToEnd (source : String) =
+  let path = written source in
+  match launched path (J.jObject []) with
+  | Err why -> why
+  | Ok m ->
+      (match ran m 1000000 with
+       | (_, Just (Stop.Exited v)) -> v
+       | (_, Just (Stop.Exception why)) -> why
+       | _ -> "did not stop")
+
+def fact : String = "let rec fact n =\n  if n < 2 then 1\n  else n * fact (n - 1)\nin\nfact 3\n"
+
+fun written (source : String) =
+  let u = createDirAll "target/debug-tests" in
+  let path = "target/debug-tests/${show (stringByteLength source)}.ml" in
+  let w = writeString (path, source) in
+  path
+
+fun req (n : Int) (command : String) (args : [(String, Json)]) : Json =
+  J.jObject [
+    ("seq", J.jInt n),
+    ("type", J.jString "request"),
+    ("command", J.jString command),
+    ("arguments", J.jObject args)
+  ]
+
+fun launching (path : String) (line : Int) : [Json] =
+  [
+    req 1 "initialize" [],
+    req 2 "launch" [("program", J.jString path)],
+    req 3 "setBreakpoints" [
+      ("source", J.jObject [("path", J.jString path)]),
+      ("breakpoints", J.jArray [J.jObject [("line", J.jInt line)]])
+    ],
+    req 4 "configurationDone" []
+  ]
+
+fun field (j : Maybe Json) (path : [String]) : Maybe Json = M.andThen (J.path path) j
+
+fun item (j : Maybe Json) (i : Int) : Maybe Json =
+  M.andThen (\x -> M.andThen (\xs -> V.get xs i) (J.asArray x)) j
+
+fun response (said : [Json]) (seq : Int) : Maybe Json =
+  V.find (\j -> J.get "request_seq" j == Just (J.jInt seq)) said
+
+@test fun theMachineComesToWhatTheEvaluatorDoes () =
+  let programs =
+    ["1 + 2 * 3", "let add = fun x y -> x + y in let inc = add 1 in inc 41", fact, "1 / 0"]
+  in assertEq
+       (V.map runToEnd programs)
+       ["7", "42", "6", "division by zero"]
+       "each program's value, or why it failed, as `Eval` says"
+
+@test fun aBreakpointInARecursiveFunctionStopsEachTimeItIsReached () =
+  let path = written fact in
+  let said =
+    debugged
+      (V.append (launching path 3) [
+         req 5 "stackTrace" [],
+         req 6 "variables" [("variablesReference", J.jInt 1)],
+         req 7 "continue" [],
+         req 8 "variables" [("variablesReference", J.jInt 1)],
+         req 9 "continue" []
+       ])
+      100
+      machineDebugger
+  in
+  let frames = field (response said 5) ["body", "stackFrames"] in
+  let a =
+    assertEq
+      (
+        field (item frames 0) ["name"],
+        field (item frames 0) ["line"],
+        field (response said 5) ["body", "totalFrames"]
+      )
+      (Just (J.jString "fact"), Just (J.jInt 3), Just (J.jInt 2))
+      "in `fact`, on line 3, called from the program"
+  in
+  let n = \seq -> field (item (field (response said seq) ["body", "variables"]) 0) ["value"] in
+  let b = assertEq (n 6, n 8) (Just (J.jString "3"), Just (J.jString "2")) "`n` is 3, then 2" in
+  assertEq
+    (V.find (\j -> J.get "event" j == Just (J.jString "output")) said
+       |> (\o -> field o ["body", "output"]))
+    (Just (J.jString "=> 6\n"))
+    "and then it finishes, with 6"
+
+@test fun aStepIntoACallStopsInsideIt () =
+  let path = written fact in
+  let said =
+    debugged
+      (V.append (launching path 3) [req 5 "stepIn" [], req 6 "stackTrace" []])
+      100
+      machineDebugger
+  in
+  let frames = field (response said 6) ["body", "stackFrames"] in
+  assertEq
+    (field (item frames 0) ["line"], field (response said 6) ["body", "totalFrames"])
+    (Just (J.jInt 2), Just (J.jInt 3))
+    "on the first line of the call it stepped into, one frame deeper"
+
+@test fun aFailureStopsTheProgramForGood () =
+  let path = written "let x = 1 in\nx / 0\n" in
+  let said =
+    debugged
+      [
+        req 1 "initialize" [],
+        req 2 "launch" [("program", J.jString path)],
+        req 3 "configurationDone" [],
+        req 4 "evaluate" [("expression", J.jString "x"), ("frameId", J.jInt 0)],
+        req 5 "continue" []
+      ]
+      100
+      machineDebugger
+  in
+  let stopped = V.find (\j -> J.get "event" j == Just (J.jString "stopped")) said in
+  assertEq
+    (
+      field stopped ["body", "reason"],
+      field stopped ["body", "text"],
+      field (response said 4) ["body", "result"],
+      field (response said 5) ["success"]
+    )
+    (
+      Just (J.jString "exception"),
+      Just (J.jString "division by zero"),
+      Just (J.jString "1"),
+      Just (J.jBool False)
+    )
+    "stopped where it failed, still to be looked at, and not to be run on"
