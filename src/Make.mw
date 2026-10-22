@@ -74,7 +74,7 @@ use Std.Fs (
 use Std.Process (Process, currentExe, currentPid)
 use Std.Console (Console, writeOutput)
 use Std.Macro (Datum, Reflect, toDatum, fromDatum)
-use Std.Sort (sort)
+use Std.Sort (sort, sortOn)
 use Lingua.Query (datumJson, jsonDatum)
 
 fun okOf r = match r with | Ok x -> Just x | Err _ -> None
@@ -750,6 +750,329 @@ fun dirOf r = match r with | (dir, _, _, _) -> dir
                V.map (\f -> (f, M.unwrapOr "" (okOf (readToString f)))) (filesOf us d)
              in Ok (Given d sources is (outDir r us.sub d))
 
+-- --- the parts of a unit ------------------------------------------------------
+--
+-- A unit whose sources import each other is not one thing to check: what
+-- imports nothing of the rest is checked first, and sources that import each
+-- other in a circle are checked together. Those groups -- the import graph's
+-- strongly connected components -- are a unit's parts. A build that says how
+-- a unit's sources import each other (`parts`) compiles each part on its own
+-- (`compilePart`), in dependency order, those that do not depend on each other
+-- at once, and each again only if its sources, or the interface of a part it
+-- imports, changed; then makes the unit's interface of its parts'
+-- (`assemble`). What a part was compiled from, and its interface, are kept
+-- under the unit's own directory, `parts/`.
+
+-- What a part is compiled from: the unit's directory, the part's sources --
+-- each path and its text -- the interface of each part it imports, by that
+-- part's name, the interface of each unit the unit depends on, and the
+-- directory it may write into, the unit's.
+@pub data Part i p
+  = Part String [(String, String)] [(String, p)] [(String, i)] String
+
+use Part.*
+
+@pub fun partDir (x : Part i p) : String = match x with | Part d _ _ _ _ -> d
+
+@pub fun partSources (x : Part i p) : [(String, String)] = match x with | Part _ s _ _ _ -> s
+
+@pub fun partImports (x : Part i p) : [(String, p)] = match x with | Part _ _ ps _ _ -> ps
+
+@pub fun partUnitImports (x : Part i p) : [(String, i)] = match x with | Part _ _ _ is _ -> is
+
+@pub fun partOut (x : Part i p) : String = match x with | Part _ _ _ _ o -> o
+
+-- What each node of `table` reaches, itself included, among `known`.
+fun reachFrom table known (start : String) =
+  let rec walk frontier seen =
+    match V.get frontier 0 with
+    | None -> seen
+    | Just n ->
+        if HashMap.member n seen then walk (V.drop frontier 1) seen
+        else
+          walk
+            (V.append
+               (V.drop frontier 1)
+               (V.filter (\d -> HashMap.member d known) (HashMap.getOr [] n table)))
+            (HashMap.insert n True seen)
+  in walk [start] HashMap.empty
+
+-- The strongly connected components of `graph` -- each node and the nodes it
+-- has an edge to -- each its nodes in the order the graph names them, and
+-- every component after those it reaches: the order to check them in. An
+-- edge to a node the graph does not name is left out.
+@pub fun sccs (graph : [(String, [String])]) : [[String]] =
+  let nodes = V.map fst graph in
+  let known = V.foldl (\m n -> HashMap.insert n True m) HashMap.empty nodes in
+  let table = V.foldl (\m g -> HashMap.insert (fst g) (snd g) m) HashMap.empty graph in
+  let reach = V.foldl (\m n -> HashMap.insert n (reachFrom table known n) m) HashMap.empty nodes in
+  let reaches = \a b -> HashMap.member b (HashMap.getOr HashMap.empty a reach) in
+  let comps =
+    V.foldl
+      (\acc n ->
+        if V.any (\c -> V.elem n c) acc then acc
+        else V.pushBack acc (V.filter (\m -> reaches n m and reaches m n) nodes))
+      []
+      nodes
+  in
+  -- A component reaches strictly more than any it depends on, which does
+  -- not reach it back: by how much each reaches is an order to check them in.
+  let size = \c -> V.len (HashMap.keys (HashMap.getOr HashMap.empty (V.getOr "" c 0) reach)) in
+  V.map
+    snd
+    (sortOn
+       (\x -> fst x)
+       (V.map
+          (\i -> ((size (V.getOr [] comps i), i), V.getOr [] comps i))
+          (V.range 0 (V.len comps))))
+
+-- A part's name: of its sources, so the same sources are the same part from
+-- one build to the next.
+@pub fun partName (members : [String]) : String =
+  let h = hash (sort members) in
+  "p${show (if h < 0 then 0 - h else h)}"
+
+-- What was kept of each part: what it was compiled from -- its sources, and
+-- the interface of each part it imports -- and its own interface's
+-- fingerprint, by its name.
+fun partsKept (dir : String) =
+  match M.andThen (\t -> okOf (J.parse t)) (okOf (readToString (Path.join dir "parts.json"))) with
+  | None -> HashMap.empty
+  | Just j ->
+      V.foldl
+        (\m e ->
+          let n = \k -> M.unwrapOr 0 (M.andThen J.asInt (J.get k e)) in
+          match M.andThen J.asString (J.get "name" e) with
+          | None -> m
+          | Just name ->
+              let against =
+                V.concatMap
+                  (\a ->
+                    match (
+                      M.andThen J.asString (J.get "name" a),
+                      M.andThen J.asInt (J.get "interface" a)
+                    ) with
+                    | (Just an, Just af) -> [(an, af)]
+                    | _ -> [])
+                  (M.unwrapOr [] (M.andThen J.asArray (J.get "against" e)))
+              in HashMap.insert name (n "sources", against, n "interface") m)
+        HashMap.empty
+        (M.unwrapOr [] (J.asArray j))
+
+fun keepParts (dir : String) (kept : [(String, Int, [(String, Int)], Int)]) =
+  let u = createDirAll dir in
+  writeString (
+    Path.join dir "parts.json",
+    J.render
+      (J.jArray
+         (V.map
+            (\k ->
+              match k with
+              | (name, src, against, f) ->
+                  J.jObject [
+                    ("name", J.jString name),
+                    ("sources", J.jInt src),
+                    (
+                      "against",
+                      J.jArray
+                        (V.map
+                           (\a ->
+                             J.jObject [("name", J.jString (fst a)), ("interface", J.jInt (snd a))])
+                           against)
+                    ),
+                    ("interface", J.jInt f)
+                  ])
+            kept))
+  )
+
+-- What became of a part: its name, its sources' fingerprint, what it was
+-- compiled against, and its interface and that interface's fingerprint --
+-- or why it has none: its compiler said why, or a part it imports has none.
+type PartDone p = (String, Int, [(String, Int)], Result (Bool, String) (p, Int))
+
+-- The unit `u` compiled a part at a time and its interface made of its
+-- parts' -- or the reports of the parts that failed. `key` is what of the
+-- unit's options compiling depends on.
+@pub fun inParts
+    (parallel : Bool)
+    (key : Int)
+    partsOf
+    compilePart
+    assemble
+    encode
+    decode
+    (u : Given i) =
+  let out = unitOut u in
+  let dir = Path.join out "parts" in
+  let sources = unitSources u in
+  let paths = V.map fst sources in
+  let said = partsOf sources in
+  let graph =
+    V.map
+      (\path ->
+        (
+          path,
+          V.filter
+            (\d -> V.elem d paths)
+            (M.unwrapOr [] (M.map snd (V.find (\g -> fst g == path) said)))
+        ))
+      paths
+  in
+  let comps = sccs graph in
+  let names = V.map partName comps in
+  let partOfPath =
+    V.foldl
+      (\m i ->
+        V.foldl (\m2 path -> HashMap.insert path (V.getOr "" names i) m2) m (V.getOr [] comps i))
+      HashMap.empty
+      (V.range 0 (V.len comps))
+  in
+  -- The parts each part imports: those its sources import, but itself.
+  let importsOf =
+    \i ->
+      let me = V.getOr "" names i in
+      V.foldl
+        (\acc path ->
+          V.foldl
+            (\acc2 d ->
+              let n = HashMap.getOr "" d partOfPath in
+              if n == me or V.elem n acc2 then acc2 else V.pushBack acc2 n)
+            acc
+            (HashMap.getOr
+               []
+               path
+               (V.foldl (\m g -> HashMap.insert (fst g) (snd g) m) HashMap.empty graph)))
+        []
+        (V.getOr [] comps i)
+  in
+  let before = partsKept dir in
+  -- How deep each part is: one more than the deepest it imports. Parts of
+  -- one depth do not import each other, and are compiled at once.
+  let depths =
+    V.foldl
+      (\m i ->
+        HashMap.insert
+          (V.getOr "" names i)
+          (1 + V.foldl (\d n -> max d (HashMap.getOr 0 n m)) 0 (importsOf i))
+          m)
+      HashMap.empty
+      (V.range 0 (V.len comps))
+  in
+  let deepest = V.foldl (\d n -> max d (HashMap.getOr 0 n depths)) 0 names in
+  let step =
+    \done i -> partStep key compilePart encode decode u dir comps names importsOf before done i
+  in
+  let stepped =
+    V.foldl
+      (\done depth ->
+        let here =
+          V.filter
+            (\i -> HashMap.getOr 0 (V.getOr "" names i) depths == depth)
+            (V.range 0 (V.len comps))
+        in if parallel and V.len here > 1 then
+             -- A thread starts with no handlers: each part's compiler is held to
+             -- the unit there as the unit's own is.
+             V.append
+               done
+               (Thread.awaitAll
+                  (V.map
+                     (\i -> Thread.spawn (\() -> sandboxed paths out (\() -> step done i)))
+                     here))
+           else V.append done (V.map (\i -> step done i) here))
+      []
+      (V.range 1 (deepest + 1))
+  in
+  let failed =
+    V.concatMap
+      (\d ->
+        match d with
+        | (_, _, _, Err (False, why)) -> [why]
+        | _ -> [])
+      stepped
+  in if not (V.isEmpty failed) then Err (S.join "\n" failed)
+     else
+       let kept =
+         V.concatMap
+           (\d ->
+             match d with
+             | (n, src, against, Ok (_, f)) -> [(n, src, against, f)]
+             | _ -> [])
+           stepped
+       in
+       let w = keepParts dir kept in
+       -- What is kept of a part no longer in the unit goes.
+       let gone =
+         V.foldl
+           (\acc f ->
+             if f != "parts.json"
+               and S.startsWith "p" f
+               and S.endsWith ".json" f
+               and not (V.elem (S.take f (stringByteLength f - 5)) names) then
+               (let r = removeFile (Path.join dir f) in acc)
+             else acc)
+           ()
+           (M.unwrapOr [] (okOf (readDir dir)))
+       in assemble
+            u
+            (V.concatMap (\d -> match d with | (_, _, _, Ok (x, _)) -> [x] | _ -> []) stepped)
+
+-- Part `i`, compiled -- unless what it would be compiled from is what it was,
+-- and its interface is still kept -- given what became of the parts before it.
+fun partStep key compilePart encode decode u dir comps names importsOf before done i =
+  let name = V.getOr "" names i in
+  let members = V.getOr [] comps i in
+  let deps = importsOf i in
+  let outcome = \n -> V.find (\d -> match d with | (m, _, _, _) -> m == n) done in
+  let blocker =
+    V.find
+      (\n ->
+        match outcome n with
+        | Just (_, _, _, Ok _) -> False
+        | _ -> True)
+      deps
+  in
+  let src = hash (V.filter (\x -> V.elem (fst x) members) (unitSources u), key) in
+  match blocker with
+  | Just n -> (name, src, [], Err (True, "${name} imports ${n}, which did not build"))
+  | None ->
+      let imported =
+        V.concatMap
+          (\n ->
+            match outcome n with
+            | Just (_, _, _, Ok (x, f)) -> [(n, x, f)]
+            | _ -> [])
+          deps
+      in
+      let against = V.map (\x -> match x with | (n, _, f) -> (n, f)) imported in
+      let file = Path.join dir "${name}.json" in
+      let keptOf =
+        \f ->
+          M.andThen
+            (\d -> okOf (decode d))
+            (M.andThen jsonDatum (M.andThen (\t -> okOf (J.parse t)) (okOf (readToString file))))
+      in
+      let fresh =
+        (match HashMap.lookup name before with
+         | Just (s0, a0, f0) ->
+             if s0 == src and a0 == against then M.map (\x -> (x, f0)) (keptOf f0) else None
+         | None -> None)
+      in match fresh with
+         | Just (x, f) -> (name, src, against, Ok (x, f))
+         | None ->
+             let part =
+               Part
+                 (unitDir u)
+                 (V.filter (\x -> V.elem (fst x) members) (unitSources u))
+                 (V.map (\x -> match x with | (n, p, _) -> (n, p)) imported)
+                 (unitImports u)
+                 (unitOut u)
+             in match compilePart part with
+                | Err why -> (name, src, against, Err (False, why))
+                | Ok x ->
+                    (match writeInterface file (encode x) with
+                     | Err why -> (name, src, against, Err (False, why))
+                     | Ok _ -> (name, src, against, Ok (x, hash x)))
+
 -- --- options ------------------------------------------------------------------
 
 -- A build with no options: every unit's are nothing, and nothing depends on
@@ -906,9 +1229,13 @@ def buildCall : Parser Tokens (Bool, String, String, [Item]) =
     |> keep (P.some (P.choice [P.try optionsItem, P.try profileItem, setting]))
 
 -- The settings a build needs, and those it may add.
-def settings : [String] = ["sources", "manifest", "compile"]
+def settings : [String] = ["sources", "manifest"]
 
-def optional : [String] = ["dependencies", "files", "parallel", "link", "overrides", "pinned"]
+def optional : [String] =
+  [
+    "compile", "dependencies", "files", "parallel", "link", "overrides", "pinned", "parts",
+    "compilePart", "assemble"
+  ]
 
 -- An option's type: a truth, a number, a text, maybe one of the last two,
 -- several texts, or one of the names written.
@@ -1217,20 +1544,32 @@ fun textCode (s : String) : String =
                 "a build has no setting `${fst (fst s)}`: they are ${S.join ", " (V.map (\x -> "`${x}`") (V.append settings optional))}, and `options { … }` and `profile name { … }`"
                 (snd (fst s))]
          | None ->
-             match V.find (\k -> not (V.any (\s -> fst (fst s) == k) ss)) settings with
+             let has = \k -> V.any (\s -> fst (fst s) == k) ss in
+             match V.find (\k -> not (has k)) settings with
              | Just k -> [Fail "a build needs `${k}`" Nowhere]
              | None ->
-                 match V.find
-                   (\s -> fst (fst s) == "parallel" and not (V.elem (snd s) ["true", "false"]))
-                   ss with
-                 | Just s ->
-                     [Fail
-                        "`parallel` is `true` or `false`: whether units that do not depend on each other are compiled at once, which they are unless it says `false`"
-                        (snd (fst s))]
-                 | None ->
-                     match optionsOf (M.unwrapOr [] (M.map snd (V.get declared 0))) 0 [] with
-                     | Err failed -> failed
-                     | Ok opts -> written pub name lang ss declared profiles opts
+                 if has "parts" and not (has "compilePart" and has "assemble") then
+                   [Fail
+                      "a build whose units are compiled in parts needs `compilePart`, which compiles a part, and `assemble`, which makes a unit's interface of its parts'"
+                      Nowhere]
+                 else if not (has "parts") and (has "compilePart" or has "assemble") then
+                   [Fail "`compilePart` and `assemble` are for a build that says `parts`" Nowhere]
+                 else if not (has "parts") and not (has "compile") then
+                   [Fail
+                      "a build needs `compile`, or `parts` with `compilePart` and `assemble`"
+                      Nowhere]
+                 else
+                   match V.find
+                     (\s -> fst (fst s) == "parallel" and not (V.elem (snd s) ["true", "false"]))
+                     ss with
+                   | Just s ->
+                       [Fail
+                          "`parallel` is `true` or `false`: whether units that do not depend on each other are compiled at once, which they are unless it says `false`"
+                          (snd (fst s))]
+                   | None ->
+                       match optionsOf (M.unwrapOr [] (M.map snd (V.get declared 0))) 0 [] with
+                       | Err failed -> failed
+                       | Ok opts -> written pub name lang ss declared profiles opts
 
 -- What a build's declaration writes, once its settings and options are read.
 fun written (pub : Bool) (name : String) (lang : String) ss declared profiles (opts : [Opt])
@@ -1240,6 +1579,18 @@ fun written (pub : Bool) (name : String) (lang : String) ss declared profiles (o
   let vis = if pub then "@pub " else "" in
   let schedule =
     if given "parallel" == Just "false" then "LinguaMake.inTurn" else "LinguaMake.onThreads"
+  in
+  -- How a unit is compiled: by `compile`, or a part at a time. `withOpts` is
+  -- whether the build has options, which a part's compiler is given first.
+  let compiled =
+    \withOpts ->
+      match given "parts" with
+      | None ->
+          if withOpts then "(\\o u -> ${get "compile"} o u)" else "(\\o u -> ${get "compile"} u)"
+      | Just ps ->
+          let o = if withOpts then "o " else "" in
+          let key = if withOpts then "(lingua${name}_compileKey o)" else "0" in
+          "(\\o u -> LinguaMake.inParts ${if given "parallel" == Just "false" then "False" else "True"} ${key} (\\lingua_s -> ${ps} lingua_s) (\\lingua_p -> ${get "compilePart"} ${o}lingua_p) (\\lingua_u lingua_ps -> ${get "assemble"} ${o}lingua_u lingua_ps) LinguaMake.encodeReflect LinguaMake.decodeReflect u)"
   in
   let unitsIn =
     \sub ->
@@ -1277,7 +1628,7 @@ fun written (pub : Bool) (name : String) (lang : String) ss declared profiles (o
 -- ${lang}'s build: the unit at `root` and every unit it depends on, each
 -- compiled only if what it would be compiled from has changed.
 ${vis}fun build${name} (root : String) =
-  LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "\"\""}) root LinguaMake.noOptions (\\o u -> ${get "compile"} u) (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect
+  LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "\"\""}) root LinguaMake.noOptions ${compiled False} (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect
 
 -- What the unit at `dir` was compiled from in `root`'s last build.
 ${vis}fun given${name} (root : String) (dir : String) =
@@ -1311,7 +1662,7 @@ ${vis}fun build${name} (lingua_profile : String) (lingua_set : [(String, String)
   | Just lingua_base ->
       LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "lingua_profile"}) root
         { resolve = \\lingua_dir lingua_manifest -> (let lingua_r = (match ${lower}With lingua_base ${over} with | Err lingua_e -> Err lingua_e | Ok lingua_o -> ${lower}With lingua_o lingua_set) in ${last}), compileKey = lingua${name}_compileKey, linkKey = lingua${name}_linkKey }
-        (\\o u -> ${get "compile"} o u) (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} o l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect
+        ${compiled True} (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} o l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect
 
 -- What the unit at `dir` was compiled from in `root`'s last build as that
 -- profile.
@@ -1335,3 +1686,93 @@ use Std.Test (assertEq)
     (rounds [("a", []), ("b", ["a"]), ("c", ["a"]), ("d", ["b", "c"])])
     [["a"], ["b", "c"], ["d"]]
     "b and c together"
+
+@test fun partsAreTheComponentsOfTheImportsInTheOrderToCheckThem () =
+  let parts = sccs [("c", ["a"]), ("a", ["b"]), ("b", ["a", "z"]), ("d", [])] in
+  let a = assertEq (V.len parts) 3 "a and b import each other, and are one; `z` is no source" in
+  let at =
+    \n ->
+      M.unwrapOr (0 - 1) (V.find (\i -> V.elem n (V.getOr [] parts i)) (V.range 0 (V.len parts)))
+  in
+  let b = assertEq (V.getOr [] parts (at "a")) ["a", "b"] "together, as the graph names them" in
+  assertEq (at "a" < at "c") True "and what imports them after them"
+
+-- A unit of four sources: `a` and `b` import each other, `c` imports `a`,
+-- and `d` imports nothing. A source's imports are the words of its text
+-- after `use`, and a part's interface is its sources' names -- not their
+-- texts, so a change to a text that leaves the names alone changes no
+-- interface.
+fun sourcesOf (texts : [(String, String)]) : [(String, [String])] =
+  V.map
+    (\t ->
+      (
+        fst t,
+        V.concatMap (\w -> if S.startsWith "use:" w then [S.drop w 4] else []) (S.split " " (snd t))
+      ))
+    texts
+
+fun inTestParts (out : String) (texts : [(String, String)]) (compiled : Ref [String]) =
+  inParts
+    False
+    0
+    sourcesOf
+    (\(x : Part String String) ->
+      let names = S.join "+" (V.map fst (partSources x)) in
+      let u = setRef compiled (V.pushBack (getRef compiled) names) in
+      Ok "${names}[${S.join "," (V.map (\ip -> snd ip) (partImports x))}]")
+    (\(g : Given String) ps -> Ok (S.join " | " ps))
+    encodeReflect
+    decodeReflect
+    (Given "unit" texts [] out)
+
+@test fun aPartIsCompiledAgainOnlyIfWhatItWasCompiledFromChanged () =
+  let out = "target/lingua-parts-test" in
+  let r = removeDirAll out in
+  let texts = [("a", "use:b one"), ("b", "use:a"), ("c", "use:a"), ("d", "x")] in
+  let compiled = newRef [] in
+  let first = inTestParts out texts compiled in
+  let a =
+    assertEq
+      (first, getRef compiled)
+      (Ok "d[] | a+b[] | c[a+b[]]", ["d", "a+b", "c"])
+      "each part compiled once, in order, and the unit's interface made of theirs"
+  in
+  let u = setRef compiled [] in
+  let again = inTestParts out texts compiled in
+  let b = assertEq (again, getRef compiled) (first, []) "nothing compiled when nothing changed" in
+  let w = setRef compiled [] in
+  let edited =
+    inTestParts out [("a", "use:b two"), ("b", "use:a"), ("c", "use:a"), ("d", "x")] compiled
+  in
+  let c =
+    assertEq
+      (getRef compiled)
+      ["a+b"]
+      "a text changed, so its part is compiled again; its interface did not change, so what imports it is not"
+  in
+  let x = setRef compiled [] in
+  let regrouped =
+    inTestParts out [("a", "use:b two"), ("b", "y"), ("c", "use:a"), ("d", "x")] compiled
+  in assertEq
+       (regrouped, getRef compiled)
+       (Ok "b[] | d[] | a[b[]] | c[a[b[]]]", ["b", "a", "c"])
+       "b no longer imports a: two parts where there was one, and what imports them again"
+
+@test fun aPartThatFailsBlocksWhatImportsItAndTheUnit () =
+  let out = "target/lingua-parts-fail" in
+  let r = removeDirAll out in
+  let failing =
+    inParts
+      False
+      0
+      sourcesOf
+      (\(x : Part String String) ->
+        if V.any (\s -> fst s == "a") (partSources x) then Err "a is wrong" else Ok "fine")
+      (\(g : Given String) ps -> Ok (S.join " | " ps))
+      encodeReflect
+      decodeReflect
+      (Given "unit" [("a", "x"), ("c", "use:a"), ("d", "x")] [] out)
+  in assertEq
+       failing
+       (Err "a is wrong")
+       "the unit fails with what its compiler said, and `c` is not compiled"
