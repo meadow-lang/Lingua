@@ -161,6 +161,7 @@ A `Lingua.Make.Part i p` is what one part is compiled from:
 | `partImports x`     | the interface of each part it imports, by that part's name     |
 | `partUnitImports x` | the interfaces of the units the unit depends on, as `unitImports` |
 | `partOut x`         | the unit's own directory to write into, `unitOut`              |
+| `partUnitPaths x`   | the paths of every source of the unit, sorted: a part's place among them, for naming its things apart from the other parts' |
 
 With options, `compilePart` and `assemble` are given them first, as `compile`
 is. A part's interface type `p` is `Reflect`, as a unit's is.
@@ -168,8 +169,8 @@ is. A part's interface type `p` is `Reflect`, as a unit's is.
 **What is compiled when.** A unit is compiled again when its sources or an
 interface it reads changed, as always. Then, inside it:
 
-- a part is compiled again only if its sources, or the interface of a part it
-  imports, are not what they were, so an edit that leaves a part's interface
+- a part is compiled again only if its sources, the interface of a part it
+  imports, or the unit's set of sources are not what they were, so an edit that leaves a part's interface
   as it was compiles nothing that imports it;
 - parts that do not import each other are compiled at once, each on a thread
   held to the unit as the unit's compiler is, unless the build says

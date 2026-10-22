@@ -765,22 +765,28 @@ fun dirOf r = match r with | (dir, _, _, _) -> dir
 
 -- What a part is compiled from: the unit's directory, the part's sources --
 -- each path and its text -- the interface of each part it imports, by that
--- part's name, the interface of each unit the unit depends on, and the
--- directory it may write into, the unit's.
+-- part's name, the interface of each unit the unit depends on, the
+-- directory it may write into, the unit's, and the paths of every source of
+-- the unit, sorted: where the part stands among them.
 @pub data Part i p
-  = Part String [(String, String)] [(String, p)] [(String, i)] String
+  = Part String [(String, String)] [(String, p)] [(String, i)] String [String]
 
 use Part.*
 
-@pub fun partDir (x : Part i p) : String = match x with | Part d _ _ _ _ -> d
+@pub fun partDir (x : Part i p) : String = match x with | Part d _ _ _ _ _ -> d
 
-@pub fun partSources (x : Part i p) : [(String, String)] = match x with | Part _ s _ _ _ -> s
+@pub fun partSources (x : Part i p) : [(String, String)] = match x with | Part _ s _ _ _ _ -> s
 
-@pub fun partImports (x : Part i p) : [(String, p)] = match x with | Part _ _ ps _ _ -> ps
+@pub fun partImports (x : Part i p) : [(String, p)] = match x with | Part _ _ ps _ _ _ -> ps
 
-@pub fun partUnitImports (x : Part i p) : [(String, i)] = match x with | Part _ _ _ is _ -> is
+@pub fun partUnitImports (x : Part i p) : [(String, i)] = match x with | Part _ _ _ is _ _ -> is
 
-@pub fun partOut (x : Part i p) : String = match x with | Part _ _ _ _ o -> o
+@pub fun partOut (x : Part i p) : String = match x with | Part _ _ _ _ o _ -> o
+
+-- The paths of every source of the unit, sorted: what a part may name its
+-- things after so that no other part of the unit names its own the same --
+-- its place among them -- though it can read only its own.
+@pub fun partUnitPaths (x : Part i p) : [String] = match x with | Part _ _ _ _ _ ps -> ps
 
 -- What each node of `table` reaches, itself included, among `known`.
 fun reachFrom table known (start : String) =
@@ -1031,47 +1037,55 @@ fun partStep key compilePart encode decode u dir comps names importsOf before do
         | _ -> True)
       deps
   in
-  let src = hash (V.filter (\x -> V.elem (fst x) members) (unitSources u), key) in
-  match blocker with
-  | Just n -> (name, src, [], Err (True, "${name} imports ${n}, which did not build"))
-  | None ->
-      let imported =
-        V.concatMap
-          (\n ->
-            match outcome n with
-            | Just (_, _, _, Ok (x, f)) -> [(n, x, f)]
-            | _ -> [])
-          deps
-      in
-      let against = V.map (\x -> match x with | (n, _, f) -> (n, f)) imported in
-      let file = Path.join dir "${name}.json" in
-      let keptOf =
-        \f ->
-          M.andThen
-            (\d -> okOf (decode d))
-            (M.andThen jsonDatum (M.andThen (\t -> okOf (J.parse t)) (okOf (readToString file))))
-      in
-      let fresh =
-        (match HashMap.lookup name before with
-         | Just (s0, a0, f0) ->
-             if s0 == src and a0 == against then M.map (\x -> (x, f0)) (keptOf f0) else None
-         | None -> None)
-      in match fresh with
-         | Just (x, f) -> (name, src, against, Ok (x, f))
-         | None ->
-             let part =
-               Part
-                 (unitDir u)
-                 (V.filter (\x -> V.elem (fst x) members) (unitSources u))
-                 (V.map (\x -> match x with | (n, p, _) -> (n, p)) imported)
-                 (unitImports u)
-                 (unitOut u)
-             in match compilePart part with
-                | Err why -> (name, src, against, Err (False, why))
-                | Ok x ->
-                    (match writeInterface file (encode x) with
-                     | Err why -> (name, src, against, Err (False, why))
-                     | Ok _ -> (name, src, against, Ok (x, hash x)))
+  -- A part is given every path of the unit, so a source added or removed
+  -- anywhere in it is something every part was compiled from.
+  let src =
+    hash (
+      V.filter (\x -> V.elem (fst x) members) (unitSources u),
+      key,
+      sort (V.map fst (unitSources u))
+    )
+  in match blocker with
+     | Just n -> (name, src, [], Err (True, "${name} imports ${n}, which did not build"))
+     | None ->
+         let imported =
+           V.concatMap
+             (\n ->
+               match outcome n with
+               | Just (_, _, _, Ok (x, f)) -> [(n, x, f)]
+               | _ -> [])
+             deps
+         in
+         let against = V.map (\x -> match x with | (n, _, f) -> (n, f)) imported in
+         let file = Path.join dir "${name}.json" in
+         let keptOf =
+           \f ->
+             M.andThen
+               (\d -> okOf (decode d))
+               (M.andThen jsonDatum (M.andThen (\t -> okOf (J.parse t)) (okOf (readToString file))))
+         in
+         let fresh =
+           (match HashMap.lookup name before with
+            | Just (s0, a0, f0) ->
+                if s0 == src and a0 == against then M.map (\x -> (x, f0)) (keptOf f0) else None
+            | None -> None)
+         in match fresh with
+            | Just (x, f) -> (name, src, against, Ok (x, f))
+            | None ->
+                let part =
+                  Part
+                    (unitDir u)
+                    (V.filter (\x -> V.elem (fst x) members) (unitSources u))
+                    (V.map (\x -> match x with | (n, p, _) -> (n, p)) imported)
+                    (unitImports u)
+                    (unitOut u)
+                    (sort (V.map fst (unitSources u)))
+                in match compilePart part with
+                   | Err why -> (name, src, against, Err (False, why))
+                   | Ok x ->
+                       (match writeInterface file (encode x) with
+                        | Err why -> (name, src, against, Err (False, why))
+                        | Ok _ -> (name, src, against, Ok (x, hash x)))
 
 -- --- options ------------------------------------------------------------------
 
@@ -1776,3 +1790,30 @@ fun inTestParts (out : String) (texts : [(String, String)]) (compiled : Ref [Str
        failing
        (Err "a is wrong")
        "the unit fails with what its compiler said, and `c` is not compiled"
+
+@test fun aPartIsGivenEveryPathOfItsUnitAndCompiledAgainWhenOneIsAdded () =
+  let out = "target/lingua-parts-paths" in
+  let r = removeDirAll out in
+  let seen = newRef [] in
+  let run =
+    \texts ->
+      inParts
+        False
+        0
+        sourcesOf
+        (\(x : Part String String) ->
+          let u = setRef seen (V.pushBack (getRef seen) (S.join "," (partUnitPaths x))) in
+          Ok (S.join "+" (V.map fst (partSources x))))
+        (\(g : Given String) ps -> Ok (S.join " | " ps))
+        encodeReflect
+        decodeReflect
+        (Given "unit" texts [] out)
+  in
+  let first = run [("b", "x"), ("a", "x")] in
+  let a = assertEq (getRef seen) ["a,b", "a,b"] "every path of the unit, sorted, to each part" in
+  let u = setRef seen [] in
+  let added = run [("b", "x"), ("a", "x"), ("c", "x")] in
+  assertEq
+    (V.len (getRef seen))
+    3
+    "a source added: every part is compiled again, since each was given the paths"
