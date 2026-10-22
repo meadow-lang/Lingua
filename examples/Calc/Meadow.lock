@@ -26,7 +26,7 @@ tree = "809c6aa34620f8b8270c7811bb4b54e56719cbfe"
 
 [[package]]
 name = "LineEditor"
-source = "git+https://github.com/meadow-lang/LineEditor?version=0.2.0"
+source = "git+https://github.com/meadow-lang/LineEditor?version=0.2.2"
 version = "0.2.2"
 rev = "2c4b99ff3d5af18cd5cb65d33c8f61a53f7edd99"
 tree = "94081a99b15d97885e9752fca248decf47b8c951"

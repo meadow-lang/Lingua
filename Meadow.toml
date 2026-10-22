@@ -8,4 +8,4 @@ Nettle = { git = "https://github.com/meadow-lang/Nettle.git", branch = "master" 
 Pretty = { git = "https://github.com/meadow-lang/Pretty.git", version = "0.2.0" }
 Fuzzy = { git = "https://github.com/meadow-lang/Fuzzy", version = "0.1.0" }
 Doodle = { git = "https://github.com/meadow-lang/Doodle", version = "0.1.1" }
-LineEditor = { git = "https://github.com/meadow-lang/LineEditor", version = "0.2.0" }
+LineEditor = { git = "https://github.com/meadow-lang/LineEditor", version = "0.2.2" }
