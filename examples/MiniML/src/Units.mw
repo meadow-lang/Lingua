@@ -4,7 +4,9 @@
 -- and a unit's interface is what its files export, at their types.
 
 use Lingua (make!)
-use Lingua.Make (Given, Linking, unitSources, unitImports, unitOut, linkUnits, linkOut)
+use Lingua.Make (
+  Given, Linking, Part, unitSources, unitImports, unitOut, linkUnits, linkOut, partSources, partOut
+)
 use Lingua.Diagnostic (renderToOutput)
 use MiniML.Types
 use MiniML.Compiler
@@ -502,3 +504,67 @@ make! {
           (True, True)
           "each after its own"
       in assertEq (V.getOr "" lines 4) "   Compiled app" "and the one that needs them all, last"
+
+-- --- a unit compiled in parts ---------------------------------------------------
+--
+-- A build whose files say what they import, with a line `-- use name` naming
+-- another file of the unit: the files that import each other are compiled
+-- together, as a part, and each part again only when it must. A part's
+-- interface is its files' names; a unit's, its parts', in the order they
+-- were compiled. Each part compiled is written down in the unit's directory,
+-- so a test can say which were.
+make! {
+  Parted "miniml"
+    | sources = ".ml"
+    | manifest = "Unit"
+    | parts = importsIn
+    | compilePart = compiledPart
+    | assemble = assembledParts
+}
+
+fun importsIn (sources : [(String, String)]) : [(String, [String])] =
+  V.map
+    (\x ->
+      (
+        fst x,
+        V.concatMap
+          (\l ->
+            if S.startsWith "-- use " l then
+              [Path.join (M.unwrapOr "." (Path.parent (fst x))) "${S.trim (S.drop l 7)}.ml"]
+            else [])
+          (S.lines (snd x))
+      ))
+    sources
+
+fun compiledPart (x : Part [String] String) =
+  let names = S.join "+" (V.map (\s -> Path.fileName (fst s)) (partSources x)) in
+  let u = appendString (Path.join (partOut x) "compiled.log", "${names}\n") in
+  Ok names
+
+fun assembledParts (g : Given [String]) (ps : [String]) = Ok ps
+
+@test fun aUnitIsCompiledAPartAtATime () =
+  let root = "target/build-parts" in
+  let z = removeDirAll root in
+  let app = Path.join root "app" in
+  let a = write app "Unit" "" in
+  let b = write app "a.ml" "-- use b\n1" in
+  let c = write app "b.ml" "-- use a\n2" in
+  let d = write app "c.ml" "-- use a\n3" in
+  let e = write app "d.ml" "4" in
+  let log = Path.joinAll [app, "target", "units", "app", "compiled.log"] in
+  let compiled = \u -> S.lines (Res.unwrapOr "" (readToString log)) in
+  let first = withOutput (\() -> buildParted app) in
+  let afterFirst = compiled () in
+  let f = write app "c.ml" "-- use a\n33" in
+  let second = withOutput (\() -> buildParted app) in
+  let afterSecond = compiled () in
+  let x =
+    assertEq
+      (fst first, V.len afterFirst, V.elem "a.ml+b.ml" afterFirst, V.elem "d.ml" afterFirst)
+      (True, 3, True, True)
+      "three parts, a and b together, those that do not import each other at once"
+  in assertEq
+       (fst second, V.drop afterSecond 3)
+       (True, ["c.ml"])
+       "a file changed, and only its part was compiled again"

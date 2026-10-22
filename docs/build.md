@@ -23,7 +23,7 @@ the last build, for a tool that wants to ask the compiler about a unit again.
 | -------------- | -------- | ------------------------------------------------------------------------ |
 | `sources`      | yes      | the ending of a unit's source files, `".ml"`                             |
 | `manifest`     | yes      | the file that makes a directory a unit, `"Unit"`                         |
-| `compile`      | yes      | the compiler: a function of a `Given i` answering `Result String i`      |
+| `compile`      | yes, but see `parts` | the compiler: a function of a `Given i` answering `Result String i` |
 | `parallel`     | no       | `false` to compile one unit after another; a build is parallel otherwise |
 | `options { … }`| no       | what the build can be told; see [Options and profiles](#options-and-profiles) |
 | `profile n { … }` | no    | a named set of options                                                   |
@@ -32,6 +32,9 @@ the last build, for a tool that wants to ask the compiler about a unit again.
 | `dependencies` | no       | how to read a manifest, for one that is more than a list of paths        |
 | `files`        | no       | where a unit's sources are, when not beside the manifest                 |
 | `link`         | no       | how the program is put together once every unit is built                 |
+| `parts`        | no       | how a unit's sources import each other, to compile it a part at a time; see [Parts of a unit](#parts-of-a-unit) |
+| `compilePart`  | with `parts` | the compiler of one part: a function of a `Part i p` answering `Result String p` |
+| `assemble`     | with `parts` | a unit's interface, of its parts': a function of a `Given i` and the parts' interfaces, answering `Result String i` |
 
 A setting the build does not have, a missing required one, or a `parallel` that
 is neither `true` nor `false` is an error where it was written.
@@ -119,6 +122,69 @@ that has gone missing makes its unit compile again.
 
 A build kept by a different compiler binary, or by an older layout of these
 files, is not trusted: every unit is compiled once more.
+
+## Parts of a unit
+
+A language whose sources import each other cannot check a unit's sources in
+any order. What imports nothing of the rest comes first, and sources that
+import each other in a circle are checked together. Those groups are the
+strongly connected components of the import graph inside the unit, and
+`make!` can compile a unit one group at a time:
+
+```meadow
+make! {
+  Parted "miniml"
+    | sources = ".ml"
+    | manifest = "Unit"
+    | parts = importsIn
+    | compilePart = compiledPart
+    | assemble = assembledParts
+}
+```
+
+| setting       | type                                         | does                                               |
+| ------------- | -------------------------------------------- | -------------------------------------------------- |
+| `parts`       | `[(String, String)] -> [(String, [String])]` | each source (path, text) and the paths of the sources of the unit it imports |
+| `compilePart` | `Part i p -> Result String p`                | compiles one part                                  |
+| `assemble`    | `Given i -> [p] -> Result String i`          | the unit's interface, from its parts' in the order they were compiled |
+
+With `parts`, `compile` is not needed. Which file a module is, and what its
+imports are, is the language's business: `parts` answers paths. A path a
+source imports that is not one of the unit's sources is left out.
+
+A `Lingua.Make.Part i p` is what one part is compiled from:
+
+| function            | answers                                                        |
+| ------------------- | -------------------------------------------------------------- |
+| `partDir x`         | the unit's directory                                           |
+| `partSources x`     | the part's sources, each a path and its text                   |
+| `partImports x`     | the interface of each part it imports, by that part's name     |
+| `partUnitImports x` | the interfaces of the units the unit depends on, as `unitImports` |
+| `partOut x`         | the unit's own directory to write into, `unitOut`              |
+
+With options, `compilePart` and `assemble` are given them first, as `compile`
+is. A part's interface type `p` is `Reflect`, as a unit's is.
+
+**What is compiled when.** A unit is compiled again when its sources or an
+interface it reads changed, as always. Then, inside it:
+
+- a part is compiled again only if its sources, or the interface of a part it
+  imports, are not what they were, so an edit that leaves a part's interface
+  as it was compiles nothing that imports it;
+- parts that do not import each other are compiled at once, each on a thread
+  held to the unit as the unit's compiler is, unless the build says
+  `parallel = false`;
+- a part that fails blocks the parts that import it, and the unit fails with
+  what its compiler said.
+
+What a part was compiled from, and its interface, are kept in the unit's own
+directory, under `parts/`. A part's name is made from its sources' paths, so
+the same sources are the same part from one build to the next, and what is
+kept of a part no longer in the unit is removed. `assemble` runs whenever the
+unit is compiled, with every part's interface, compiled or kept.
+
+[Units.mw](../examples/MiniML/src/Units.mw) has `Parted`, whose files say
+what they import with a line `-- use name`, and a test of it.
 
 ## Scheduling
 
