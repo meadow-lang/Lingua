@@ -104,6 +104,8 @@ use Std.Test (assertEq)
 use Std.Console (withOutput)
 use Std.Fs (Fs, createDirAll, removeDirAll, removeFile, appendString, readToString)
 use Std.Result as Res
+use Std.Process (spawn)
+use Lingua.Resolve (Dep, GitRef, reqOf)
 
 -- Build `root` and say, for each unit, how it went.
 fun built root =
@@ -568,3 +570,113 @@ fun assembledParts (g : Given [String]) (ps : [String]) = Ok ps
        (fst second, V.drop afterSecond 3)
        (True, ["c.ml"])
        "a file changed, and only its part was compiled again"
+
+-- --- what a unit depends on, fetched --------------------------------------------
+--
+-- A build whose manifest may name a unit in a git repository, a line
+-- `git name url version`: fetched into a cache, the release chosen written
+-- down in `Unit.lock` beside the root unit's manifest, and that one built
+-- until an update moves it.
+make! {
+  Fetched "miniml"
+    | sources = ".ml"
+    | manifest = "Unit"
+    | compile = compileUnit
+    | dependencies = fetchedDeps
+    | lock = "Unit.lock"
+    | cache = "target/fetched-cache/git"
+}
+
+fun fetchedDeps (root : String) (dir : String) (text : String) : Result String [Dep] =
+  V.foldl
+    (\acc l ->
+      match acc with
+      | Err e -> Err e
+      | Ok ds ->
+          let ws = S.split " " (S.trim l) in
+          if V.len ws == 4 and V.getOr "" ws 0 == "git" then
+            (match reqOf (V.getOr "" ws 3) with
+             | Just q ->
+                 Ok (V.pushBack ds (Dep.Git (V.getOr "" ws 1) (V.getOr "" ws 2) (GitRef.Release q)))
+             | None -> Err "`${V.getOr "" ws 3}` is not a version")
+          else Ok (V.pushBack ds (Dep.Path (S.trim l))))
+    (Ok [])
+    (V.filter (\l -> not (S.isEmpty (S.trim l))) (S.lines text))
+
+fun gitIn (dir : String) (args : [String]) =
+  spawn ("git", V.append ["-C", dir, "-c", "user.email=t@t", "-c", "user.name=t"] args, None, [])
+
+@test fun whatAUnitFetchesIsLockedAndMovedOnlyByAnUpdate () =
+  let root = "target/build-fetched" in
+  let z = removeDirAll root in
+  let y = removeDirAll "target/fetched-cache" in
+  let repo = Path.join root "double" in
+  let a = write repo "Unit" "" in
+  let b = write repo "double.ml" "fun x -> x + x" in
+  let c = gitIn repo ["init", "--quiet", "-b", "main"] in
+  let d = gitIn repo ["add", "-A"] in
+  let e = gitIn repo ["commit", "--quiet", "-m", "one"] in
+  let f = gitIn repo ["tag", "v1.0.0"] in
+  let url =
+    (match gitIn repo ["rev-parse", "--show-toplevel"] with
+     | Ok (0, out, _) -> S.trim out
+     | _ -> repo)
+  in
+  let app = Path.join root "app" in
+  let g = write app "Unit" "git double ${url} 1.0.0\n" in
+  let h = write app "main.ml" "double 21" in
+  let lockNow = \u -> Res.unwrapOr "" (readToString (Path.join app "Unit.lock")) in
+  let first = withOutput (\() -> buildFetched app) in
+  let locked = lockNow () in
+  -- A release after it: the build keeps to the one in the lock file.
+  let i = write repo "double.ml" "fun x -> x * 2" in
+  let j = gitIn repo ["commit", "--quiet", "-am", "two"] in
+  let k = gitIn repo ["tag", "v1.1.0"] in
+  let second = withOutput (\() -> buildFetched app) in
+  let afterSecond = lockNow () in
+  let dry = withOutput (\() -> updateFetched app [] True) in
+  let afterDry = lockNow () in
+  let update = withOutput (\() -> updateFetched app [] False) in
+  let afterUpdate = lockNow () in
+  -- What the lock file pins is in the cache: a build needs no network.
+  let offline = withOutput (\() -> buildFetchedWith True True app) in
+  -- A manifest asking for what the lock file does not pin, built locked.
+  let w = write app "Unit" "git double ${url} 1.1.0\n" in
+  let refused = withOutput (\() -> buildFetchedWith False True app) in
+  let x =
+    assertEq
+      (
+        fst first,
+        S.contains "version = \"1.0.0\"" locked,
+        S.contains "source = \"git+${url}?version=1.0.0\"" locked
+      )
+      (True, True, True)
+      "the release that meets the manifest, fetched, built and locked"
+  in
+  let x2 =
+    assertEq
+      (fst second, afterSecond == locked)
+      (True, True)
+      "a newer release is not taken by a build"
+  in
+  let x3 =
+    assertEq
+      (fst dry, S.contains "   Updating double 1.0.0 -> 1.1.0" (snd dry), afterDry == locked)
+      (True, True, True)
+      "a dry run says what would move and writes nothing"
+  in
+  let x4 =
+    assertEq
+      (fst update, S.contains "version = \"1.1.0\"" afterUpdate)
+      (True, True)
+      "an update moves the lock"
+  in
+  let x5 =
+    assertEq
+      (fst offline, S.contains "   Compiled app" (snd offline))
+      (True, True)
+      "built offline from the cache"
+  in assertEq
+       (fst refused, S.contains "the build is locked" (snd refused), lockNow () == afterUpdate)
+       (False, True, True)
+       "a locked build refuses what the lock file does not pin"
