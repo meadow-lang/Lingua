@@ -24,6 +24,7 @@
 @pub mod Cli
 @pub mod Lsp
 @pub mod Make
+@pub mod Resolve
 @pub mod Format
 @pub mod Repl
 @pub mod Dap

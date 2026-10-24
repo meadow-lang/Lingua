@@ -35,6 +35,9 @@ the last build, for a tool that wants to ask the compiler about a unit again.
 | `parts`        | no       | how a unit's sources import each other, to compile it a part at a time; see [Parts of a unit](#parts-of-a-unit) |
 | `compilePart`  | with `parts` | the compiler of one part: a function of a `Part i p` answering `Result String p` |
 | `assemble`     | with `parts` | a unit's interface, of its parts': a function of a `Given i` and the parts' interfaces, answering `Result String i` |
+| `lock`         | no       | the lock file, beside the root unit's manifest, for a build that fetches what it depends on; see [Dependencies fetched](#dependencies-fetched) |
+| `cache`        | with `lock` | where what is fetched is kept, `"~/.idyll/git"`; `~/.<language>/git` by default |
+| `cacheEnv`     | with `lock` | a variable that, when set, moves the cache under it: `$IDYLL_HOME/git` |
 
 A setting the build does not have, a missing required one, or a `parallel` that
 is neither `true` nor `false` is an error where it was written.
@@ -186,6 +189,65 @@ unit is compiled, with every part's interface, compiled or kept.
 
 [Units.mw](../examples/MiniML/src/Units.mw) has `Parted`, whose files say
 what they import with a line `-- use name`, and a test of it.
+
+## Dependencies fetched
+
+A build that says `lock` may depend on units in git repositories. Its
+`dependencies` answers `Result String [Dep]`, each one a `Lingua.Resolve.Dep`:
+
+```meadow
+data Dep = Path String | Git String String GitRef   -- a directory; a name, a url and a reference
+data GitRef = Default | Branch String | Tag String | Rev String | Release Req
+```
+
+`Path` is a directory beside the unit, as a plain manifest's lines are. `Git`
+is fetched into the cache and stands for the directory it was checked out in.
+`Release` takes the newest tag `v1.2.3` the requirement allows, Cargo's way:
+`1.2.0` takes anything from it to `2.0.0`, `0.3.0` up to `0.4.0`, and a
+pre-release only when asked for. Two units asking for releases of one
+repository with the same breaking digit get the same one. `reqOf "1.2.0"`
+reads a requirement.
+
+```meadow
+make! {
+  Idyll "idyll"
+    | sources = ".idl"
+    | manifest = "Idyll.toml"
+    | compile = compileUnit
+    | dependencies = depsOf
+    | lock = "idyll.lock"
+    | cache = "~/.idyll/git"
+    | cacheEnv = "IDYLL_HOME"
+}
+```
+
+What each repository resolved to, its commit and tree, is written to the lock
+file, and the next build uses that and nothing newer. The lock file is the
+format `idyll-driver` writes, `version = 1` and a `[[package]]` for each
+repository: written only when it would change, and with what no unit depends
+on any more left out. A tag that has moved since it was locked is refused
+rather than followed.
+
+Such a build writes three more things beside `build<Name>` and `given<Name>`:
+
+| function | what it is |
+| -------- | ---------- |
+| `build<Name> root` | the build, fetching what it must and keeping the lock file |
+| `build<Name>With offline locked root` | the same, `offline` -- only what the cache holds, and an error saying what would have had to be fetched -- or `locked`: an error rather than a change to the lock file, which is what CI wants |
+| `update<Name> root names dryRun` | the dependencies brought to the newest their manifests take -- those in `names`, or every one when it is empty -- each that moved said, and the lock file written unless `dryRun` |
+
+A build with options takes its profile and settings after the flags:
+`build<Name>With offline locked profile set root`. `given<Name>` reads with
+the cache alone.
+
+The cache has a bare clone of each repository under `db/` and each commit
+checked out once under `checkouts/`, both named for the url. Git runs with no
+terminal prompt and with `ext::` urls turned off, and a url that would be read
+as an option is refused.
+
+[Units.mw](../examples/MiniML/src/Units.mw) has `Fetched`, whose manifest
+names a release with a line `git name url version`, and a test that locks,
+updates and builds it offline.
 
 ## Scheduling
 

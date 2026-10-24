@@ -1,0 +1,993 @@
+-- Lingua.Resolve: dependencies that are more than paths -- a git repository
+-- at a branch, a tag, a commit or a release -- fetched into a cache, chosen
+-- among releases by version, and recorded in a lock file so that every build
+-- after reuses exactly what was resolved, with no network.
+--
+-- A build declares it with `make!`'s `lock`, and its `dependencies` then
+-- answer `Dep`s. The formats and the rules are those of Idyll's own driver
+-- (idyll-driver: lock.rs, git.rs, semver.rs, update.rs), so a lock file
+-- written by one reads in the other:
+--
+--   version = 1
+--
+--   [[package]]
+--   name = "json"
+--   source = "git+https://github.com/someone/idyll-json?version=1.2.0"
+--   version = "1.4.0"
+--   rev = "a1b2c3…"
+--   tree = "4842b3…"
+--
+-- `rev` is the commit and `tree` the hash of its source. A release is a tag
+-- that reads as a version, `v1.2.3` or `1.2.3`; a requirement `1.2.0` takes
+-- the newest release below the next breaking one (`<2.0.0`; below 1.0 the
+-- minor breaks: `0.3.1` is `<0.4.0`), and two requirements that can share a
+-- release do. Git is run as a program, so a private repository works with
+-- whatever keys and credential helper the user has.
+
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Char as C
+use Std.Maybe as M
+use Std.Path as Path
+use Std.Fs (Fs, readToString, writeString, createDirAll, removeDirAll, exists, isDir, rename)
+use Std.Process (Process, getEnv, spawn)
+
+fun okOf r = match r with | Ok x -> Just x | Err _ -> None
+
+-- --- versions ----------------------------------------------------------------
+
+-- A release: major, minor and patch, and a pre-release tail -- `rc1` of
+-- `1.0.0-rc1` -- or nothing.
+@derive(Debug, PartialEq)
+@pub data Version = Version Int Int Int String
+
+-- `1.2.3`, `v1.2.3` or `1.2.3-rc1` as a version; nothing for anything else,
+-- which is how a tag that is not a release is passed over. Build metadata
+-- (`+deadbeef`) names the same release, and is dropped.
+@pub fun versionOf (text : String) : Maybe Version =
+  let t0 = if S.startsWith "v" text then S.drop text 1 else text in
+  let t = V.getOr "" (S.split "+" t0) 0 in
+  let (core, pre, bad) =
+    (match S.indexOf "-" t with
+     | Just i -> (let p = S.drop t (i + 1) in (S.take t i, p, S.isEmpty p))
+     | None -> (t, "", False))
+  in
+  let parts = S.split "." core in
+  let number =
+    \p ->
+      if S.isEmpty p or not (V.all C.isDigit (S.chars p)) then None
+      else if stringByteLength p > 1 and S.startsWith "0" p then None
+      else S.toInt p
+  in
+  let preOk = V.all (\c -> C.isAlphaNum c or c == '.' or c == '-') (S.chars pre) in
+  if bad or V.len parts != 3 or not preOk then None
+  else
+    match (
+      number (V.getOr "" parts 0),
+      number (V.getOr "" parts 1),
+      number (V.getOr "" parts 2)
+    ) with
+    | (Just a, Just b, Just c) -> Just (Version a b c pre)
+    | _ -> None
+
+@pub fun showVersion (v : Version) : String =
+  match v with
+  | Version a b c pre -> "${show a}.${show b}.${show c}${if S.isEmpty pre then "" else "-${pre}"}"
+
+fun isPre (v : Version) : Bool = match v with | Version _ _ _ pre -> not (S.isEmpty pre)
+
+fun numbers (v : Version) : (Int, Int, Int) = match v with | Version a b c _ -> (a, b, c)
+
+-- The digit that breaks compatibility: the major, or the minor below 1.0.
+fun breaking (v : Version) : (Int, Int) =
+  match v with
+  | Version a b _ _ -> if a > 0 then (a, 0) else (0, b)
+
+-- -1, 0 or 1, as `a` is older than, the same as, or newer than `b`. A release
+-- is newer than the pre-releases leading to it.
+@pub fun compareVersions (a : Version) (b : Version) : Int =
+  let byNumbers = cmpTriple (numbers a) (numbers b) in
+  if byNumbers != 0 then byNumbers
+  else
+    match (isPre a, isPre b) with
+    | (False, False) -> 0
+    | (False, True) -> 1
+    | (True, False) -> 0 - 1
+    | (True, True) ->
+        (match (a, b) with
+         | (Version _ _ _ p, Version _ _ _ q) -> comparePre p q)
+
+fun cmpInt (x : Int) (y : Int) : Int = if x < y then 0 - 1 else if x > y then 1 else 0
+
+fun cmpTriple t u =
+  match (t, u) with
+  | ((a, b, c), (x, y, z)) ->
+      let first = cmpInt a x in
+      if first != 0 then first
+      else
+        let second = cmpInt b y in
+        if second != 0 then second else cmpInt c z
+
+-- Pre-release tails, field by field: numbers as numbers, a number below a
+-- word, and fewer fields, all equal so far, first.
+fun comparePre (p : String) (q : String) : Int =
+  let ps = S.split "." p in
+  let qs = S.split "." q in
+  let rec go i =
+    match (V.get ps i, V.get qs i) with
+    | (None, None) -> 0
+    | (None, Just _) -> 0 - 1
+    | (Just _, None) -> 1
+    | (Just x, Just y) ->
+        let numeric = \s -> not (S.isEmpty s) and V.all C.isDigit (S.chars s) in
+        let o =
+          (match (numeric x, numeric y) with
+           | (True, True) -> cmpInt (M.unwrapOr 0 (S.toInt x)) (M.unwrapOr 0 (S.toInt y))
+           | (True, False) -> 0 - 1
+           | (False, True) -> 1
+           | (False, False) -> if x < y then 0 - 1 else if x > y then 1 else 0)
+        in if o != 0 then o else go (i + 1)
+  in go 0
+
+-- What a dependency will take: a release, and anything after it that does
+-- not break it. `^1.2.0` is the same, spelled out.
+@derive(Debug, PartialEq)
+@pub data Req = Req Version
+
+@pub fun reqOf (text : String) : Maybe Req =
+  let t = S.trim text in
+  M.map Req (versionOf (if S.startsWith "^" t then S.drop t 1 else t))
+
+fun least (r : Req) : Version = match r with | Req v -> v
+
+-- Whether `v` is this release or a later one that does not break it. Asking
+-- for a release is not asking for the pre-releases after it.
+@pub fun allows (r : Req) (v : Version) : Bool =
+  let l = least r in
+  if isPre v and not (isPre l) then False
+  else if isPre v and numbers v != numbers l then False
+  else compareVersions v l >= 0 and breaking v == breaking l
+
+-- The newest of `vs` that `r` takes.
+@pub fun bestOf (r : Req) (vs : [Version]) : Maybe Version =
+  V.foldl
+    (\acc v ->
+      if not (allows r v) then acc
+      else
+        match acc with
+        | Just b -> if compareVersions v b > 0 then Just v else acc
+        | None -> Just v)
+    None
+    vs
+
+fun stricter (r : Req) (s : Req) : Req = if compareVersions (least s) (least r) > 0 then s else r
+
+-- --- what a manifest asks for ------------------------------------------------
+
+-- A git reference: the remote's default branch, a branch, a tag, a commit,
+-- or a release that meets a requirement.
+@derive(Debug, PartialEq)
+@pub data GitRef
+  = Default
+  | Branch String
+  | Tag String
+  | Rev String
+  | Release Req
+
+-- A dependency: a directory beside the unit -- relative to it -- or a
+-- repository, by its name, its url and the reference it follows.
+@derive(Debug, PartialEq)
+@pub data Dep = Path String | Git String String GitRef
+
+-- How a reference reads in a lock entry: `branch=main`, `version=1.2.0`. A
+-- requirement is written as asked, not as the release it resolved to, so a
+-- resolution that moved within it still finds the entry it replaces.
+@pub fun written (r : GitRef) : String =
+  match r with
+  | GitRef.Default -> ""
+  | GitRef.Branch b -> "branch=${b}"
+  | GitRef.Tag t -> "tag=${t}"
+  | GitRef.Rev c -> "rev=${c}"
+  | GitRef.Release q -> "version=${showVersion (least q)}"
+
+fun refspec (r : GitRef) : String =
+  match r with
+  | GitRef.Branch b -> b
+  | GitRef.Tag t -> t
+  | GitRef.Rev c -> c
+  | _ -> "HEAD"
+
+-- A dependency's source as the lock file writes it: `git+<url>?tag=v1`.
+@pub fun sourceOf (url : String) (r : GitRef) : String =
+  let w = written r in
+  if S.isEmpty w then "git+${url}" else "git+${url}?${w}"
+
+-- --- the lock file -----------------------------------------------------------
+
+-- One dependency as it was resolved: its name, its source, the commit, the
+-- hash of the source tree at that commit, and the release it resolved to
+-- when it asked for a version -- or nothing.
+@derive(Debug, PartialEq)
+@pub data Locked = Locked String String String String String
+
+fun lockedName (l : Locked) : String = match l with | Locked n _ _ _ _ -> n
+
+fun lockedSource (l : Locked) : String = match l with | Locked _ s _ _ _ -> s
+
+fun lockedRev (l : Locked) : String = match l with | Locked _ _ r _ _ -> r
+
+fun lockedVersion (l : Locked) : String = match l with | Locked _ _ _ _ v -> v
+
+fun unquoted (s : String) : String =
+  let t = S.trim s in
+  let a = if S.startsWith "\"" t then S.drop t 1 else t in
+  if S.endsWith "\"" a then S.take a (stringByteLength a - 1) else a
+
+-- The entries of a lock file. One written by a later format is not read at
+-- all: guessing at it could pin the wrong commit, and resolving afresh is
+-- always safe.
+@pub fun lockOf (text : String) : [Locked] =
+  let step =
+    \acc line0 ->
+      match acc with
+      | (done, current, ok) ->
+          let line = S.trim line0 in
+          if S.isEmpty line or S.startsWith "#" line then acc
+          else if line == "[[package]]" then
+            (finished done current, Just (Locked "" "" "" "" ""), ok)
+          else
+            match S.indexOf "=" line with
+            | None -> acc
+            | Just i ->
+                let key = S.trim (S.take line i) in
+                let value = unquoted (S.drop line (i + 1)) in
+                (match current with
+                 | None -> if key == "version" then (done, current, value == "1") else acc
+                 | Just (Locked n s r t v) ->
+                     let now =
+                       if key == "name" then Locked value s r t v
+                       else if key == "source" then Locked n value r t v
+                       else if key == "rev" then Locked n s value t v
+                       else if key == "tree" then Locked n s r value v
+                       else if key == "version" then Locked n s r t value
+                       else Locked n s r t v
+                     in (done, Just now, ok))
+  in match V.foldl step ([], None, True) (S.lines text) with
+     | (done, current, ok) -> if ok then finished done current else []
+
+fun finished done current =
+  match current with
+  | Just (Locked n s r t v) ->
+      if S.isEmpty n or S.isEmpty r then done else V.pushBack done (Locked n s r t v)
+  | None -> done
+
+-- A lock file's text: sorted by name and source, so two machines resolving
+-- one graph write the same file. `program` is who writes it, in the header.
+@pub fun lockText (program : String) (entries : [Locked]) : String =
+  let sorted =
+    V.foldl
+      (\acc e ->
+        insertSorted
+          (\a b -> (lockedName a, lockedSource a) <= (lockedName b, lockedSource b))
+          acc
+          e)
+      []
+      entries
+  in
+  let entry =
+    \e ->
+      match e with
+      | Locked n s r t v ->
+          "\n[[package]]\nname = \"${n}\"\nsource = \"${s}\"\n${if S.isEmpty v then "" else "version = \"${v}\"\n"}rev = \"${r}\"\n${if S.isEmpty t then "" else "tree = \"${t}\"\n"}"
+  in "# Written by ${program}. Commit this file: it is what makes a build on\n# another machine the build you tested. Change it with `${program} update`.\n\nversion = 1\n${S.join "" (V.map entry sorted)}"
+
+fun insertSorted before (xs : [a]) (x : a) : [a] =
+  let at = V.foldl (\i y -> if before y x then i + 1 else i) 0 xs in
+  V.concat [V.take xs at, [x], V.drop xs at]
+
+-- --- git -----------------------------------------------------------------------
+
+-- Whether `url` is one a dependency may name: not an option to git, and not a
+-- `helper::address` transport, either of which would run a command.
+@pub fun safeUrl (url : String) : Result String () =
+  let schemes = ["https://", "http://", "ssh://", "git://", "file://"] in
+  let helper =
+    (match S.indexOf "::" url with
+     | Just i ->
+         let scheme = S.take url i in
+         not (S.isEmpty scheme)
+           and V.all (\c -> C.isAlphaNum c or c == '+' or c == '.' or c == '-') (S.chars scheme)
+     | None -> False)
+  in
+  let drive =
+    (match S.chars url with
+     | cs ->
+         V.len cs >= 3
+           and C.isAlpha (V.getOr ' ' cs 0)
+           and V.getOr ' ' cs 1 == ':'
+           and (V.getOr ' ' cs 2 == '/' or V.getOr ' ' cs 2 == '\\'))
+  in
+  let scp =
+    (match S.indexOf ":" url with
+     | Just i -> i > 0 and not (S.contains "/" (S.take url i))
+     | None -> False)
+  in if S.isEmpty url then Err "a git dependency has an empty url"
+     else if S.startsWith "-" url then
+       Err
+         "the git url `${url}` begins with `-`, so git would read it as an option rather than a location; refusing it"
+     else if helper then
+       Err "the git url `${url}` uses a `::` transport, which can run a command; refusing it"
+     else if V.any (\s -> S.startsWith s url) schemes then Ok ()
+     else if S.startsWith "/" url or S.startsWith "./" url or S.startsWith "../" url or drive then
+       Ok ()
+     else if scp then Ok ()
+     else
+       Err
+         "`${url}` is not a git url this build understands: expected one beginning with https://, ssh://, git:// or file://, a `host:path` address, or a path to a repository"
+
+-- Whether `s` is a full commit id. A lock's `rev` becomes a directory name and
+-- a revision handed to git, so one that is a path is not trusted.
+fun isCommitId (s : String) : Bool =
+  (stringByteLength s == 40 or stringByteLength s == 64) and V.all C.isHexDigit (S.chars s)
+
+-- A directory name for `url`: its last part, readable, and a hash of the
+-- whole, which keeps two repositories of one name apart. A trailing `/` or
+-- `.git` names the same repository.
+@pub fun slugOf (url : String) : String =
+  let trimmed = trimEnd (trimEnd (trimEnd url "/") ".git") "/" in
+  let parts =
+    V.filter (\p -> not (S.isEmpty p)) (V.concatMap (\p -> S.split ":" p) (S.split "/" trimmed))
+  in
+  let name = V.getOr "repo" parts (V.len parts - 1) in
+  let safe =
+    S.fromChars
+      (V.map (\c -> if C.isAlphaNum c or c == '-' or c == '_' then c else '-') (S.chars name))
+  in
+  let h = hash trimmed in
+  "${safe}-${show (if h < 0 then 0 - h else h)}"
+
+fun trimEnd (s : String) (suffix : String) : String =
+  if S.endsWith suffix s then S.take s (stringByteLength s - stringByteLength suffix) else s
+
+-- Git, run in `dir` (or nowhere), its output or what it said went wrong. It
+-- never stops for a password, and is never told to use a transport that runs
+-- a command, whatever the user's configuration allows.
+fun git (dir : Maybe String) (args : [String]) : Result String String ! { Process | e } =
+  let base = ["-c", "protocol.ext.allow=never", "-c", "core.longpaths=true"] in
+  let at = (match dir with | Just d -> ["-C", d] | None -> []) in
+  match spawn ("git", V.concat [base, at, args], None, [("GIT_TERMINAL_PROMPT", "0")]) with
+  | Err why -> Err "`git` could not be run, and a git dependency needs it: ${why}"
+  | Ok (code, out, err) ->
+      if code == 0 then Ok out
+      else Err (if S.isEmpty (S.trim err) then "git ${V.getOr "" args 0} failed" else S.trim err)
+
+-- Clone `url` into `db` the first time, and fetch into it after: every branch
+-- and tag, a moved tag brought over so it can be reported as moved.
+fun fetch (db : String) (url : String) =
+  match safeUrl url with
+  | Err why -> Err why
+  | Ok _ ->
+      if exists (Path.join db "HEAD") then
+        fetched
+          (git (Just db) [
+             "fetch", "--quiet", "--force", "--prune", "--", url, "+refs/heads/*:refs/heads/*",
+             "+refs/tags/*:refs/tags/*"
+           ])
+      else
+        let u = M.map createDirAll (Path.parent db) in
+        let w = removeDirAll db in
+        fetched (git None ["clone", "--quiet", "--bare", "--", url, db])
+
+fun fetched (r : Result String String) : Result String () =
+  match r with | Ok _ -> Ok () | Err why -> Err why
+
+-- The commit `what` names, in full: an annotated tag's commit, not the tag.
+fun revParse (db : String) (what : String) : Result String String ! { Process | e } =
+  trimmedOut (git (Just db) ["rev-parse", "--verify", "--end-of-options", "${what}^{commit}"])
+
+fun treeOf (db : String) (rev : String) : Result String String ! { Process | e } =
+  trimmedOut (git (Just db) ["rev-parse", "--verify", "--end-of-options", "${rev}^{tree}"])
+
+fun trimmedOut (r : Result String String) : Result String String =
+  match r with
+  | Ok out -> Ok (S.trim out)
+  | Err why -> Err why
+
+-- The source at `rev` put in `path`: written beside it and moved, so an
+-- interrupted run never leaves a half-written checkout a later build trusts.
+fun unpack (db : String) (rev : String) (path : String) =
+  let parent = M.unwrapOr "." (Path.parent path) in
+  let u = createDirAll parent in
+  let staging = Path.join parent ".${rev}.part" in
+  let w = removeDirAll staging in
+  match git None ["clone", "--quiet", "--local", "--no-checkout", db, staging] with
+  | Err why -> Err why
+  | Ok _ ->
+      match git (Just staging) ["checkout", "--quiet", "--detach", rev] with
+      | Err why -> Err why
+      | Ok _ ->
+          (match rename (staging, path) with
+           | Ok _ -> Ok ()
+           | Err why ->
+               -- Another build may have unpacked the same commit first: its
+               -- contents are the same by construction.
+               if isDir path then (let x = removeDirAll staging in Ok ())
+               else Err "could not put ${path} in place: ${why}")
+
+-- Every release the repository has: a tag that reads as a version, with the
+-- tag as it was written. Offline, what was fetched before is used.
+@pub fun releasesOf (cache : String) (url : String) (offline : Bool) =
+  let db = Path.joinAll [cache, "db", slugOf url] in
+  let ready =
+    if offline then
+      (if exists (Path.join db "HEAD") then Ok ()
+       else Err "cannot look for the releases of `${url}` while offline")
+    else fetch db url
+  in match ready with
+     | Err why -> Err why
+     | Ok _ ->
+         match git (Just db) ["tag", "--list"] with
+         | Err why -> Err why
+         | Ok out ->
+             Ok
+               (V.concatMap
+                  (\t -> M.unwrapOr [] (M.map (\v -> [(v, S.trim t)]) (versionOf (S.trim t))))
+                  (V.filter (\t -> not (S.isEmpty (S.trim t))) (S.lines out)))
+
+-- `url` at `ref` on disk: its directory, its commit and its tree. `pinned` is
+-- the commit a lock recorded; when it is already checked out nothing is
+-- fetched at all. A tag that now names another commit than the lock says is
+-- refused rather than followed.
+@pub fun ensure (cache : String) (url : String) (ref : GitRef) (pinned : String) (offline : Bool) =
+  let db = Path.joinAll [cache, "db", slugOf url] in
+  let checkouts = Path.joinAll [cache, "checkouts", slugOf url] in
+  if not (S.isEmpty pinned) and not (isCommitId pinned) then
+    Err
+      "the lock file gives `${pinned}` as the commit of `${url}`, which is not a commit id; refusing it"
+  else if not (S.isEmpty pinned) and isDir (Path.join checkouts pinned) then
+    Ok (Path.join checkouts pinned, pinned, M.unwrapOr "" (okOf (treeOf db pinned)))
+  else if offline then
+    Err
+      "`${url}${if S.isEmpty (written ref) then "" else " (${written ref})"}` is not in the cache, and this build is offline.\nRun it without `offline` once to fetch it."
+  else
+    match fetch db url with
+    | Err why -> Err why
+    | Ok _ ->
+        let found =
+          if S.isEmpty pinned then
+            (match revParse db (refspec ref) with
+             | Ok r -> Ok r
+             | Err why ->
+                 Err
+                   "`${url}` has no ${if S.isEmpty (written ref) then "default branch" else written ref}: ${why}")
+          else
+            match revParse db pinned with
+            | Err _ ->
+                Err
+                  "`${url}` has no commit ${pinned}, which the lock file says to use.\nThe history it was on may have been rewritten."
+            | Ok r ->
+                (match ref with
+                 | GitRef.Tag t ->
+                     (match revParse db t with
+                      | Ok now ->
+                          if now != r then
+                            Err
+                              "`tag=${t}` of `${url}` now names commit ${S.take now 9}, but the lock file says ${S.take r 9}.\nA tag that moves is a different program under the same name. Update deliberately to take the new one."
+                          else Ok r
+                      | Err _ -> Ok r)
+                 | _ -> Ok r)
+        in match found with
+           | Err why -> Err why
+           | Ok rev ->
+               let path = Path.join checkouts rev in
+               let unpacked = if isDir path then Ok () else unpack db rev path in
+               match unpacked with
+               | Err why -> Err why
+               | Ok _ ->
+                   (match treeOf db rev with
+                    | Ok tree -> Ok (path, rev, tree)
+                    | Err why -> Err why)
+
+-- --- resolving a build's dependencies --------------------------------------------
+
+-- How a build resolves: where the cache is, the lock file's path, whether it
+-- may reach the network, whether a change to the lock is refused, whether this
+-- is an update and of which dependencies -- every one, when none are named --
+-- and what it has found: the lock's entries, the dependencies seen and where
+-- each is, and the release chosen for each repository and breaking digit.
+@pub data Resolver
+  = Resolver
+    String
+    String
+    Bool
+    Bool
+    Bool
+    [String]
+    (Ref [Locked])
+    [Locked]
+    (Ref [((String, String), String)])
+    (Ref [((String, (Int, Int)), Version)])
+
+-- A resolver for a build whose lock file is `lockPath`, read now.
+@pub fun resolver
+    (cache : String)
+    (lockPath : String)
+    (offline : Bool)
+    (locked : Bool)
+    (update : Bool)
+    (only : [String]) =
+  let had = lockOf (M.unwrapOr "" (okOf (readToString lockPath))) in
+  Resolver cache lockPath offline locked update only (newRef had) had (newRef []) (newRef [])
+
+fun cacheOf r = match r with | Resolver c _ _ _ _ _ _ _ _ _ -> c
+
+fun lockPathOf r = match r with | Resolver _ p _ _ _ _ _ _ _ _ -> p
+
+fun offlineOf r = match r with | Resolver _ _ o _ _ _ _ _ _ _ -> o
+
+fun lockedOf r = match r with | Resolver _ _ _ l _ _ _ _ _ _ -> l
+
+fun updatingOf r = match r with | Resolver _ _ _ _ u _ _ _ _ _ -> u
+
+fun onlyOf r = match r with | Resolver _ _ _ _ _ o _ _ _ _ -> o
+
+fun entriesOf r = match r with | Resolver _ _ _ _ _ _ e _ _ _ -> e
+
+fun beforeOf r = match r with | Resolver _ _ _ _ _ _ _ b _ _ -> b
+
+fun seenOf r = match r with | Resolver _ _ _ _ _ _ _ _ s _ -> s
+
+fun releasesHeld r = match r with | Resolver _ _ _ _ _ _ _ _ _ rs -> rs
+
+-- Where a build's shared cache is: `cache` with a leading `~` the home
+-- directory -- or, when the variable `env` is set, its value with the
+-- cache's last part, as `$IDYLL_HOME/git`.
+@pub fun cacheDir (cache : String) (env : String) =
+  match (if S.isEmpty env then None else getEnv env) with
+  | Just h -> Path.join h (Path.fileName cache)
+  | None ->
+      if S.startsWith "~" cache then
+        let home =
+          (match getEnv "USERPROFILE" with
+           | Just h -> h
+           | None -> M.unwrapOr "." (getEnv "HOME"))
+        in Path.join
+             home
+             (S.drop
+                (S.drop cache 1)
+                (if S.startsWith "/" (S.drop cache 1) or S.startsWith "\\" (S.drop cache 1) then 1
+                 else 0))
+      else cache
+
+-- The directories `deps` are, for a unit at `from`: a path as it is, beside
+-- the unit; a repository fetched -- or found in the cache -- and recorded.
+@pub fun dirsOf (r : Resolver) (from : String) (deps : Result String [Dep]) =
+  match deps with
+  | Err why -> Err why
+  | Ok ds ->
+      V.foldl
+        (\acc d ->
+          match acc with
+          | Err why -> Err why
+          | Ok dirs ->
+              (match resolve r from d with
+               | Ok dir -> Ok (V.pushBack dirs dir)
+               | Err why -> Err why))
+        (Ok [])
+        ds
+
+-- The directory one dependency is.
+@pub fun resolve (r : Resolver) (from : String) (d : Dep) =
+  match d with
+  | Dep.Path p -> Ok (Path.normalize (Path.join from p))
+  | Dep.Git name url ref ->
+      let source = sourceOf url ref in
+      match V.find (\s -> fst s == (name, source)) (getRef (seenOf r)) with
+      | Just s -> Ok (snd s)
+      | None ->
+          let refresh = updatingOf r and (V.isEmpty (onlyOf r) or V.elem name (onlyOf r)) in
+          let had =
+            V.find (\l -> lockedName l == name and lockedSource l == source) (getRef (entriesOf r))
+          in
+          let pinned = if refresh then None else had in
+          if lockedOf r and M.isNone pinned then
+            Err
+              "`${name}` from ${described source} is not what the lock file pins, and the build is locked.\nUpdate deliberately to change the lock file."
+          else
+            -- A release asked for: the one the lock recorded, or the newest that
+            -- meets this and what the build decided before for the repository.
+            let chosen =
+              (match ref with
+               | GitRef.Release q ->
+                   (match pinned with
+                    | Just l ->
+                        (match versionOf (lockedVersion l) with
+                         | Just v ->
+                             (let u = held r url v in
+                              Ok (GitRef.Tag (tagOf r url v), showVersion v))
+                         | None -> releaseFor r name url q)
+                    | None -> releaseFor r name url q)
+               | other -> Ok (other, ""))
+            in match chosen with
+               | Err why -> Err why
+               | Ok (actual, version) ->
+                   match ensure
+                     (cacheOf r)
+                     url
+                     actual
+                     (M.unwrapOr "" (M.map lockedRev pinned))
+                     (offlineOf r) with
+                   | Err why -> Err why
+                   | Ok (path, rev, tree) ->
+                       let u =
+                         setRef (seenOf r) (V.pushBack (getRef (seenOf r)) ((name, source), path))
+                       in
+                       let w =
+                         setRef
+                           (entriesOf r)
+                           (V.pushBack
+                              (V.filter
+                                 (\l -> not (lockedName l == name and lockedSource l == source))
+                                 (getRef (entriesOf r)))
+                              (Locked name source rev tree version))
+                       in Ok path
+
+fun described (source : String) : String =
+  match S.indexOf "?" source with
+  | Just i -> "${trimStart (S.take source i) "git+"} (${S.drop source (i + 1)})"
+  | None -> trimStart source "git+"
+
+fun trimStart (s : String) (prefix : String) : String =
+  if S.startsWith prefix s then S.drop s (stringByteLength prefix) else s
+
+-- Record that `url`'s releases of `v`'s breaking digit resolve to `v`.
+fun held r (url : String) (v : Version) =
+  setRef
+    (releasesHeld r)
+    (V.pushBack (V.filter (\x -> fst x != (url, breaking v)) (getRef (releasesHeld r))) (
+       (url, breaking v),
+       v
+     ))
+
+-- The release `q` resolves to: the one already decided for its repository
+-- and breaking digit if `q` takes it, and otherwise the newest that meets
+-- both -- what everything in the build that can share one copy does.
+fun releaseFor r (name : String) (url : String) (q : Req) =
+  let group = (url, breaking (least q)) in
+  let earlier = M.map snd (V.find (\x -> fst x == group) (getRef (releasesHeld r))) in
+  match earlier with
+  | Just v ->
+      if allows q v then Ok (GitRef.Tag (tagOf r url v), showVersion v)
+      else newest r name url (stricter q (Req v))
+  | None -> newest r name url q
+
+fun newest r (name : String) (url : String) (want : Req) =
+  match releasesOf (cacheOf r) url (offlineOf r) with
+  | Err why -> Err why
+  | Ok have ->
+      match bestOf want (V.map fst have) with
+      | Just v ->
+          let u = held r url v in
+          Ok (
+            GitRef.Tag
+              (M.unwrapOr "v${showVersion v}" (M.map snd (V.find (\x -> fst x == v) have))),
+            showVersion v
+          )
+      | None ->
+          if V.isEmpty have then
+            Err
+              "`${name}` at ${url} has no releases: nothing there is tagged `v1.2.3`.\nDepend on a branch instead, or tag a release."
+          else
+            Err
+              "no release of `${name}` at ${url} is ${showVersion (least want)}; it has ${S.join ", " (V.map (\x -> showVersion (fst x)) (V.take (newestFirst have) 5))}"
+
+fun newestFirst (have : [(Version, String)]) : [(Version, String)] =
+  V.foldl (\acc x -> insertSorted (\a b -> compareVersions (fst a) (fst b) >= 0) acc x) [] have
+
+-- The tag a release was written as, as the repository spells it.
+fun tagOf r (url : String) (v : Version) =
+  match releasesOf (cacheOf r) url True with
+  | Ok have -> M.unwrapOr "v${showVersion v}" (M.map snd (V.find (\x -> fst x == v) have))
+  | Err _ -> "v${showVersion v}"
+
+-- What the build resolved, written to the lock file -- what no dependency
+-- wants any more dropped -- and only when it would change. A locked build
+-- that would change it fails instead. `program` is named in the header.
+@pub fun settle (r : Resolver) (program : String) =
+  let seen = getRef (seenOf r) in
+  let kept =
+    V.filter
+      (\l -> V.any (\s -> fst s == (lockedName l, lockedSource l)) seen)
+      (getRef (entriesOf r))
+  in
+  let text = lockText program kept in
+  let before = M.unwrapOr "" (okOf (readToString (lockPathOf r))) in
+  if text == before or (V.isEmpty kept and S.isEmpty before) then Ok ()
+  else if lockedOf r then
+    Err "the lock file would change, and the build is locked.\nUpdate deliberately to change it."
+  else
+    match writeString (lockPathOf r, text) with
+    | Ok _ -> Ok ()
+    | Err why -> Err "could not write ${lockPathOf r}: ${why}"
+
+-- What an update moved: each dependency whose commit is new or other than
+-- the lock had, its name, what it was -- a release, or a short commit -- and
+-- what it is now; by name.
+@pub fun movedBy (r : Resolver) =
+  let before = beforeOf r in
+  let shown =
+    \l -> if S.isEmpty (lockedVersion l) then S.take (lockedRev l) 9 else lockedVersion l
+  in V.foldl
+       (\acc l -> insertSorted (\a b -> fst3 a <= fst3 b) acc l)
+       []
+       (V.concatMap
+          (\now ->
+            match V.find
+              (\b -> lockedName b == lockedName now and lockedSource b == lockedSource now)
+              before with
+            | Just had ->
+                if lockedRev had == lockedRev now then []
+                else [(lockedName now, shown had, shown now)]
+            | None -> [(lockedName now, "", shown now)])
+          (getRef (entriesOf r)))
+
+fun fst3 t = match t with | (a, _, _) -> a
+
+-- The names of the dependencies the build reached, each once, in the order
+-- it reached them.
+@pub fun seenNames (r : Resolver) =
+  V.foldl
+    (\acc s -> if V.elem (fst (fst s)) acc then acc else V.pushBack acc (fst (fst s)))
+    []
+    (getRef (seenOf r))
+
+-- --- tests ---------------------------------------------------------------------
+
+use Std.Test (assertEq)
+
+fun v (s : String) : Version = M.unwrapOr (Version 0 0 0 "none") (versionOf s)
+
+@test fun aVersionIsReadWithOrWithoutItsV () =
+  assertEq
+    (V.map versionOf ["1.2.3", "v1.2.3", "v1.2.3-rc1", "1.2.3+build7"])
+    [
+      Just (Version 1 2 3 ""),
+      Just (Version 1 2 3 ""),
+      Just (Version 1 2 3 "rc1"),
+      Just (Version 1 2 3 "")
+    ]
+    "as Idyll's driver reads them"
+
+@test fun whatIsNotAReleaseIsNoVersion () =
+  assertEq
+    (V.filter (\t -> M.isSome (versionOf t)) [
+       "", "v", "1", "1.2", "1.2.3.4", "1.2.x", "v01.2.3", "1.2.-3", "release-1", "1.2.3-"
+     ])
+    []
+    "none of them"
+
+@test fun aReleaseOutranksItsPreReleases () =
+  assertEq
+    (
+      compareVersions (v "1.0.0") (v "1.0.0-rc2"),
+      compareVersions (v "1.0.0-rc2") (v "1.0.0-rc1"),
+      compareVersions (v "1.0.0-rc.10") (v "1.0.0-rc.2"),
+      compareVersions (v "1.0.0-rc10") (v "1.0.0-rc2"),
+      compareVersions (v "1.0.0-1") (v "1.0.0-alpha"),
+      compareVersions (v "0.2.0") (v "0.1.9")
+    )
+    (1, 1, 1, 0 - 1, 0 - 1, 1)
+    "semver's order"
+
+@test fun aRequirementTakesWhatDoesNotBreakIt () =
+  let q = M.unwrapOr (Req (v "9.9.9")) (reqOf "1.2.0") in
+  let z = M.unwrapOr (Req (v "9.9.9")) (reqOf "0.3.1") in
+  assertEq
+    (
+      V.map (\s -> allows q (v s)) ["1.2.0", "1.9.3", "1.1.9", "2.0.0", "1.3.0-rc1"],
+      V.map (\s -> allows z (v s)) ["0.3.1", "0.3.9", "0.4.0", "0.3.0"],
+      reqOf "^1.2.0" == reqOf "1.2.0"
+    )
+    ([True, True, False, False, False], [True, True, False, False], True)
+    "below the next breaking release, pre-releases only if asked for"
+
+@test fun theBestIsTheNewestThatFits () =
+  let have = V.map v ["0.9.0", "1.0.0", "1.4.2", "1.4.10", "2.0.0"] in
+  assertEq
+    (
+      M.map showVersion (bestOf (Req (v "1.0.0")) have),
+      M.map showVersion (bestOf (Req (v "3.0.0")) have)
+    )
+    (Just "1.4.10", None)
+    "1.4.10, and nothing for 3"
+
+@test fun aLockIsWrittenAsIdyllsDriverWritesItAndReadBack () =
+  let entries =
+    [
+      Locked "text" "git+https://e.com/text?tag=v1" "bbb" "t2" "",
+      Locked "json" "git+https://e.com/json?version=1.2.0" "aaa" "t1" "1.4.0"
+    ]
+  in
+  let text = lockText "idyll" entries in
+  let a =
+    assertEq
+      text
+      "# Written by idyll. Commit this file: it is what makes a build on\n# another machine the build you tested. Change it with `idyll update`.\n\nversion = 1\n\n[[package]]\nname = \"json\"\nsource = \"git+https://e.com/json?version=1.2.0\"\nversion = \"1.4.0\"\nrev = \"aaa\"\ntree = \"t1\"\n\n[[package]]\nname = \"text\"\nsource = \"git+https://e.com/text?tag=v1\"\nrev = \"bbb\"\ntree = \"t2\"\n"
+      "sorted by name, the version before the commit, as lock.rs renders it"
+  in
+  let b = assertEq (lockOf text) (V.reverse entries) "and read back" in
+  assertEq
+    (lockOf "version = 99\n\n[[package]]\nname = \"json\"\nsource = \"s\"\nrev = \"r\"\n")
+    []
+    "a lock from a later format is not guessed at"
+
+@test fun aSourceSaysWhichReferenceWasAskedFor () =
+  assertEq
+    (
+      sourceOf "https://e.com/j" (GitRef.Tag "v1"),
+      sourceOf "https://e.com/j" GitRef.Default,
+      sourceOf "https://e.com/j" (GitRef.Release (Req (v "1.2.0")))
+    )
+    ("git+https://e.com/j?tag=v1", "git+https://e.com/j", "git+https://e.com/j?version=1.2.0")
+    "as lock.rs writes them"
+
+@test fun aUrlThatWouldRunACommandIsRefused () =
+  assertEq
+    (V.map (\u -> match safeUrl u with | Ok _ -> True | Err _ -> False) [
+       "https://e.com/r", "git@github.com:me/r.git", "/srv/r", "../r", "C:\\r", "-upload-pack=x",
+       "ext::sh -c x", ""
+     ])
+    [True, True, True, True, True, False, False, False]
+    "the ordinary transports and paths, and nothing that is an option or a helper"
+
+@test fun aSlugIsReadableAndOneRepositoryIsOneSlug () =
+  let a = slugOf "https://github.com/someone/idyll-json" in
+  assertEq
+    (
+      S.startsWith "idyll-json-" a,
+      a != slugOf "https://github.com/other/idyll-json",
+      slugOf "https://github.com/someone/idyll-json.git" == a,
+      slugOf "https://github.com/someone/idyll-json/" == a,
+      S.startsWith "idyll-json-" (slugOf "git@github.com:someone/idyll-json.git")
+    )
+    (True, True, True, True, True)
+    "named for the repository, apart from another of the same name, whatever the spelling"
+
+-- --- with git ------------------------------------------------------------------
+--
+-- Repositories made on the spot, so these need git and no network.
+
+use Std.Fs (removeFile)
+
+-- A repository at `dir` with one file, tagged with each of `tags` in turn, a
+-- commit each: `v1.0.0` then `v1.2.0` and so on.
+fun repoWith (dir : String) (tags : [String]) =
+  let w = removeDirAll dir in
+  let u = createDirAll dir in
+  let a = git (Just dir) ["init", "--quiet", "-b", "main"] in
+  V.foldl
+    (\acc t ->
+      let x = writeString (Path.join dir "lib.txt", t) in
+      let y = git (Just dir) ["add", "-A"] in
+      let z =
+        git (Just dir) ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--quiet", "-m", t]
+      in
+      let q = git (Just dir) ["tag", t] in
+      ())
+    ()
+    tags
+
+fun absolute (p : String) =
+  match spawn ("git", ["-C", p, "rev-parse", "--show-toplevel"], None, []) with
+  | Ok (0, out, _) -> S.trim out
+  | _ -> p
+
+@test fun aReleaseIsChosenFetchedAndLockedAndTheLockNeedsNoNetwork () =
+  let base = "target/lingua-resolve-test" in
+  let r0 = removeDirAll base in
+  let repo = Path.join base "json" in
+  let made = repoWith repo ["v1.0.0", "v1.2.0", "v2.0.0"] in
+  let url = absolute repo in
+  let cache = Path.join base "cache" in
+  let lock = Path.join base "test.lock" in
+  let dep = Dep.Git "json" url (GitRef.Release (Req (v "1.0.0"))) in
+  let first = resolver cache lock False False False [] in
+  let dir = resolve first base dep in
+  let a =
+    assertEq
+      (M.map
+         (\d -> S.trim (M.unwrapOr "" (okOf (readToString (Path.join d "lib.txt")))))
+         (okOf dir))
+      (Just "v1.2.0")
+      "the newest release below 2.0, checked out"
+  in
+  let s = settle first "test" in
+  let entries = lockOf (M.unwrapOr "" (okOf (readToString lock))) in
+  let b =
+    assertEq
+      (V.map (\l -> match l with | Locked n src _ _ ver -> (n, src, ver)) entries)
+      [("json", "git+${url}?version=1.0.0", "1.2.0")]
+      "locked: the requirement as asked, and the release it was"
+  in
+  -- The repository goes: a build with the lock, offline, still has it.
+  let gone = removeDirAll repo in
+  let offline = resolver cache lock True False False [] in
+  let again = resolve offline base dep in
+  assertEq
+    (M.isSome (okOf again), okOf again == okOf dir)
+    (True, True)
+    "the same checkout, from the cache alone"
+
+@test fun aTagThatMovedIsRefusedAndALockedBuildChangesNothing () =
+  let base = "target/lingua-resolve-moved" in
+  let r0 = removeDirAll base in
+  let repo = Path.join base "text" in
+  let made = repoWith repo ["v1.0.0"] in
+  let url = absolute repo in
+  let lock = Path.join base "test.lock" in
+  let dep = Dep.Git "text" url (GitRef.Tag "v1.0.0") in
+  let first = resolver (Path.join base "cache-a") lock False False False [] in
+  let d = resolve first base dep in
+  let s = settle first "test" in
+  -- The tag is moved, as a force-push moves it, and another machine with an
+  -- empty cache builds from the lock.
+  let x = writeString (Path.join repo "lib.txt", "different") in
+  let y = git (Just repo) ["add", "-A"] in
+  let z =
+    git (Just repo) [
+      "-c", "user.email=t@t", "-c", "user.name=t", "commit", "--quiet", "-m", "moved"
+    ]
+  in
+  let q = git (Just repo) ["tag", "-f", "v1.0.0"] in
+  let other = resolver (Path.join base "cache-b") lock False False False [] in
+  let moved = resolve other base dep in
+  let a =
+    assertEq
+      (match moved with
+       | Err why -> S.contains "now names commit" why
+       | Ok _ -> False)
+      True
+      "a moved tag is refused, not followed"
+  in
+  let locked = resolver (Path.join base "cache-a") lock False True False [] in
+  let newDep = resolve locked base (Dep.Git "other" url GitRef.Default) in
+  assertEq
+    (match newDep with
+     | Err why -> S.contains "the build is locked" why
+     | Ok _ -> False)
+    True
+    "and a locked build refuses what the lock does not pin"
+
+@test fun anUpdateTakesTheNewestAndSaysWhatMoved () =
+  let base = "target/lingua-resolve-update" in
+  let r0 = removeDirAll base in
+  let repo = Path.join base "json" in
+  let made = repoWith repo ["v1.0.0"] in
+  let url = absolute repo in
+  let cache = Path.join base "cache" in
+  let lock = Path.join base "test.lock" in
+  let dep = Dep.Git "json" url (GitRef.Release (Req (v "1.0.0"))) in
+  let first = resolver cache lock False False False [] in
+  let d = resolve first base dep in
+  let s = settle first "test" in
+  let more = repoWithMore repo "v1.3.0" in
+  -- A build keeps what the lock has; an update takes the newer release.
+  let build = resolver cache lock False False False [] in
+  let kept = resolve build base dep in
+  let k = settle build "test" in
+  let keptVersion = V.map lockedVersion (lockOf (M.unwrapOr "" (okOf (readToString lock)))) in
+  let update = resolver cache lock False False True [] in
+  let u = resolve update base dep in
+  let moved = movedBy update in
+  let w = settle update "test" in
+  assertEq
+    (keptVersion, moved, V.map lockedVersion (lockOf (M.unwrapOr "" (okOf (readToString lock)))))
+    (["1.0.0"], [("json", "1.0.0", "1.3.0")], ["1.3.0"])
+    "the lock kept by a build, moved by an update, and the move said"
+
+fun repoWithMore (dir : String) (tag : String) =
+  let x = writeString (Path.join dir "lib.txt", tag) in
+  let y = git (Just dir) ["add", "-A"] in
+  let z =
+    git (Just dir) ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--quiet", "-m", tag]
+  in git (Just dir) ["tag", tag]

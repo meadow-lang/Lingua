@@ -76,6 +76,7 @@ use Std.Console (Console, writeOutput)
 use Std.Macro (Datum, Reflect, toDatum, fromDatum)
 use Std.Sort (sort, sortOn)
 use Lingua.Query (datumJson, jsonDatum)
+use Lingua.Resolve as R
 
 fun okOf r = match r with | Ok x -> Just x | Err _ -> None
 
@@ -1096,6 +1097,95 @@ fun partStep key compilePart encode decode u dir comps names importsOf before do
 -- Say that a build cannot be made, as `makeUnits` says it.
 @pub fun sayError (why : String) : () ! { Console | e } = writeOutput "error: ${why}\n"
 
+-- --- dependencies fetched --------------------------------------------------------
+
+-- The resolver of the build of the unit at `root`: what it fetches kept in
+-- `cache` -- or, when the variable `env` is set, under it -- and what it
+-- resolved recorded in the lock file `lock`, beside the root unit's manifest.
+-- See `Lingua.Resolve`.
+@pub fun resolverOf
+    (cache : String)
+    (env : String)
+    (lock : String)
+    (root : String)
+    (offline : Bool)
+    (locked : Bool)
+    (update : Bool)
+    (only : [String]) =
+  R.resolver
+    (R.cacheDir cache env)
+    (Path.join (Path.normalize root) lock)
+    offline
+    locked
+    update
+    only
+
+-- The directories the dependencies a manifest names are, for the unit at
+-- `from`: each path beside it, each repository fetched or found in the cache.
+@pub fun resolvedDirs (r : R.Resolver) (from : String) (deps : Result String [R.Dep]) =
+  R.dirsOf r from deps
+
+-- Every unit `root` reaches, the dependencies its manifests name resolved by
+-- `r`, and the lock file brought to what they resolved to: whether it could
+-- be, the first thing wrong said.
+@pub fun settled (r : R.Resolver) (lang : String) us (root : String) =
+  match graph us root with
+  | Err why -> (let u = sayError why in False)
+  | Ok _ ->
+      (match R.settle r lang with
+       | Err why -> (let u = sayError why in False)
+       | Ok _ -> True)
+
+-- An update of the build of the unit at `root`: the dependencies it reaches
+-- brought to the newest their manifests take -- those in `names`, or every one
+-- when it is empty -- what moved said, and the lock file written unless this
+-- is a dry run. Whether it could be.
+@pub fun updated
+    (r : R.Resolver)
+    (lang : String)
+    us
+    (root : String)
+    (names : [String])
+    (dryRun : Bool) =
+  match graph us root with
+  | Err why -> (let u = sayError why in False)
+  | Ok _ ->
+      let known = R.seenNames r in
+      match V.find (\n -> not (V.elem n known)) names with
+      | Just n ->
+          let u =
+            sayError
+              "`${n}` is not a git dependency of this unit.\nIts dependencies are: ${if V.isEmpty known then "none" else S.join ", " known}"
+          in False
+      | None ->
+          let moved = R.movedBy r in
+          let one = V.len moved == 1 in
+          let u =
+            writeOutput
+              "   Locking ${show (V.len moved)} ${if one then "dependency" else "dependencies"} to the latest commit${if one then "" else "s"}\n"
+          in if V.isEmpty moved then
+               (let w = writeOutput "   Unchanged every git dependency is already current\n" in
+                True)
+             else
+               let w =
+                 V.foldl
+                   (\acc m ->
+                     match m with
+                     | (n, was, now) ->
+                         writeOutput
+                           (if S.isEmpty was then "   Adding ${n} ${now}\n"
+                            else "   Updating ${n} ${was} -> ${now}\n"))
+                   ()
+                   moved
+               in if dryRun then
+                    (let x =
+                       writeOutput "warning: not updating the lock file, as this is a dry run\n"
+                     in True)
+                  else
+                    match R.settle r lang with
+                    | Err why -> (let x = sayError why in False)
+                    | Ok _ -> True
+
 -- A truth, as an option is given one on a command line or in a manifest.
 @pub fun asBool (value : String) : Maybe Bool =
   if V.elem value ["true", "True", "yes", "on", "1"] then Just True
@@ -1248,7 +1338,7 @@ def settings : [String] = ["sources", "manifest"]
 def optional : [String] =
   [
     "compile", "dependencies", "files", "parallel", "link", "overrides", "pinned", "parts",
-    "compilePart", "assemble"
+    "compilePart", "assemble", "lock", "cache", "cacheEnv"
   ]
 
 -- An option's type: a truth, a number, a text, maybe one of the last two,
@@ -1572,6 +1662,14 @@ fun textCode (s : String) : String =
                    [Fail
                       "a build needs `compile`, or `parts` with `compilePart` and `assemble`"
                       Nowhere]
+                 else if has "lock" and not (has "dependencies") then
+                   [Fail
+                      "a build with a `lock` fetches what its manifests depend on, and says how a manifest names it: `dependencies`, which answers each as a `Dep`"
+                      Nowhere]
+                 else if (has "cache" or has "cacheEnv") and not (has "lock") then
+                   [Fail
+                      "`cache` and `cacheEnv` say where a build with a `lock` keeps what it fetches"
+                      Nowhere]
                  else
                    match V.find
                      (\s -> fst (fst s) == "parallel" and not (V.elem (snd s) ["true", "false"]))
@@ -1606,10 +1704,50 @@ fun written (pub : Bool) (name : String) (lang : String) ss declared profiles (o
           let key = if withOpts then "(lingua${name}_compileKey o)" else "0" in
           "(\\o u -> LinguaMake.inParts ${if given "parallel" == Just "false" then "False" else "True"} ${key} (\\lingua_s -> ${ps} lingua_s) (\\lingua_p -> ${get "compilePart"} ${o}lingua_p) (\\lingua_u lingua_ps -> ${get "assemble"} ${o}lingua_u lingua_ps) LinguaMake.encodeReflect LinguaMake.decodeReflect u)"
   in
+  -- A build with a lock file resolves what its manifests name, by
+  -- `lingua_resolver`, before it reads the units they are.
+  let lock = given "lock" in
+  let deps =
+    \f ->
+      if M.isSome lock then
+        "Just (\\r d t -> LinguaMake.resolvedDirs lingua_resolver d (${f} r d t))"
+      else "Just (\\r d t -> ${f} r d t)"
+  in
   let unitsIn =
     \sub ->
-      "{ manifest = \"${get "manifest"}\", ext = \"${get "sources"}\", sub = ${sub}, deps = ${M.unwrapOr "None" (M.map (\f -> "Just (\\r d t -> ${f} r d t)") (given "dependencies"))}, files = ${M.unwrapOr "None" (M.map (\f -> "Just (\\d -> ${f} d)") (given "files"))} }"
+      "{ manifest = \"${get "manifest"}\", ext = \"${get "sources"}\", sub = ${sub}, deps = ${M.unwrapOr "None" (M.map deps (given "dependencies"))}, files = ${M.unwrapOr "None" (M.map (\f -> "Just (\\d -> ${f} d)") (given "files"))} }"
   in
+  let resolverWith =
+    \args ->
+      "LinguaMake.resolverOf \"${M.unwrapOr "~/.${lang}/git" (given "cache")}\" \"${get "cacheEnv"}\" \"${get "lock"}\" root ${args}"
+  in
+  -- What a build with a lock file does first: resolve, and settle the lock.
+  let settle =
+    \sub ->
+      if M.isSome lock then
+        "let lingua_resolver = ${resolverWith "lingua_offline lingua_locked False []"} in\n  if not (LinguaMake.settled lingua_resolver \"${lang}\" (${unitsIn sub}) root) then False\n  else\n  "
+      else ""
+  in
+  -- What it was compiled from is read with what is in the cache alone.
+  let givenResolver =
+    if M.isSome lock then "let lingua_resolver = ${resolverWith "True False False []"} in\n  "
+    else ""
+  in
+  let withName = if M.isSome lock then "With" else "" in
+  let flags = if M.isSome lock then "(lingua_offline : Bool) (lingua_locked : Bool) " else "" in
+  -- The build as it is called without the flags, and the update.
+  let lockCode = \params args -> if M.isNone lock then "" else "
+-- ${lang}'s build, fetching what it must, and with the lock file `${get "lock"}`
+-- kept as it resolved: `build${name}With` not `offline` and not `locked`.
+${vis}fun build${name} ${params}(root : String) = build${name}With False False ${args}root
+
+-- ${lang}'s update: what the units depend on brought to the newest each
+-- manifest takes -- those in `lingua_names`, or every one when it is empty --
+-- what moved said, and the lock file written unless it is a dry run.
+${vis}fun update${name} (root : String) (lingua_names : [String]) (lingua_dryRun : Bool) =
+  let lingua_resolver = ${resolverWith "False False True lingua_names"} in
+  LinguaMake.updated lingua_resolver \"${lang}\" (${unitsIn "\"\""}) root lingua_names lingua_dryRun
+" in
   let unknown =
     V.concatMap
       (\pr ->
@@ -1640,14 +1778,14 @@ fun written (pub : Bool) (name : String) (lang : String) ss declared profiles (o
      else if V.isEmpty declared then [Code "use Lingua.Make as LinguaMake
 
 -- ${lang}'s build: the unit at `root` and every unit it depends on, each
--- compiled only if what it would be compiled from has changed.
-${vis}fun build${name} (root : String) =
-  LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "\"\""}) root LinguaMake.noOptions ${compiled False} (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect
+-- compiled only if what it would be compiled from has changed.${if M.isSome lock then " Offline, it\n-- reaches no network: what it depends on must be in the cache. Locked, it\n-- fails rather than change the lock file." else ""}
+${vis}fun build${name}${withName} ${flags}(root : String) =
+  ${settle "\"\""}LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "\"\""}) root LinguaMake.noOptions ${compiled False} (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect
 
 -- What the unit at `dir` was compiled from in `root`'s last build.
 ${vis}fun given${name} (root : String) (dir : String) =
-  LinguaMake.givenOf (${unitsIn "\"\""}) root dir LinguaMake.decodeReflect
-"]
+  ${givenResolver}LinguaMake.givenOf (${unitsIn "\"\""}) root dir LinguaMake.decodeReflect
+${lockCode "" ""}"]
      else
        -- A build with options and no profile written has one, `debug`: what
        -- the options are by default.
@@ -1669,20 +1807,20 @@ ${vis}fun given${name} (root : String) (dir : String) =
 -- ${lang}'s build, as profile `lingua_profile` and with `lingua_set` over
 -- it: the unit at `root` and every unit it depends on, each compiled with
 -- its own options and only if what it would be compiled from -- those
--- among it -- has changed. What it builds is under `target/<profile>`.
-${vis}fun build${name} (lingua_profile : String) (lingua_set : [(String, String)]) (root : String) =
+-- among it -- has changed. What it builds is under `target/<profile>`.${if M.isSome lock then " Offline,\n-- it reaches no network: what it depends on must be in the cache. Locked, it\n-- fails rather than change the lock file." else ""}
+${vis}fun build${name}${withName} ${flags}(lingua_profile : String) (lingua_set : [(String, String)]) (root : String) =
   match ${lower}Profile lingua_profile with
   | None -> (let lingua_u = LinguaMake.sayError \"${lang} has no profile `\${lingua_profile}`: it has \${LinguaS.join \", \" ${lower}Profiles}\" in False)
   | Just lingua_base ->
-      LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "lingua_profile"}) root
+      ${settle "lingua_profile"}LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "lingua_profile"}) root
         { resolve = \\lingua_dir lingua_manifest -> (let lingua_r = (match ${lower}With lingua_base ${over} with | Err lingua_e -> Err lingua_e | Ok lingua_o -> ${lower}With lingua_o lingua_set) in ${last}), compileKey = lingua${name}_compileKey, linkKey = lingua${name}_linkKey }
         ${compiled True} (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} o l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect
 
 -- What the unit at `dir` was compiled from in `root`'s last build as that
 -- profile.
 ${vis}fun given${name} (lingua_profile : String) (root : String) (dir : String) =
-  LinguaMake.givenOf (${unitsIn "lingua_profile"}) root dir LinguaMake.decodeReflect
-"]]
+  ${givenResolver}LinguaMake.givenOf (${unitsIn "lingua_profile"}) root dir LinguaMake.decodeReflect
+${lockCode "(lingua_profile : String) (lingua_set : [(String, String)]) " "lingua_profile lingua_set "}"]]
 
 -- --- tests ---------------------------------------------
 
