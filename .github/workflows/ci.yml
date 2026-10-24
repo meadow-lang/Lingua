@@ -33,6 +33,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Meadow (nightly)
+        # The installer asks GitHub's API for the release; with a token it is
+        # not held to the limit on unauthenticated requests.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           curl -fsSL https://raw.githubusercontent.com/meadow-lang/meadow/master/scripts/meadowup-init.sh | sh -s -- --version nightly
           echo "$HOME/.meadow/bin" >> "$GITHUB_PATH"
