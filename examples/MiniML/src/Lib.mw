@@ -54,6 +54,7 @@ mod Units
 mod Bench
 mod Tool
 mod Debug
+mod Blocks
 
 use Lingua (cli!)
 use Lingua.Diagnostic (renderToOutput)

@@ -1,0 +1,188 @@
+-- A language whose blocks are laid out, as Idyll's and Haskell's are: for
+-- `format!`'s tests of a grammar that a layout pass reads.
+--
+-- A file is a block of bindings, `name = value`, and `let` opens a block of
+-- them that `in` -- or a line further left -- closes. A block's column is its
+-- first token's; a line that starts at it is its next item, and one further
+-- right goes on with the line before. The layout pass puts that into the
+-- tokens as tokens with no text, where the block or the item starts: `vopen`,
+-- `vsemi` and `vclose`. So the formatter must keep a block's items at its
+-- column and write those tokens as nothing.
+
+use Lingua (syntax!, format!)
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Maybe as M
+
+@derive(Debug, PartialEq)
+@pub data Token
+  = Name
+  | Equals
+  | Let
+  | In
+  | Open
+  | Semi
+  | Close
+  | Space
+
+fun isSpace (c : String) : Bool = c == " " or c == "\n" or c == "\t" or c == "\r"
+
+fun isNameChar (c : String) : Bool = not (S.isEmpty c) and not (isSpace c) and c != "="
+
+fun spanWhile (p : String -> Bool) (input : String) (i : Int) : Int =
+  if i < stringByteLength input and p (stringSlice input i (i + 1)) then spanWhile p input (i + 1)
+  else i
+
+-- The tokens as written, each with the bytes it covers.
+fun raw (input : String) : [(Token, Int, Int)] = rawFrom input 0 []
+
+fun rawFrom (input : String) (i : Int) (out : [(Token, Int, Int)]) : [(Token, Int, Int)] =
+  if i >= stringByteLength input then out
+  else
+    let c = stringSlice input i (i + 1) in
+    if isSpace c then
+      let j = spanWhile isSpace input i in
+      rawFrom input j (V.pushBack out (Token.Space, i, j))
+    else if c == "=" then rawFrom input (i + 1) (V.pushBack out (Token.Equals, i, i + 1))
+    else
+      let j = spanWhile isNameChar input i in
+      let w = stringSlice input i j in
+      let t = if w == "let" then Token.Let else if w == "in" then Token.In else Token.Name in
+      rawFrom input j (V.pushBack out (t, i, j))
+
+fun columnOf (input : String) (at : Int) : Int =
+  if at <= 0 or stringSlice input (at - 1) at == "\n" then 0 else 1 + columnOf input (at - 1)
+
+-- The blocks a line starting at `col` closes, and the item it begins if it
+-- starts at the column of the block it is then in.
+fun closeTo (out : [(Token, Int, Int)]) (stack : [(Int, Bool)]) (col : Int) (at : Int) =
+  match V.last stack with
+  | Just (c, _) ->
+      if c > col then
+        closeTo (V.pushBack out (Token.Close, at, at)) (V.take stack (V.len stack - 1)) col at
+      else if c == col then (V.pushBack out (Token.Semi, at, at), stack)
+      else (out, stack)
+  | None -> (out, stack)
+
+-- The tokens laid out: each block's column on a stack, and whether `let`
+-- opened it.
+fun laid (input : String) : [(Token, Int, Int)] =
+  let step =
+    \acc x ->
+      match (acc, x) with
+      | ((out, stack, afterLet, lineStart), (t, from, to)) ->
+          if t == Token.Space then
+            (
+              V.pushBack out x,
+              stack,
+              afterLet,
+              lineStart or S.contains "\n" (stringSlice input from to)
+            )
+          else
+            let col = columnOf input from in
+            let opened =
+              if afterLet or V.isEmpty stack then
+                (V.pushBack out (Token.Open, from, from), V.pushBack stack (col, afterLet))
+              else if lineStart then closeTo out stack col from
+              else (out, stack)
+            in
+            let closed =
+              (match (t, V.last (snd opened)) with
+               | (Token.In, Just (_, True)) ->
+                   (
+                     V.pushBack (fst opened) (Token.Close, from, from),
+                     V.take (snd opened) (V.len (snd opened) - 1)
+                   )
+               | _ -> opened)
+            in (V.pushBack (fst closed) x, snd closed, t == Token.Let, False)
+  in
+  let n = stringByteLength input in
+  match V.foldl step ([], [], False, True) (raw input) with
+  | (out, stack, _, _) -> V.foldl (\o s -> V.pushBack o (Token.Close, n, n)) out stack
+
+@pub fun foldToken f acc (input : String) =
+  Ok (V.foldl (\a x -> match x with | (t, from, to) -> f a t from to) acc (laid input))
+
+syntax! {
+  Blocks
+  lexer Token
+  trivia { Space }
+  tokens {
+    "name" = Name, "=" = Equals, "let" = Let, "in" = In, "vopen" = Open, "vsemi" = Semi,
+    "vclose" = Close
+  }
+  grammar {
+    File = open:"vopen" entries:Entry* close:"vclose"
+    Entry = Bind | Sep
+    Sep = sep:"vsemi"
+    Bind = name:"name" "=" value:Expr
+    Expr = LetE | Var
+    LetE = "let" open:"vopen" entries:Entry* close:"vclose" "in" body:Expr
+    Var = name:"name"
+  }
+}
+
+-- A block's items a line each, at its column; a binding's value after its
+-- `=`, or under it a level in; a `let`'s bindings after it, or under it.
+-- The file has no rule, and is written as it was, but for its bindings.
+format! {
+  Laid for Blocks
+  indent 2
+  width 40
+    | Sep = newline sep tight
+    | Bind = name "=" indent(line value)
+    | LetE = "let" open indent(line entries) close "in" body
+}
+
+-- The same, and the file laid out by a rule of its own.
+format! {
+  LaidFile for Blocks
+  indent 2
+  width 40
+    | File = open entries close
+    | Sep = newline sep tight
+    | Bind = name "=" indent(line value)
+    | LetE = "let" open indent(line entries) close "in" body
+}
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertEq)
+
+fun words (input : String) : [String] =
+  V.concatMap
+    (\x ->
+      match x with
+      | (t, from, to) -> if t == Token.Space then [] else [stringSlice input from to])
+    (raw input)
+
+fun errorsIn (input : String) : Int = match parseBlocks input with | (_, errs) -> V.len errs
+
+-- Laid out by both formatters, which should agree; read back with nothing
+-- wrong, the same words in the same order, and laid out again the same.
+fun both (src : String) =
+  let a = formatLaid (fst (parseBlocks src)) in
+  let b = formatLaidFile (fst (parseBlocks src)) in
+  let x = assertEq b a "a file's rule lays it out as it was written" in
+  let y = assertEq (errorsIn a, words a) (0, words src) "read back, the same program" in
+  let z = assertEq (formatLaid (fst (parseBlocks a))) a "laid out twice is laid out once" in
+  a
+
+@test fun aBlockThatFitsGoesOnOneLine () =
+  let a = assertEq (errorsIn "x = let a = 1 in a\n") 0 "the layout reads it" in
+  assertEq
+    (both "x = let   a = 1  in a\n")
+    "x = let a = 1 in a\n"
+    "a token with no text parts nothing"
+
+@test fun aBlocksItemsAreEachALineAtItsColumn () =
+  assertEq
+    (both "x = let a = 1\n        b = 2 in a\n\ny = z\n")
+    "x =\n  let\n    a = 1\n    b = 2 in a\n\ny = z\n"
+    "the second binding at the first's column, and the blank line between the files' kept, once"
+
+@test fun aBlankLineBetweenItemsIsKeptOnce () =
+  assertEq
+    (both "x = y\n\n\n\nz = w\nv = u\n")
+    "x = y\n\nz = w\nv = u\n"
+    "one blank line, and none where there was none"
