@@ -708,3 +708,82 @@ pass! {
            got
            [CoreExprKind.Literal, CoreExprKind.Prim, CoreExprKind.Prim]
            "the `let`'s value, and the sum twice"
+
+-- --- a fold --------------------------------------------------------------------
+--
+-- A pass that answers a value rather than a language: the cases are where
+-- something is found, or the context changes, and every other node answers
+-- its children's answers put together, left to right.
+
+-- Every name a program binds or uses, in the order written: only the
+-- productions that hold a name need a case. A `fun` answers its pattern's
+-- names and then its body's.
+pass! {
+  namesIn : Shapes -> [String] fold [] V.append
+    | Expr.Var { name } -> [name]
+    | Pat.Var { name } -> [name]
+    | Wild {} -> ["_"]
+}
+
+-- The names used and not bound, with the names bound around as the
+-- context: a `fun` folds its body with its pattern's names in it.
+pass! {
+  freeIn : Shapes -> [String] with bound fold [] V.append
+    | Expr.Var { name } -> if V.elem name bound then [] else [name]
+    | Pat.Var { name } -> [name]
+    | Lam { param, later body } -> body (V.append bound param)
+}
+
+-- `fun _ -> y`.
+fun openOne () : ShapesProgram =
+  runSt (\() ->
+    let b = Shapes.newBuilder () in
+    let wild = Shapes.Pat.newWild b noMeta in
+    let y = Shapes.Expr.newVar b noMeta "y" in
+    let root = Shapes.Expr.newLam b noMeta wild y in
+    ShapesProgram (Shapes.freeze b) root)
+
+@test fun aFoldAnswersItsChildrenPutTogetherWhereItHasNoCase () =
+  let a =
+    assertEq (namesIn (nested ())) ["x", "_", "x"] "the same as the `match` by hand, `names`"
+  in assertEq
+       (freeIn [] (nested ()), freeIn [] (openOne ()))
+       ([], ["y"])
+       "a `fun` binds its name in its body"
+
+-- From a tree: the names a program refers to, in the order written -- a
+-- `let`'s own name is a `Name`, not a reference -- and whether it calls
+-- anything, a fold of truths.
+pass! {
+  referred : Calc -> [String] fold [] V.append
+    | NameRef { ident } -> [ident]
+}
+
+pass! {
+  calls : Calc -> Bool fold False (\a b -> a or b)
+    | Call {} -> True
+}
+
+@test fun aFoldReadsATreeAsItIs () =
+  match parseCalc "let x = a + f(b, c);\ng(x * 2);" with
+  | (g, _) ->
+      let a = assertEq (referred (R.root g)) ["a", "f", "b", "c", "g", "x"] "left to right" in
+      (match parseCalc "let x = 1 + 2;" with
+       | (h, _) ->
+           assertEq (calls (R.root g), calls (R.root h)) (True, False) "a call is found anywhere")
+
+-- A fold of part of a program, with a context: how deep in parentheses each
+-- number is, for an expression.
+pass! {
+  depthsOf : Calc -> [Int] with depth from Expr fold [] V.append
+    | Literal {} -> [depth]
+    | Paren { later expr } -> expr (depth + 1)
+}
+
+@test fun aFoldMayStartPartOfTheWayDownWithAContext () =
+  match parseCalc "(1 + (2)) * 3;" with
+  | (g, _) ->
+      (match exprOf g 0 with
+       | Just e ->
+           assertEq (depthsOfExpr () 0 e) [1, 2, 0] "each number, how many parentheses it is in"
+       | None -> assertEq "an expression" "" "the statement's")
