@@ -77,7 +77,11 @@ Its formatter rule names the same things in the same order:
 | (nothing)   | a single space                                                            |
 
 A rule as a whole is a group. When several separators come in a row the
-strongest wins, in the order `newline`, `line`, `cut`, `tight`.
+strongest wins, in the order `newline`, `line`, `cut`, `tight`. A separator
+that a rule begins or ends with belongs to the parent: it separates that node
+from whatever is next to it, and it counts in the run of separators there. A
+child whose rule begins with one gets no extra space before it, and one whose
+rule ends with one gets none after it.
 
 `indent` and `group` are layout only when followed by parentheses. Anywhere
 else they are a child's name, so a grammar may label a child `group`.
@@ -143,6 +147,41 @@ x
 Line breaking is done by [Pretty](https://github.com/meadow-lang/Pretty),
 Wadler's printer.
 
+### Layout-sensitive grammars
+
+Where indentation is part of the syntax, as in Idyll or Haskell, a layout pass
+between the lexer and the parser usually inserts tokens with no text: one
+where a block opens, one where each item starts, one where the block closes.
+The formatter writes such a token as nothing, and nothing gets separated
+around it either. The separators on each side apply as if it weren't there.
+Three rules are enough to keep each block's items at the block's column:
+
+```meadow
+format! {
+  Laid for Blocks
+  indent 2
+  width 40
+    | Sep  = newline sep tight
+    | Bind = name "=" indent(line value)
+    | LetE = "let" open indent(line entries) close "in" body
+}
+```
+
+`Sep`, the layout's `;`, is a separator and nothing more. Between two items it
+is exactly one line break, so every item starts a line at the same level.
+`open` and `close` print nothing, so `let a = 1 in a` stays on one line.
+Two bindings break it:
+
+```text
+x =
+  let
+    a = 1
+    b = 2 in a
+```
+
+[Blocks.mw](../examples/MiniML/src/Blocks.mw) has the layout pass, the grammar
+and tests that read the result back as the same program.
+
 ### Without a width: indenting only
 
 Leave `width` out and the formatter never moves a line break. It only sets each
@@ -206,7 +245,10 @@ by the tests for both whole and broken programs.
 - **A trailing newline is kept** if the text had one. A line that would be
   nothing but its indent is left empty.
 - When laying out, a node with no rule keeps one blank line between two
-  things; a longer run of blank lines becomes one.
+  things; a longer run of blank lines becomes one. A node with a rule keeps
+  one in the same way between two items of a child that is many, such as a
+  file's declarations. A line break a child's rule asks for is not added on
+  top of one the text already has.
 
 ## The next line's indent
 
