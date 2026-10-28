@@ -109,6 +109,30 @@
 -- met, say -- is a side table, `Lingua.Table`: an effect a case performs and
 -- whoever runs the pass handles once, not a parameter every case passes on.
 --
+-- A pass may also **fold** a program into a value -- the names it mentions,
+-- whether it calls anything -- rather than write a language:
+--
+--   pass! {
+--     mentions : Elaborated -> [Int] with depth from Term
+--     fold [] V.append
+--     | Opaque { unique } -> [unique]
+--     | Lam { later body } -> body (depth + 1)
+--     | Var { index } -> if index >= depth then [index - depth] else []
+--   }
+--
+-- After the arrow is the answer's type, which only says what it is: `fold`
+-- gives the answer of nothing and how two answers are put together, each a
+-- name -- `V.append`, `HashSet.empty` -- a literal or something in brackets,
+-- `(\a b -> a or b)`. A production with no case answers its children's
+-- answers put together, in the order of its fields, from the answer of
+-- nothing: a field that is no node -- a name, a number -- answers nothing.
+-- So a pass's cases are only where something is found or the context
+-- changes. A case takes fields as any pass's does, its children's answers
+-- already folded, `later` or `raw`; and each function, `mentionsTerm src
+-- depth child`, has no target to write into, so no `out`. From a tree, a
+-- node that is not what its rule says answers nothing, or what the pass says
+-- (`| Stmt _ -> …`).
+--
 -- A pass may also go from a **grammar** -- the tree `syntax!` parses, read as
 -- it is, with nothing copied out of it into tables:
 --
@@ -1441,38 +1465,87 @@ def rooted : Parser Tokens [Named] =
           |> keep named
           |> keep (P.many (P.skipThen (punct ",") named))))
 
--- A call: whether it is public, its name, the languages it goes between,
--- its context, the sorts it starts at, and its cases.
-type PassCall = (Bool, Named, Named, Named, Maybe String, [Named], [Case])
+-- A call: whether it is public, its name, the language it reads, what it
+-- answers -- a language, or a fold's type -- its context, the sorts it
+-- starts at, its fold's nothing and putting together, and its cases.
+type PassCall = (Bool, Named, Named, [TokenTree], Maybe String, [Named], Maybe [TokenTree], [Case])
 
 def passCall : Parser Tokens PassCall =
-  P.pure (\pub name src dst ctx roots cs -> (M.isSome pub, name, src, dst, ctx, roots, cs))
+  P.pure (\pub name src dst ctx roots fold cs ->
+    (M.isSome pub, name, src, dst, ctx, roots, fold, cs))
     |> keep (P.optional (keyword "pub"))
     |> keep named
     |> skip (punct ":")
     |> keep named
     |> skip (punct "->")
-    |> keep named
+    |> keep (treesUntil answerEnds)
     |> keep (P.optional (P.skipThen (keyword "with") ident))
     |> keep rooted
+    |> keep (P.optional folding)
     |> keep (P.many caseP)
+
+-- Where what a pass answers ends: at the next part of the call.
+fun answerEnds (t : TokenTree) : Bool =
+  match t with
+  | Word w _ -> V.elem w ["with", "from", "fold"]
+  | _ -> isPunct "|" t
+
+-- `fold [] V.append`: the answer of nothing, and how two are put together,
+-- as they were written -- told apart once read (`foldParts`).
+def folding : Parser Tokens [TokenTree] = P.skipThen (keyword "fold") (treesUntil (isPunct "|"))
+
+-- What `fold` says, in its two parts: the first a name, maybe through
+-- modules -- `HashSet.empty` -- or any one thing, a literal or something in
+-- brackets; the second the rest.
+fun foldParts (ts : [TokenTree]) : ([TokenTree], [TokenTree]) =
+  let n = dottedFrom ts 1 in (V.take ts n, V.drop ts n)
+
+fun dottedFrom (ts : [TokenTree]) (i : Int) : Int =
+  match (V.get ts i, V.get ts (i + 1)) with
+  | (Just dot, Just (Word _ _)) -> if isPunct "." dot then dottedFrom ts (i + 2) else i
+  | _ -> i
 
 @macro
 @pub fun pass (ts : [TokenTree]) : [TokenTree] ! { Expand | e } =
   match parseTokens passCall ts with
   | Err failed -> failed
-  | Ok (pub, name, src, dst, ctx, roots, cases) ->
-      match (lookupAs (fst src), lookupAs (fst dst)) with
-      | (Err _, _) -> [Fail "no language is called `${fst src}`" (snd src)]
-      | (_, Err _) -> [Fail "no language is called `${fst dst}`" (snd dst)]
-      | (Ok from, Ok to) ->
-          match rootProblems from to roots with
-          | Just failed -> failed
-          | None ->
-              let starts = V.map fst roots in
-              match passProblems name from to starts cases with
-              | Just failed -> failed
-              | None -> passCode (if pub then "@pub " else "") (fst name) ctx from to starts cases
+  | Ok (pub, name, src, answer, ctx, roots, fold, cases) ->
+      let vis = if pub then "@pub " else "" in
+      match fold with
+      | Just said ->
+          (match (foldParts said, lookupAs (fst src)) with
+           | ((_, []), _) ->
+               [Fail
+                  "`fold` says the answer of nothing and how two answers are put together: `fold [] V.append`"
+                  (M.unwrapOr (snd name) (M.map spanOf (V.get said 0)))]
+           | (_, Err _) -> [Fail "no language is called `${fst src}`" (snd src)]
+           | ((empty, combine), Ok from) ->
+               (match foldProblems from roots cases with
+                | Just failed -> failed
+                | None -> foldCode vis (fst name) ctx from (V.map fst roots) empty combine cases))
+      | None ->
+          let dst =
+            (match (V.len answer, V.get answer 0) with
+             | (1, Just (Word d at)) -> Ok (d, at)
+             | (_, Just t) -> Err (spanOf t)
+             | (_, None) -> Err (snd name))
+          in match dst with
+             | Err at ->
+                 [Fail
+                    "a pass writes a language, `${fst name} : ${fst src} -> Core`, or folds into a value, which says `fold` and the answer of nothing and how two are put together: `fold [] V.append`"
+                    at]
+             | Ok dst ->
+                 match (lookupAs (fst src), lookupAs (fst dst)) with
+                 | (Err _, _) -> [Fail "no language is called `${fst src}`" (snd src)]
+                 | (_, Err _) -> [Fail "no language is called `${fst dst}`" (snd dst)]
+                 | (Ok from, Ok to) ->
+                     match rootProblems from to roots with
+                     | Just failed -> failed
+                     | None ->
+                         let starts = V.map fst roots in
+                         match passProblems name from to starts cases with
+                         | Just failed -> failed
+                         | None -> passCode vis (fst name) ctx from to starts cases
 
 -- What a pass cannot start at: a sort its source does not have -- and
 -- anything, when it writes a tree, which has a function for every sort
@@ -1500,28 +1573,7 @@ fun passProblems name from to (starts : [String]) cases =
          (snd name)]
     else []
   in
-  let unknown =
-    V.concatMap
-      (\c ->
-        match c with
-        | Case p at fs _ _ _ ->
-            if isOtherwise c then
-              (if M.isSome (findSort from (otherwiseSort c)) then []
-               else [Fail "`${langName from}` has no sort `${otherwiseSort c}`" at])
-            else
-              (let found = meant from p in
-               match V.get found 0 with
-               | None -> [Fail "`${langName from}` has no production `${p}`" at]
-               | Just (_, prod) ->
-                   if V.len found > 1 then [Fail (whichOf from p found) at]
-                   else
-                     V.concatMap
-                       (\f ->
-                         if V.any (\g -> fieldName g == fst f) (prodFields prod) then []
-                         else [Fail "`${p}` has no field `${fst f}`" (snd f)])
-                       fs))
-      cases
-  in
+  let unknown = unknownCases from cases in
   let uncovered =
     V.concatMap
       (\s ->
@@ -1555,6 +1607,30 @@ fun passProblems name from to (starts : [String]) cases =
   in match V.get (V.concat [direction, unknown, uncovered, unkept]) 0 with
      | Just f -> Just [f]
      | None -> None
+
+-- The cases for what `from` does not have: a sort, a production -- or one
+-- two sorts have, not said which -- or a field.
+fun unknownCases from cases =
+  V.concatMap
+    (\c ->
+      match c with
+      | Case p at fs _ _ _ ->
+          if isOtherwise c then
+            (if M.isSome (findSort from (otherwiseSort c)) then []
+             else [Fail "`${langName from}` has no sort `${otherwiseSort c}`" at])
+          else
+            (let found = meant from p in
+             match V.get found 0 with
+             | None -> [Fail "`${langName from}` has no production `${p}`" at]
+             | Just (_, prod) ->
+                 if V.len found > 1 then [Fail (whichOf from p found) at]
+                 else
+                   V.concatMap
+                     (\f ->
+                       if V.any (\g -> fieldName g == fst f) (prodFields prod) then []
+                       else [Fail "`${p}` has no field `${fst f}`" (snd f)])
+                     fs))
+    cases
 
 fun caseName c = match c with | Case p _ _ _ _ _ -> p
 
@@ -1776,6 +1852,208 @@ fun laterOf ctx (tr : String -> Ty -> String -> String) (t : Ty) (v : String) : 
 
 fun fieldTyOf p n =
   M.unwrapOr (TPrim "") (M.map fieldTy (V.find (\f -> fieldName f == n) (prodFields p)))
+
+-- --- a fold ------------------------------------------------------------------
+--
+-- A sort's function answers its production's case, or its children's answers
+-- put together. The answer of nothing and the putting together are functions
+-- of their own, `lingua<pass>_empty ()` and `lingua<pass>_combine a b`, so
+-- that what `fold` says is written once.
+
+-- What a fold cannot be written for: a sort to start at, or a case, that its
+-- language does not have.
+fun foldProblems from (roots : [Named]) cases : Maybe [TokenTree] =
+  match V.find (\r -> M.isNone (findSort from (fst r))) roots with
+  | Just r -> Just [Fail "`${langName from}` has no sort `${fst r}`" (snd r)]
+  | None -> M.map (\f -> [f]) (V.get (unknownCases from cases) 0)
+
+fun foldCode pub pass ctx from (starts : [String]) empty combine cases : [TokenTree] =
+  let c = given ctx in
+  let root = langRoot from in
+  let sorts =
+    (let reached = reachable from (if V.isEmpty starts then [root] else starts) cases in
+     V.filter (\s -> V.elem (sortName s) reached) (langSorts from))
+  in
+  let tree = isTree from in
+  let entry =
+    if not (V.isEmpty starts) then ""
+    else if tree then
+      "\n-- `${pass}`: a `${langName from}` tree folded.\n${pub}fun ${pass} ${c}lingua_root = ${pass}${root} () ${c}lingua_root\n"
+    else
+      "\n-- `${pass}`: a `${langName from}` program folded.\n${pub}fun ${pass} ${c}lingua_p =\n  match lingua_p with\n  | ${langName from}Program lingua_a lingua_r -> ${pass}${root} lingua_a ${c}lingua_r\n"
+  in V.concat [
+       [
+         Code
+           ("use Std.Maybe as LinguaM\nuse Std.Collections.Vector as LinguaV\nuse Lingua.Lang as LinguaL\n"
+              ++ (if tree then "use Lingua.Red as LinguaR\n" else "")
+              ++ "\nfun lingua${pass}_empty () = "),
+         Group Paren empty Nowhere,
+         Code "\n\nfun lingua${pass}_combine lingua_a lingua_b = ",
+         Group Paren combine Nowhere,
+         Code " lingua_a lingua_b\n"
+       ],
+       V.concatMap
+         (\s ->
+           if tree then foldTreeSort pub pass ctx from cases s
+           else foldTableSort pub pass ctx from cases s)
+         sorts,
+       [Code entry]
+     ]
+
+fun foldEmpty pass = "lingua${pass}_empty ()"
+
+-- A child folded by the pass in context `c`: a node by its sort's function,
+-- a list or an option inside, anything else as it is -- or, from a tree, a
+-- token as its text.
+fun foldChild pass c tree t v =
+  match t with
+  | TSort n -> "${pass}${n} lingua_src ${c}(${v})"
+  | TMany x -> "LinguaV.map (\\y -> ${foldChild pass c tree x "y"}) (${v})"
+  | TOpt x -> "LinguaM.map (\\y -> ${foldChild pass c tree x "y"}) (${v})"
+  | TPrim _ -> if tree then "LinguaR.text (${v})" else v
+
+-- `acc` with what child `v` answers put after it: a node's answer, each of
+-- several in turn, one that may be missing if it is there, and nothing for
+-- what is not a node. `d` keeps the names of nested lists apart.
+fun foldInto pass c (t : Ty) (v : String) (acc : String) (d : Int) : String =
+  match t with
+  | TSort n -> "lingua${pass}_combine (${acc}) (${pass}${n} lingua_src ${c}(${v}))"
+  | TMany x ->
+      "LinguaV.foldl (\\lingua_a${show d} lingua_y${show d} -> ${foldInto pass c x "lingua_y${show d}" "lingua_a${show d}" (d + 1)}) (${acc}) (${v})"
+  | TOpt x ->
+      "(let lingua_a${show d} = ${acc} in LinguaM.unwrapOr lingua_a${show d} (LinguaM.map (\\lingua_y${show d} -> ${foldInto pass c x "lingua_y${show d}" "lingua_a${show d}" (d + 1)}) (${v})))"
+  | TPrim _ -> acc
+
+-- A field a case names, bound: folded already, taken `later` -- a function
+-- from a context to the child folded in it -- or `raw`, as the source has it.
+fun foldBind pass ctx tree p lates raws (n : String) (v : String) : String =
+  let t = fieldTyOf p n in
+  if V.elem n raws then "let ${n} = ${v} in "
+  else if V.elem n lates then
+    "let ${n} = ${laterOf ctx (\c x w -> foldChild pass c tree x w) t v} in "
+  else "let ${n} = ${foldChild pass (given ctx) tree t v} in "
+
+fun foldTableSort pub pass ctx from cases s : [TokenTree] =
+  let st = "${langName from}${sortName s}" in
+  let head =
+    "\n${pub}fun ${pass}${sortName s} (lingua_src : ${arenaTy from}) ${given ctx}lingua_x ="
+  in if V.isEmpty (sortProds s) then [Code "${head} ${foldEmpty pass}\n"]
+     else
+       V.concat [
+         [Code "${head}\n  match kind${st} lingua_src lingua_x with"],
+         V.concatMap (\p -> foldTableArm pass ctx from cases s p) (sortProds s),
+         [Code "\n"]
+       ]
+
+fun foldTableArm pass ctx from cases s p : [TokenTree] =
+  let st = "${langName from}${sortName s}" in
+  let c = given ctx in
+  let fl = lowerFirst (langName from) in
+  let read = \f -> "${fl}${prodId s p}${upperFirst f} lingua_src lingua_x" in
+  match V.find (isFor s p) cases with
+  | Just (Case _ _ fs lates raws body) ->
+      let here =
+        if mentions "here" body then
+          "let here = LinguaL.spanMeta (${fl}Start lingua_src lingua_x) (${fl}End lingua_src lingua_x) in "
+        else ""
+      in
+      let src = if mentions "src" body then "let src = lingua_src in " else "" in
+      let node = if mentions "node" body then "let node = lingua_x in " else "" in
+      let binds =
+        S.join "" (V.map (\f -> foldBind pass ctx False p lates raws (fst f) (read (fst f))) fs)
+      in [
+           Code "\n  | ${st}Kind.${prodName p} -> ${here}${src}${node}${binds}",
+           Group Paren body Nowhere
+         ]
+  | None ->
+      [Code
+         "\n  | ${st}Kind.${prodName p} -> ${V.foldl (\acc f -> foldInto pass c (fieldTy f) (read (fieldName f)) acc 0) (foldEmpty pass) (prodFields p)}"]
+
+fun foldTreeSort pub pass ctx from cases s : [TokenTree] =
+  -- What a node that is none of the sort's productions answers: what the
+  -- pass says, `| Stmt _ -> …`, or nothing.
+  let fallback =
+    (match V.find (\c -> isOtherwise c and otherwiseSort c == sortName s) cases with
+     | Just (Case _ _ _ _ _ body) -> [Group Paren body Nowhere]
+     | None -> [Code (foldEmpty pass)])
+  in
+  let prods = sortProds s in
+  let arms =
+    if V.len prods == 1 then V.concatMap (\p -> foldTreeArm pass ctx from cases s p fallback) prods
+    else
+      V.concat [
+        [Code "match lingua_k with"],
+        V.concatMap
+          (\p ->
+            V.concatMap
+              (\k -> V.concat [[Code " | ${k} -> "], foldTreeArm pass ctx from cases s p fallback])
+              (kindsOfProd from p))
+          prods,
+        [Code " | _ -> "],
+        fallback
+      ]
+  in V.concat [
+       [Code
+          "\n${pub}fun ${pass}${sortName s} lingua_src ${given ctx}lingua_x =\n  let lingua_k = LinguaR.kindOf lingua_x in\n  "],
+       arms,
+       [Code "\n"]
+     ]
+
+fun foldTreeArm pass ctx from cases s p fallback : [TokenTree] =
+  let c = given ctx in
+  let fields = prodFields p in
+  let inner = innerEnum from p in
+  let open =
+    if inner then "let lingua_f0 = lingua_x in "
+    else
+      "match lingua_x with | ${langName from}${prodName p}${S.join "" (V.map (\i -> " lingua_f${show i}") (V.range 0 (V.len fields)))} -> "
+  in
+  let close = if inner then [] else V.pushFront fallback (Code " | _ -> ") in
+  let at =
+    \n ->
+      M.unwrapOr
+        0
+        (V.find (\j -> M.map fieldName (V.get fields j) == Just n) (V.range 0 (V.len fields)))
+  in match V.find (isFor s p) cases with
+     | Just (Case _ _ fs lates raws body) ->
+         let here =
+           if mentions "here" body then
+             "let here = LinguaL.spanMeta (LinguaR.offset lingua_x) (LinguaR.endOffset lingua_x) in "
+           else ""
+         in
+         let node = if mentions "node" body then "let node = lingua_x in " else "" in
+         let binds =
+           S.join
+             ""
+             (V.map
+                (\f -> foldBind pass ctx True p lates raws (fst f) "lingua_f${show (at (fst f))}")
+                fs)
+         in [Group
+               Paren
+               (V.concat [[Code (open ++ here ++ node ++ binds), Group Paren body Nowhere], close])
+               Nowhere]
+     | None ->
+         if inner then [Code "${pass}${prodName p} lingua_src ${c}lingua_x"]
+         else
+           [Group
+              Paren
+              (V.concat [
+                 [Code
+                    (open
+                       ++ V.foldl
+                         (\acc i ->
+                           foldInto
+                             pass
+                             c
+                             (M.unwrapOr (TPrim "") (M.map fieldTy (V.get fields i)))
+                             "lingua_f${show i}"
+                             acc
+                             0)
+                         (foldEmpty pass)
+                         (V.range 0 (V.len fields)))],
+                 close
+               ])
+              Nowhere]
 
 -- --- a pass from a tree ------------------------------------------------------
 --

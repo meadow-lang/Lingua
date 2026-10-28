@@ -1,9 +1,10 @@
 # Passes: what is automatic, and the newer parts of `pass!`
 
 [DESIGN.md §5](DESIGN.md#5-lang-and-pass) introduces `pass!`, contexts, `later`
-and `raw`. This guide covers what a pass does without being told, and four
+and `raw`. This guide covers what a pass does without being told, and five
 later additions: saying which sort a case is for, `node`, cases that answer
-something other than a node, and passes that start partway down a program.
+something other than a node, passes that start partway down a program, and
+passes that fold a program into a value.
 
 ## What a pass does on its own
 
@@ -195,3 +196,61 @@ production the target changed before it compiles at all.
 - A pass that writes a **tree** cannot be rooted. It already has a function for
   every sort, so there is nothing for `from` to choose, and saying it is an
   error.
+
+## A pass that folds: `fold`
+
+Some passes don't write a language. They collect something from a program: the
+names it mentions, the constants it uses, whether it calls anything. Written as
+an ordinary pass, every production needs a case, so the pass is no shorter than
+the `match` it replaces. `fold` gives the answer for nothing and a way to put
+two answers together. Then a production with no case answers its children's
+answers put together:
+
+```meadow
+pass! {
+  mentions : Elaborated -> [Int] with depth from Term
+    fold [] V.append
+    | Opaque { unique } -> [unique]
+    | Lam { later body } -> body (depth + 1)
+    | Var { index } -> if index >= depth then [index - depth] else []
+}
+```
+
+- **After the arrow is the answer's type.** It documents what the pass
+  answers, and nothing checks it.
+- **`fold` takes two parts.** The first is a name, possibly qualified by
+  modules (`[]`, `0`, `HashSet.empty`), a literal, or something in brackets.
+  Everything after it, up to the first case, is the second part: `V.append`,
+  `HashSet.union`, `(\a b -> a or b)`.
+- **A production with no case** answers its children's answers combined from
+  left to right, in field order, starting from the empty answer:
+  `combine (combine empty first) second`. A list field adds each element in
+  turn. An optional field adds its answer when it is present. A field that
+  isn't a node, such as a name, a number or a token, adds nothing. Because the
+  order is left to right, an answer that depends on order, like names in order
+  of first appearance, comes out in source order.
+- **A case** takes fields the same way any case does: already folded, `later`
+  (a function from a context to the child's answer, for a binder), or `raw`.
+  It may use `here`, `node` and `src`. There is no `out`, because a fold
+  writes no target.
+- **From a tree**, a node that doesn't match its rule answers the empty
+  answer, unless the pass says otherwise with `| Stmt _ -> …`.
+
+With `from`, a fold has a function for each sort it reaches and no entry point.
+Each function takes the source, the context if there is one, and the node:
+`mentionsTerm src depth node`. From a tree, `src` is `()`. A whole fold's entry
+point is `mentions depth program`, or `mentions depth root` for a tree.
+
+A truth is a fold too:
+
+```meadow
+pass! {
+  calls : Calc -> Bool
+    fold False (\a b -> a or b)
+    | Call {} -> True
+}
+```
+
+The tests in [the Calc example](../examples/Calc/src/Lib.mw) cover both table
+and tree languages, a context with `later`, and `from`.
+
