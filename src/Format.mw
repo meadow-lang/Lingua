@@ -522,11 +522,12 @@ fun breaksOf (strength : Int) : Int =
 -- text had, which a break that follows drops, how far in the line the text
 -- broke to was written, and how far in the line being written is set.
 fun writtenDoc (st : Style k) (s : Syntax k) : Doc () =
-  match writtenParts st s with | (d, n) -> breaksAfter d n
+  match writtenParts st s with | (d, n, _) -> breaksAfter d n
 
 -- A node no rule is for, as `writtenDoc` writes it, but for the breaks it
--- ends with: how many, for what holds it to write as a parting.
-fun writtenParts (st : Style k) (s : Syntax k) : (Doc (), Int) =
+-- ends with: how many, for what holds it to write as a parting, and whether a
+-- rule asked for them.
+fun writtenParts (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
   let all = R.children s in
   let base = indentOfLine (sourceOf st) (R.offset s) in
   let blank = \c -> (triviaOf st) (R.kindOf c) and S.isEmpty (S.trim (R.text c)) in
@@ -539,81 +540,111 @@ fun writtenParts (st : Style k) (s : Syntax k) : (Doc (), Int) =
       (V.range 0 (V.len all))
   in match (V.get solid 0, V.last solid) with
      | (Just first, Just last) ->
-         -- What is written so far with `d` after it, which begins with
-         -- `opens` breaks of its own: what to go on with -- the text so far,
-         -- and how far in the line it ends on is set.
-         let put =
-           \acc opens d ->
-             match acc with
-             | (doc, owed, broke, gap, col, cur) ->
-                 let n = max 0 (owed - broke - opens) in
-                 let fresh = owed > 0 or broke > 0 or opens > 0 in
-                 let set =
-                   if not fresh then cur else if opens > 0 or col < 0 then 0 else max 0 (col - base)
-                 in
-                 let lead = if fresh then breaksAfter PP.nil n else PP.text gap in
-                 (PP.append doc (PP.nest set (PP.append lead d)), set)
+         -- What is written so far, `doc`; the breaks owed, and whether a rule
+         -- asked for them; how many it ends with already; the space the text
+         -- had, which a break that follows drops; how far in the line the
+         -- text broke to was written; how far in the line being written is
+         -- set; and whether anything is written yet, before which blank space
+         -- is no one's.
+         let start =
+           {
+             doc = PP.nil,
+             owed = 0,
+             asked = False,
+             broke = 0,
+             gap = "",
+             col = 0 - 1,
+             cur = 0,
+             shown = False
+           }
          in
-         let written =
-           \acc opens d ->
-             (match put acc opens d with
-              | (doc, set) -> (doc, 0, 0, "", 0 - 1, set))
+         -- `d` written next, which begins with `opens` breaks of its own. A
+         -- line a rule broke to -- the layout's `;` before it, say -- or one
+         -- that begins with a break of its own is set in as what is around it
+         -- says. A line only the text broke to goes on with the one before:
+         -- it is as far in from the node's first line as it was, and further
+         -- in than that line by a level at least -- at its column, in a
+         -- language whose layout is part of its meaning, it would be a new
+         -- item.
+         let put =
+           \w opens d ->
+             let n = max 0 (w.owed - w.broke - opens) in
+             let fresh = w.owed > 0 or w.broke > 0 or opens > 0 in
+             let set =
+               if not fresh then w.cur
+               else if opens > 0 or w.asked or w.col < 0 then 0
+               else max (w.col - base) (unitOf st)
+             in
+             let lead =
+               if fresh then breaksAfter PP.nil n else PP.text (if w.shown then w.gap else "")
+             in {
+                  w | doc = PP.append w.doc (PP.nest set (PP.append lead d)),
+                  owed = 0,
+                  asked = False,
+                  broke = 0,
+                  gap = "",
+                  col = 0 - 1,
+                  cur = set,
+                  shown = True
+                }
          in
          let step =
-           \acc i ->
-             match (acc, V.get all i) with
-             | (_, None) -> acc
-             | ((doc, owed, broke, gap, col, cur), Just c) ->
+           \w i ->
+             match V.get all i with
+             | None -> w
+             | Just c ->
                  if (triviaOf st) (R.kindOf c) then
                    let t = R.text c in
-                   if not (S.isEmpty (S.trim t)) then written acc 0 (PP.text (S.trim t))
+                   if not (S.isEmpty (S.trim t)) then
+                     -- A comment on a line of its own between two items is
+                     -- neither's: the next line is set in as it would be.
+                     (let after = put w 0 (PP.text (S.trim t)) in { after | asked = w.asked })
                    else
                      let lines = S.split "\n" t in
                      let n = min 2 (V.len lines - 1) in
-                     if n == 0 then
-                       (if owed > 0 or broke > 0 then acc else (doc, owed, broke, t, col, cur))
+                     if n == 0 then (if w.owed > 0 or w.broke > 0 then w else { w | gap = t })
                      else
-                       (
-                         doc,
-                         max owed n,
-                         broke,
-                         "",
-                         stringByteLength (V.getOr "" lines (V.len lines - 1)),
-                         cur
-                       )
+                       {
+                         w | owed = max w.owed n,
+                         gap = "",
+                         col = stringByteLength (V.getOr "" lines (V.len lines - 1))
+                       }
                  else if R.isTokenOf c then
-                   (if S.isEmpty (R.text c) then acc else written acc 0 (PP.text (R.text c)))
+                   (if S.isEmpty (R.text c) then w else put w 0 (PP.text (R.text c)))
                  else
                    match HashMap.lookup (kindName st c) (rulesOf st) with
                    | None ->
                        (match writtenParts st c with
-                        | (d, n) ->
-                            (match put acc 0 d with
-                             | (doc2, set) -> (doc2, n, 0, "", 0 - 1, set)))
+                        | (d, n, a) -> (let after = put w 0 d in { after | owed = n, asked = a }))
                    | Just elems ->
                        (match ruledParts st c elems with
                         | (lead, body, trail) ->
-                            let owing = max owed (breaksOf lead) in
-                            (match body with
-                             | Just (d, opens, closes) ->
-                                 (match put
-                                    (doc, owing, broke, gap, col, cur)
-                                    (breaksOf opens)
-                                    d with
-                                  | (doc2, set) ->
-                                      (doc2, breaksOf trail, breaksOf closes, "", 0 - 1, set))
-                             | None -> (doc, max owing (breaksOf trail), broke, gap, col, cur)))
+                            let led =
+                              if breaksOf lead > 0 then
+                                { w | owed = max w.owed (breaksOf lead), asked = True }
+                              else w
+                            in (match body with
+                                | Just (d, opens, closes) ->
+                                    let after = put led (breaksOf opens) d in
+                                    {
+                                      after | owed = breaksOf trail,
+                                      asked = breaksOf trail > 0 or breaksOf closes > 0,
+                                      broke = breaksOf closes
+                                    }
+                                | None ->
+                                    if breaksOf trail > 0 then
+                                      { led | owed = max led.owed (breaksOf trail), asked = True }
+                                    else led))
          in
-         let body =
-           (match V.foldl step (PP.nil, 0, 0, "", 0 - 1, 0) (V.range first (last + 1)) with
-            | (doc, owed, broke, _, _, _) -> (doc, max 0 (owed - broke)))
-         in
+         let w = V.foldl step start (V.range first (last + 1)) in
+         let n = max 0 (w.owed - w.broke) in
          let endsInComment =
            (match V.get all last with
             | Just c -> (triviaOf st) (R.kindOf c)
             | None -> False)
-         in if endsInComment and M.isSome (R.parent s) then (fst body, max 1 (snd body)) else body
-     | _ -> (PP.nil, 0)
+         in if endsInComment and M.isSome (R.parent s) then (w.doc, max 1 n, w.asked)
+            else (w.doc, n, w.asked)
+     | _ -> (PP.nil, 0, False)
 
 -- How far in the line of `t` that `at` is on starts: its spaces and tabs.
 fun indentOfLine (t : String) (at : Int) : Int =
@@ -852,7 +883,7 @@ fun kidItem
            match HashMap.lookup (kindName st c) (rulesOf st) with
            | None ->
                (match writtenParts st c with
-                | (d, n) ->
+                | (d, n, _) ->
                     V.append
                       [Written level (commented d) none none]
                       (if n > 0 then [Parting (if n > 1 then blanking else breaking) level]

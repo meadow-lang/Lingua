@@ -291,12 +291,16 @@ by the tests for both whole and broken programs.
   one in the same way between two items of a child that is many, such as a
   file's declarations. A line break a child's rule asks for is not added on
   top of one the text already has.
-- **A node with no rule keeps how far in each of its lines was.** A line it
-  breaks to is set in by as much as it was further in than the line the node
-  began on, on top of whatever sets in the node. A line at or left of that line
-  gets nothing extra. In a layout language a line further in continues the one
-  before, so this keeps what the program means. A child whose rule begins
-  with a line break is the exception: its rule sets it in.
+- **A node with no rule keeps how far in each of its lines was.** A line the
+  text breaks to, and no rule asked for, continues the line before. It is set
+  in by as much as it was further in than the line the node began on, and by
+  at least one level, on top of whatever sets in the node. In a layout
+  language a line at the node's own column would be a new item, never a
+  continuation. A line a rule broke to (a layout `;`, say, or a child whose
+  rule begins with a break) is set in as the rules say. That holds after a
+  comment on a line of its own, too.
+- **Blank space before anything is written** is dropped. So a text whose
+  first line is indented is set out whole, on the first run.
 
 ## The next line's indent
 
