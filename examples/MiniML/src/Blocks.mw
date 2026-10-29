@@ -1,8 +1,10 @@
 -- A language whose blocks are laid out, as Idyll's and Haskell's are: for
 -- `format!`'s tests of a grammar that a layout pass reads.
 --
--- A file is a block of bindings, `name = value`, and `let` opens a block of
--- them that `in` -- or a line further left -- closes. A block's column is its
+-- A file is a block of bindings, `name = value` -- or a name and guards,
+-- `| cond = value`, each on a line further in -- and `let` opens a block of
+-- them that `in` -- or a line further left -- closes. A value may be a chain
+-- of names, `a -> b -> c`. A block's column is its
 -- first token's; a line that starts at it is its next item, and one further
 -- right goes on with the line before. The layout pass puts that into the
 -- tokens as tokens with no text, where the block or the item starts: `vopen`,
@@ -13,6 +15,7 @@ use Lingua (syntax!, format!)
 use Std.Collections.Vector as V
 use Std.String as S
 use Std.Maybe as M
+use Lingua.Green (Green)
 
 @derive(Debug, PartialEq)
 @pub data Token
@@ -24,10 +27,12 @@ use Std.Maybe as M
   | Semi
   | Close
   | Space
+  | Bar
+  | Arrow
 
 fun isSpace (c : String) : Bool = c == " " or c == "\n" or c == "\t" or c == "\r"
 
-fun isNameChar (c : String) : Bool = not (S.isEmpty c) and not (isSpace c) and c != "="
+fun isNameChar (c : String) : Bool = not (S.isEmpty c) and not (isSpace c) and c != "=" and c != "|"
 
 fun spanWhile (p : String -> Bool) (input : String) (i : Int) : Int =
   if i < stringByteLength input and p (stringSlice input i (i + 1)) then spanWhile p input (i + 1)
@@ -44,6 +49,9 @@ fun rawFrom (input : String) (i : Int) (out : [(Token, Int, Int)]) : [(Token, In
       let j = spanWhile isSpace input i in
       rawFrom input j (V.pushBack out (Token.Space, i, j))
     else if c == "=" then rawFrom input (i + 1) (V.pushBack out (Token.Equals, i, i + 1))
+    else if c == "|" then rawFrom input (i + 1) (V.pushBack out (Token.Bar, i, i + 1))
+    else if stringSlice input i (i + 2) == "->" then
+      rawFrom input (i + 2) (V.pushBack out (Token.Arrow, i, i + 2))
     else
       let j = spanWhile isNameChar input i in
       let w = stringSlice input i j in
@@ -109,14 +117,18 @@ syntax! {
   trivia { Space }
   tokens {
     "name" = Name, "=" = Equals, "let" = Let, "in" = In, "vopen" = Open, "vsemi" = Semi,
-    "vclose" = Close
+    "vclose" = Close, "|" = Bar, "->" = Arrow
   }
   grammar {
     File = open:"vopen" entries:Entry* close:"vclose"
-    Entry = Bind | Sep
+    Entry = Bind | Sep | Guarded
     Sep = sep:"vsemi"
     Bind = name:"name" "=" value:Expr
-    Expr = LetE | Var
+    Guarded = name:"name" guards:Guards
+    Guards = arms:Guard*
+    Guard = "|" cond:Var "=" value:Expr
+    Expr = LetE | Var | Chain
+    Chain = from:Var "->" to:Expr
     LetE = "let" open:"vopen" entries:Entry* close:"vclose" "in" body:Expr
     Var = name:"name"
   }
@@ -132,6 +144,8 @@ format! {
     | Sep = newline sep tight
     | Bind = name "=" indent(line value)
     | LetE = "let" open indent(line entries) close "in" body
+    | Guards = indent(arms)
+    | Guard = newline "|" cond "=" indent(line value)
 }
 
 -- The same, and the file laid out by a rule of its own.
@@ -143,6 +157,40 @@ format! {
     | Sep = newline sep tight
     | Bind = name "=" indent(line value)
     | LetE = "let" open indent(line entries) close "in" body
+    | Guards = indent(arms)
+    | Guard = newline "|" cond "=" indent(line value)
+}
+
+-- A binding too long for its line set out as Idyll sets out a signature:
+-- the `=` three columns in and each `->` two, so that what follows each
+-- starts in one column. `nogroup`: a chain is not a group of its own, so the
+-- whole of it breaks as the binding does -- not the outer link alone.
+format! {
+  Hung for Blocks
+  indent 2
+  width 30
+    | Sep = newline sep tight
+    | Bind = name indent 2(line indent 1("=") value)
+    | Chain = nogroup from line "->" to
+}
+
+-- A binding with no rule: written as it was, each line it broke to as far
+-- in from the line it began on as it was.
+format! {
+  Bare for Blocks
+  indent 2
+  width 40
+    | Sep = newline sep tight
+}
+
+-- The same with each link of the chain a group of its own.
+format! {
+  HungGrouped for Blocks
+  indent 2
+  width 30
+    | Sep = newline sep tight
+    | Bind = name indent 2(line indent 1("=") value)
+    | Chain = from line "->" to
 }
 
 -- --- tests -------------------------------------------------------------------
@@ -186,3 +234,50 @@ fun both (src : String) =
     (both "x = y\n\n\n\nz = w\nv = u\n")
     "x = y\n\nz = w\nv = u\n"
     "one blank line, and none where there was none"
+
+@test fun aChildsBreakALevelInStandsWithTheTextsBreak () =
+  -- `Guards` is a level in and each `Guard` begins with a break, inside a
+  -- binding with no rule: the break the text had and the guard's are one.
+  let a =
+    assertEq
+      (both "f\n    | a = b\n    | c = d\n")
+      "f\n  | a = b\n  | c = d\n"
+      "no blank line before the first guard"
+  in assertEq
+       (both "f\n\n  | a = b\n  | c = d\ng = h\n")
+       "f\n\n  | a = b\n  | c = d\ng = h\n"
+       "and the one the text had kept, once"
+
+-- Laid out by one formatter: read back, the same words, laid out
+-- again the same.
+fun laidBy (format : Green Blocks -> String) (src : String) =
+  let a = format (fst (parseBlocks src)) in
+  let y = assertEq (errorsIn a, words a) (0, words src) "read back, the same program" in
+  let z = assertEq (format (fst (parseBlocks a))) a "laid out twice is laid out once" in
+  a
+
+@test fun aPartMayBeSetInByColumnsAndAChainBreakAsOne () =
+  let long = "x = aaaaaaaaaa -> bbbbbbbbbb -> cccccccccc -> dddddddddd\n" in
+  let a =
+    assertEq (laidBy formatHung "x = a -> b\n") "x = a -> b\n" "what fits stays on its line"
+  in
+  let b =
+    assertEq
+      (laidBy formatHung long)
+      "x\n   = aaaaaaaaaa\n  -> bbbbbbbbbb\n  -> cccccccccc\n  -> dddddddddd\n"
+      "the `=` three in, each `->` two, every link broken"
+  in assertEq
+       (laidBy formatHungGrouped long)
+       "x\n   = aaaaaaaaaa\n  -> bbbbbbbbbb\n  -> cccccccccc -> dddddddddd\n"
+       "a link that is a group of its own goes on one line where it fits"
+
+@test fun aLineANodeWithNoRuleBrokeToKeepsHowFarInItWas () =
+  let a =
+    assertEq
+      (laidBy formatBare "x\n  = a -> b\n")
+      "x\n  = a -> b\n"
+      "the `=` still further in than the name, so the binding goes on"
+  in assertEq
+       (laidBy formatLaid "x = a ->\n      b -> c\n")
+       "x =\n  a ->\n        b -> c\n"
+       "the chain's second line as far in from its first as it was, under the value's level"
