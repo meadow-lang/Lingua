@@ -274,7 +274,15 @@ by the tests for both whole and broken programs.
   missing a child lays out what is there. `let x =\n(1 +\nin x` still gets its
   value indented.
 - **Comments keep a line of their own** before what they were written before.
-  A comment inside a node breaks whatever group holds it.
+  A comment inside a node breaks whatever group holds it. A comment written at
+  the end of a line, after the token before it, stays at the end of that
+  line, with a line break after it.
+- **An `indent(…)` with nothing in it** writes nothing, including the
+  separators inside it. So `indent(newline entries)` with no entries adds no
+  line break.
+- **Text the lexer skipped**, such as blank space before the first token that
+  a layout pass doesn't hand over, is trivia. The parser keeps it as
+  `Unknown`.
 - **It is idempotent.** Formatting twice gives what formatting once did.
 - **A trailing newline is kept** if the text had one. A line that would be
   nothing but its indent is left empty.
