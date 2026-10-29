@@ -6,7 +6,7 @@
 use Lingua (lsp!, repl!)
 use Lingua.Green (Green)
 use Lingua.Repl (Reply)
-use Lingua.Lsp (Asked, positionIn)
+use Lingua.Lsp (Asked, positionIn, pathOf)
 use Std.Json as J
 use Std.String as S
 use Lingua.Red (Syntax)
@@ -25,6 +25,7 @@ use Std.Result.Result.*
 
 lsp! {
   pub Server "miniml" for Session threaded
+    | opened = placeOf
     | text = setSessionSource
     | diagnostics = diagnosticsOf
     | tree = treeOf
@@ -44,8 +45,13 @@ lsp! {
 def serverRequests =
   [
     ("miniml/type", \db (a : Asked) -> J.jString (typeIn db a.file)),
+    ("miniml/place", \db (a : Asked) -> J.jString (answered "" (\() -> sessionPlace db a.file))),
     ("textDocument/inlayHint", hintsOf)
   ]
+
+-- Where a file the editor opened is on the disk: what a language whose
+-- files are checked with their package's would read the rest of it from.
+fun placeOf db file uri = setSessionPlace db file (pathOf uri)
 
 fun typeIn db file = answered "" (\() -> match sessionTyped db file with | Ok t -> t | Err _ -> "")
 
@@ -630,3 +636,16 @@ fun opening (uri : String) (text : String) : Json =
     (S.contains "scratch> " out and V.len (S.split "42 : Int" out) == 3)
     True
     "under its own prompt; and what it kept begins the next line below, entered there too"
+
+@test fun theServerIsToldWhereAnOpenedFileIs () =
+  let said =
+    told
+      [
+        opening "file:///c%3A/work/a.ml" "1 + 2\n",
+        asking 1 "miniml/place" (inFile "file:///c%3A/work/a.ml")
+      ]
+      serveServerInTurn
+  in assertEq
+       (M.andThen (J.get "result") (V.get said 1))
+       (Just (J.jString "c:/work/a.ml"))
+       "its path"
