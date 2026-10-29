@@ -69,6 +69,7 @@ Its formatter rule names the same things in the same order:
 | written     | meaning                                                                   |
 | ----------- | ------------------------------------------------------------------------- |
 | `indent(…)` | what it encloses is one level in from where the node began                |
+| `indent 3(…)` | what it encloses is 3 columns in; `indent -1(…)` is one column out      |
 | `group(…)`  | what it encloses goes on one line if it fits, and breaks together if not  |
 | `line`      | a space, or a line break where its group breaks                           |
 | `cut`       | nothing, or a line break where its group breaks                           |
@@ -81,10 +82,42 @@ strongest wins, in the order `newline`, `line`, `cut`, `tight`. A separator
 that a rule begins or ends with belongs to the parent: it separates that node
 from whatever is next to it, and it counts in the run of separators there. A
 child whose rule begins with one gets no extra space before it, and one whose
-rule ends with one gets none after it.
+rule ends with one gets none after it. The same goes for a separator inside
+an `indent(…)` at the start or end of a rule: it stays inside, at that
+indentation, but a separator beside it adds only what it asks for beyond
+that. A line break there and a line break beside it make one line break.
 
-`indent` and `group` are layout only when followed by parentheses. Anywhere
-else they are a child's name, so a grammar may label a child `group`.
+`indent` and `group` are layout only when followed by parentheses, or by a
+number and parentheses. Anywhere else they are a child's name, so a grammar
+may label a child `group`.
+
+**`nogroup`.** A rule that begins with `nogroup` is not a group of its own.
+Its separators break when the enclosing group breaks. That is what a
+right-nested chain needs, such as `a -> b -> c` read as `a -> (b -> c)`. With
+each link a group, the outer link breaks and an inner one still fits, so the
+chain comes out half broken. With `nogroup` the whole chain breaks together:
+
+```meadow
+format! {
+  Hung for Blocks
+  indent 2
+  width 30
+    | Bind  = name indent 2(line indent 1("=") value)
+    | Chain = nogroup from line "->" to
+}
+```
+
+```text
+x
+   = aaaaaaaaaa
+  -> bbbbbbbbbb
+  -> cccccccccc
+  -> dddddddddd
+```
+
+The line break before `=` is set in to its own column (2 + 1), and the
+value's are set in to 2, so whatever follows `=` and each `->` starts in one
+column.
 
 **Not every rule needs one.** A node with no formatter rule is written as it
 was, with its line breaks where they were, set in by whatever is around it. A
@@ -211,7 +244,8 @@ y                           y
 ```
 
 In this mode `line`, `cut`, `newline` and `tight` say nothing, and a `group` is
-just what it encloses. Only `indent(…)` matters.
+just what it encloses. Only `indent(…)` matters, and `indent 3(…)`, which sets
+a line in by those columns rather than by a level.
 
 **A level is per line, not per node.** A line is set in by one level for each
 *line* on which a node began whose indented part the line starts in.
@@ -249,6 +283,12 @@ by the tests for both whole and broken programs.
   one in the same way between two items of a child that is many, such as a
   file's declarations. A line break a child's rule asks for is not added on
   top of one the text already has.
+- **A node with no rule keeps how far in each of its lines was.** A line it
+  breaks to is set in by as much as it was further in than the line the node
+  began on, on top of whatever sets in the node. A line at or left of that line
+  gets nothing extra. In a layout language a line further in continues the one
+  before, so this keeps what the program means. A child whose rule begins
+  with a line break is the exception: its rule sets it in.
 
 ## The next line's indent
 
@@ -315,7 +355,8 @@ one-line functions over it. The same module can be used by hand:
 | function                 | what it does                                   |
 | ------------------------ | ---------------------------------------------- |
 | `style unit width name trivia rules` | a formatter; `width` 0 for indent only |
-| `tok`, `child`, `indented`, `grouped` | the pieces of a rule            |
+| `tok`, `child`, `indented`, `indentedBy n`, `grouped` | the pieces of a rule |
+| `nogroup`                | a rule's first element, for one that is no group |
 | `line`, `cut`, `newline`, `tight`     | the separators                  |
 | `layout st g`            | what `format<Name>` calls when there is a width |
 | `reindent st g`          | what it calls when there is none               |
