@@ -7,15 +7,17 @@
 -- of names, `a -> b -> c`. A block's column is its
 -- first token's; a line that starts at it is its next item, and one further
 -- right goes on with the line before. The layout pass puts that into the
--- tokens as tokens with no text, where the block or the item starts: `vopen`,
--- `vsemi` and `vclose`. So the formatter must keep a block's items at its
--- column and write those tokens as nothing.
+-- tokens as tokens with no text, as Idyll's does: `vopen` where a block's
+-- first item starts, and `vsemi` -- and `vclose`, for a line further left --
+-- at the end of the line before, after a comment there. So the formatter
+-- must keep a block's items at its column and write those tokens as nothing.
+-- A comment runs from `--` to the end of its line.
 
 use Lingua (syntax!, format!)
 use Std.Collections.Vector as V
 use Std.String as S
 use Std.Maybe as M
-use Lingua.Green (Green)
+use Lingua.Green (Green, dump)
 
 @derive(Debug, PartialEq)
 @pub data Token
@@ -29,6 +31,7 @@ use Lingua.Green (Green)
   | Space
   | Bar
   | Arrow
+  | Comment
 
 fun isSpace (c : String) : Bool = c == " " or c == "\n" or c == "\t" or c == "\r"
 
@@ -48,6 +51,9 @@ fun rawFrom (input : String) (i : Int) (out : [(Token, Int, Int)]) : [(Token, In
     if isSpace c then
       let j = spanWhile isSpace input i in
       rawFrom input j (V.pushBack out (Token.Space, i, j))
+    else if stringSlice input i (i + 2) == "--" then
+      let j = spanWhile (\x -> x != "\n") input i in
+      rawFrom input j (V.pushBack out (Token.Comment, i, j))
     else if c == "=" then rawFrom input (i + 1) (V.pushBack out (Token.Equals, i, i + 1))
     else if c == "|" then rawFrom input (i + 1) (V.pushBack out (Token.Bar, i, i + 1))
     else if stringSlice input i (i + 2) == "->" then
@@ -63,14 +69,47 @@ fun columnOf (input : String) (at : Int) : Int =
 
 -- The blocks a line starting at `col` closes, and the item it begins if it
 -- starts at the column of the block it is then in.
-fun closeTo (out : [(Token, Int, Int)]) (stack : [(Int, Bool)]) (col : Int) (at : Int) =
+fun closeTo (out : [Token]) (stack : [(Int, Bool)]) (col : Int) =
   match V.last stack with
   | Just (c, _) ->
-      if c > col then
-        closeTo (V.pushBack out (Token.Close, at, at)) (V.take stack (V.len stack - 1)) col at
-      else if c == col then (V.pushBack out (Token.Semi, at, at), stack)
+      if c > col then closeTo (V.pushBack out Token.Close) (V.take stack (V.len stack - 1)) col
+      else if c == col then (V.pushBack out Token.Semi, stack)
       else (out, stack)
   | None -> (out, stack)
+
+-- `out` with `vs` put in where the line before ends: after its last token,
+-- and a comment on that line after it, if there is one.
+fun beforeSpace (input : String) (out : [(Token, Int, Int)]) (vs : [Token]) : [(Token, Int, Int)] =
+  let kindAt =
+    \i ->
+      (match V.get out i with
+       | Just (t, _, _) -> t
+       | None -> Token.Space)
+  in
+  let endAt = \i -> (match V.get out i with | Just (_, _, e) -> e | None -> 0) in
+  let solid =
+    V.foldl
+      (\last i -> if kindAt i == Token.Space or kindAt i == Token.Comment then last else i)
+      (0 - 1)
+      (V.range 0 (V.len out))
+  in
+  let sameLine =
+    \i ->
+      kindAt i == Token.Space
+        and not
+          (S.contains
+             "\n"
+             (match V.get out i with
+              | Just (_, f, t) -> stringSlice input f t
+              | None -> ""))
+  in
+  let keep =
+    if kindAt (solid + 1) == Token.Comment then solid + 2
+    else if sameLine (solid + 1) and kindAt (solid + 2) == Token.Comment then solid + 3
+    else solid + 1
+  in
+  let at = endAt (keep - 1) in
+  V.concat [V.take out keep, V.map (\t -> (t, at, at)) vs, V.drop out keep]
 
 -- The tokens laid out: each block's column on a stack, and whether `let`
 -- opened it.
@@ -79,7 +118,8 @@ fun laid (input : String) : [(Token, Int, Int)] =
     \acc x ->
       match (acc, x) with
       | ((out, stack, afterLet, lineStart), (t, from, to)) ->
-          if t == Token.Space then
+          if t == Token.Comment then (V.pushBack out x, stack, afterLet, lineStart)
+          else if t == Token.Space then
             (
               V.pushBack out x,
               stack,
@@ -91,7 +131,9 @@ fun laid (input : String) : [(Token, Int, Int)] =
             let opened =
               if afterLet or V.isEmpty stack then
                 (V.pushBack out (Token.Open, from, from), V.pushBack stack (col, afterLet))
-              else if lineStart then closeTo out stack col from
+              else if lineStart then
+                (match closeTo [] stack col with
+                 | (vs, rest) -> (beforeSpace input out vs, rest))
               else (out, stack)
             in
             let closed =
@@ -108,13 +150,22 @@ fun laid (input : String) : [(Token, Int, Int)] =
   match V.foldl step ([], [], False, True) (raw input) with
   | (out, stack, _, _) -> V.foldl (\o s -> V.pushBack o (Token.Close, n, n)) out stack
 
+-- The text before the first token, if it is blank space, is not given as a
+-- token -- as Idyll's layout does not -- so the parser has it as text it was
+-- not given.
 @pub fun foldToken f acc (input : String) =
-  Ok (V.foldl (\a x -> match x with | (t, from, to) -> f a t from to) acc (laid input))
+  Ok
+    (V.foldl
+       (\a x ->
+         match x with
+         | (t, from, to) -> if t == Token.Space and from == 0 then a else f a t from to)
+       acc
+       (laid input))
 
 syntax! {
   Blocks
   lexer Token
-  trivia { Space }
+  trivia { Space, Comment }
   tokens {
     "name" = Name, "=" = Equals, "let" = Let, "in" = In, "vopen" = Open, "vsemi" = Semi,
     "vclose" = Close, "|" = Bar, "->" = Arrow
@@ -181,6 +232,27 @@ format! {
   indent 2
   width 40
     | Sep = newline sep tight
+}
+
+-- Idyll's rules for a block: the layout's `;` after the item it ends -- a
+-- break after it -- and `in` on a line of its own when the `let` breaks.
+format! {
+  Trailing for Blocks
+  indent 2
+  width 40
+    | Sep = tight sep newline
+    | Bind = name "=" indent(line value)
+    | LetE = "let" open indent(line entries) close line "in" body
+}
+
+-- A `let`'s bindings always under it: and where it has none, nothing under it.
+format! {
+  Under for Blocks
+  indent 2
+  width 40
+    | Sep = newline sep tight
+    | Bind = name "=" indent(line value)
+    | LetE = "let" open indent(newline entries) close line "in" body
 }
 
 -- The same with each link of the chain a group of its own.
@@ -281,3 +353,37 @@ fun laidBy (format : Green Blocks -> String) (src : String) =
        (laidBy formatLaid "x = a ->\n      b -> c\n")
        "x =\n  a ->\n        b -> c\n"
        "the chain's second line as far in from its first as it was, under the value's level"
+
+@test fun aCommentAtTheEndOfALineStaysThereAndTheNextItemKeepsItsColumn () =
+  let src = "z = let x = 1 -- hi\n        y = 2\n     in x\n" in
+  let a =
+    assertEq
+      (laidBy formatLaid src)
+      "z =\n  let\n    x = 1 -- hi\n    y = 2 in x\n"
+      "the comment where it was, and `y` at `x`'s column"
+  in
+  let b =
+    assertEq
+      (laidBy formatTrailing src)
+      "z =\n  let\n    x = 1 -- hi\n    y = 2\n  in x\n"
+      "the same with the layout's `;` after the item"
+  in assertEq
+       (laidBy formatTrailing "z = let x = 1\n        -- note\n        y = 2\n     in x\n")
+       "z =\n  let\n    x = 1\n    -- note\n    y = 2\n  in x\n"
+       "a comment on a line of its own keeps it, at its item's column"
+
+@test fun aTextWhoseFirstLineIsSetInIsSetOutWhole () =
+  -- The blank space before the first token is not one the lexer gave: the
+  -- parser has it as text it was not given, and trivia.
+  assertEq (both "  x = a\n  y = b\n") "x = a\ny = b\n" "both lines at the left, still one block"
+
+@test fun anIndentWithNothingInItPartsNothing () =
+  let a =
+    assertEq
+      (laidBy formatUnder "x = let in a\n\ny = b\n")
+      "x = let in a\n\ny = b\n"
+      "no bindings, no break"
+  in assertEq
+       (laidBy formatUnder "x = let p = q in a\n")
+       "x =\n  let\n    p = q\n  in a\n"
+       "and with one, its break"

@@ -38,7 +38,8 @@
 -- not, a child laid out in its turn by its own rule. A node no rule is for is
 -- written as it was -- its breaks where they were, set in by what is around
 -- it -- so a formatter is written a rule at a time. A comment keeps a line of
--- its own before what it was written before, which breaks whatever holds it.
+-- its own before what it was written before, which breaks whatever holds it
+-- -- or, written at the end of a line, stays at its end, a break after it.
 -- A parting a rule begins or ends with parts its node from what is around it,
 -- and stands with the partings there: `Sep = newline sep tight` parts the
 -- items it is between by a break, and only that. Between two of the nodes a
@@ -521,6 +522,11 @@ fun breaksOf (strength : Int) : Int =
 -- text had, which a break that follows drops, how far in the line the text
 -- broke to was written, and how far in the line being written is set.
 fun writtenDoc (st : Style k) (s : Syntax k) : Doc () =
+  match writtenParts st s with | (d, n) -> breaksAfter d n
+
+-- A node no rule is for, as `writtenDoc` writes it, but for the breaks it
+-- ends with: how many, for what holds it to write as a parting.
+fun writtenParts (st : Style k) (s : Syntax k) : (Doc (), Int) =
   let all = R.children s in
   let base = indentOfLine (sourceOf st) (R.offset s) in
   let blank = \c -> (triviaOf st) (R.kindOf c) and S.isEmpty (S.trim (R.text c)) in
@@ -579,7 +585,11 @@ fun writtenDoc (st : Style k) (s : Syntax k) : Doc () =
                    (if S.isEmpty (R.text c) then acc else written acc 0 (PP.text (R.text c)))
                  else
                    match HashMap.lookup (kindName st c) (rulesOf st) with
-                   | None -> written acc 0 (writtenDoc st c)
+                   | None ->
+                       (match writtenParts st c with
+                        | (d, n) ->
+                            (match put acc 0 d with
+                             | (doc2, set) -> (doc2, n, 0, "", 0 - 1, set)))
                    | Just elems ->
                        (match ruledParts st c elems with
                         | (lead, body, trail) ->
@@ -596,14 +606,14 @@ fun writtenDoc (st : Style k) (s : Syntax k) : Doc () =
          in
          let body =
            (match V.foldl step (PP.nil, 0, 0, "", 0 - 1, 0) (V.range first (last + 1)) with
-            | (doc, owed, broke, _, _, _) -> breaksAfter doc (owed - broke))
+            | (doc, owed, broke, _, _, _) -> (doc, max 0 (owed - broke)))
          in
          let endsInComment =
            (match V.get all last with
             | Just c -> (triviaOf st) (R.kindOf c)
             | None -> False)
-         in if endsInComment and M.isSome (R.parent s) then PP.append body PP.hardline else body
-     | _ -> PP.nil
+         in if endsInComment and M.isSome (R.parent s) then (fst body, max 1 (snd body)) else body
+     | _ -> (PP.nil, 0)
 
 -- How far in the line of `t` that `at` is on starts: its spaces and tabs.
 fun indentOfLine (t : String) (at : Int) : Int =
@@ -641,7 +651,9 @@ fun ruledParts (st : Style k) (s : Syntax k) (elems : [Elem])
   let strength = \i -> (match i with | Parting n _ -> n | _ -> 0 - 1) in
   let leading = V.len (V.takeWhile outer items) in
   let middle = V.drop items leading in
-  let trailing = V.len (V.takeWhile outer (V.reverse middle)) in
+  -- What it ends with, at any level, parts it from what follows -- which a
+  -- break is set in as, whatever level it was written at.
+  let trailing = V.len (V.takeWhile isParting (V.reverse middle)) in
   let inner = V.take middle (V.len middle - trailing) in
   let strongest = \is -> V.foldl (\m i -> max m (strength i)) (0 - 1) is in
   (
@@ -650,6 +662,8 @@ fun ruledParts (st : Style k) (s : Syntax k) (elems : [Elem])
      else Just (asRule st elems inner, openingOf inner, closingOf inner)),
     strongest (V.drop middle (V.len middle - trailing))
   )
+
+fun isParting (i : Item) : Bool = match i with | Parting _ _ -> True | _ -> False
 
 fun ruledItems (st : Style k) (s : Syntax k) (elems : [Elem]) : [Item] =
   let all = R.children s in
@@ -688,10 +702,13 @@ fun itemsOf
     (leaf : Int)
     (taken : Int)
     : ([Item], Int, Int) =
+  -- What `indent(…)` encloses: nothing at all where it has nothing to
+  -- write -- an empty list -- not the partings around that nothing.
   let within =
     \out at done inner columns ->
       match itemsOf st all places kids found inner columns at done with
-      | (items, at2, done2) -> (V.append out items, at2, done2)
+      | (items, at2, done2) ->
+          if V.all isParting items then (out, at2, done2) else (V.append out items, at2, done2)
   in V.foldl
        (\acc e ->
          match acc with
@@ -704,19 +721,31 @@ fun itemsOf
               | Group inner ->
                   (match itemsOf st all places kids found inner 0 at done with
                    | (items, at2, done2) ->
-                       if V.isEmpty items then (out, at2, done2)
-                       else
-                         (
-                           V.pushBack
-                             out
-                             (Written
-                                level
-                                (PP.group (assemble st items))
-                                (openingOf items)
-                                (closingOf items)),
-                           at2,
-                           done2
-                         ))
+                       -- What it ends with parts it from what follows.
+                       let tail = V.len (V.takeWhile isParting (V.reverse items)) in
+                       let body = V.take items (V.len items - tail) in
+                       let after =
+                         V.map
+                           (\i ->
+                             match i with
+                             | Parting n _ -> Parting n level
+                             | other -> other)
+                           (V.drop items (V.len items - tail))
+                       in if V.isEmpty body then (V.append out after, at2, done2)
+                          else
+                            (
+                              V.concat [
+                                out,
+                                [Written
+                                   level
+                                   (PP.group (assemble st body))
+                                   (openingOf body)
+                                   (0 - 1)],
+                                after
+                              ],
+                              at2,
+                              done2
+                            ))
               | _ ->
                   let r = V.getOr absent found at in
                   if not (present r) then (out, at + 1, done)
@@ -767,7 +796,11 @@ fun closingOf (items : [Item]) : Int =
 
 -- Child `j`, with the comments written before it, each on a line of its own:
 -- the partings its rule begins and ends with, standing with those around it,
--- and what it writes. A token with no text is nothing -- but the comments.
+-- and what it writes. A token with no text is nothing -- but the comments. A
+-- comment on the line of what is before it stays at that line's end, and a
+-- break follows it. Nothing written ends with a break: a break written at the
+-- end of something is set in as what follows it is, not as itself, so a break
+-- after it is a parting, which what follows sets in.
 fun kidItem
     (st : Style k)
     (all : [Syntax k])
@@ -778,14 +811,38 @@ fun kidItem
     : [Item] =
   let at = V.getOr 0 places j in
   let before = (if j == 0 then 0 else V.getOr 0 places (j - 1) + 1) in
-  let comments = commentsIn all before at in
+  let textAt = \i -> M.unwrapOr "" (M.map R.text (V.get all i)) in
+  let found =
+    V.concatMap
+      (\i -> (let t = S.trim (textAt i) in if S.isEmpty t then [] else [(i, t)]))
+      (V.range before at)
+  in
+  let endsLine =
+    (match V.get found 0 with
+     | Just (i, _) -> j > 0 and not (V.any (\k -> S.contains "\n" (textAt k)) (V.range before i))
+     | None -> False)
+  in
+  let none = 0 - 1 in
+  let atEnd =
+    (match (endsLine, V.get found 0) with
+     | (True, Just (_, t)) -> [Written level (PP.text t) none none, Parting breaking level]
+     | _ -> [])
+  in
+  let comments = V.map snd (if endsLine then V.drop found 1 else found) in
   let commented =
     \own -> V.foldr (\c d -> PP.append (PP.append (PP.text c) PP.hardline) d) own comments
   in
-  let none = 0 - 1 in
   let onlyComments =
-    if V.isEmpty comments then [] else [Written level (commented PP.nil) none tightly]
-  in match V.get kids j with
+    if V.isEmpty comments then []
+    else
+      [
+        Written level (PP.intersperse (V.map PP.text comments) PP.hardline) none none,
+        Parting breaking level
+      ]
+  in
+  let opening = \opens -> if V.isEmpty comments then opens else none in
+  let own =
+    (match V.get kids j with
      | None -> []
      | Just c ->
          if R.isTokenOf c then
@@ -793,7 +850,13 @@ fun kidItem
             else [Written level (commented (PP.text (R.text c))) none none])
          else
            match HashMap.lookup (kindName st c) (rulesOf st) with
-           | None -> [Written level (commented (writtenDoc st c)) none none]
+           | None ->
+               (match writtenParts st c with
+                | (d, n) ->
+                    V.append
+                      [Written level (commented d) none none]
+                      (if n > 0 then [Parting (if n > 1 then blanking else breaking) level]
+                       else []))
            | Just elems ->
                (match ruledParts st c elems with
                 | (lead, body, trail) ->
@@ -801,14 +864,11 @@ fun kidItem
                       (if lead >= 0 then [Parting lead level] else []),
                       (match body with
                        | Just (d, opens, closes) ->
-                           [Written
-                              level
-                              (commented d)
-                              (if V.isEmpty comments then opens else none)
-                              closes]
+                           [Written level (commented d) (opening opens) closes]
                        | None -> onlyComments),
                       (if trail >= 0 then [Parting trail level] else [])
-                    ])
+                    ]))
+  in V.append atEnd own
 
 -- The trivia from child `from` up to `to` that is not blank: comments.
 fun commentsIn (all : [Syntax k]) (from : Int) (to : Int) : [String] =
@@ -1116,8 +1176,11 @@ fun quote (s : String) : String =
 
 fun formatCode pub name grammar (unit : Int) (width : Int) (trivia : [String]) (rules : [String])
     : [TokenTree] =
-  let isTrivia = S.join "" (V.map (\k -> " | ${grammar}.${k} -> True") trivia) in
-  [Code "use Lingua.Format as LinguaF
+  -- What the lexer skipped -- blank space before the first token, say --
+  -- the parser keeps as `Unknown`, and trivia.
+  let isTrivia =
+    S.join "" (V.map (\k -> " | ${grammar}.${k} -> True") (V.pushBack trivia "Unknown"))
+  in [Code "use Lingua.Format as LinguaF
 use Std.Collections.Vector as LinguaV
 
 -- `${name}`: how a ${grammar} tree is set out.
