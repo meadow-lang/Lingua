@@ -22,6 +22,7 @@ use Std.Result.Result.*
 database! {
   pub Session
     | input source (file : Int) : String
+    | input place (file : Int) : String
     | query parsed (file : Int) : (Green Mini, [(Int, String)]) = parseMini (querySource file)
     | query program (file : Int) : (Maybe CoreProgram, [Binder], [Diagnostic]) =
         compile [] (queryParsed file)

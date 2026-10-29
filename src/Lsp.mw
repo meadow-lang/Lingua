@@ -284,14 +284,77 @@ fun withText (d : Docs) (uri : String) (text : String) : (Docs, Int) =
 
 -- --- serving -----------------------------------------------------------------
 
--- A language server, until the editor says `exit`: `setText` told of every
--- edit, `diagnose` asked what is wrong in each open file after it, and
--- `answer` given every other request -- its method, the file it is about,
--- the file's text and the byte it points at -- answering `None` for one it
--- cannot. `own` are the methods the language answers itself, which may be
--- about no file, and `extra` what else it says the server can do.
-@pub fun serve name features (own : [String]) extra setText diagnose answer =
-  loop (name, features, own, extra) setText diagnose answer (emptyDocs ())
+-- A language server, until the editor says `exit`: `opened` told of each
+-- file the editor opens -- its number and its uri, before its text -- and
+-- `setText` of every edit, `diagnose` asked what is wrong in each open file
+-- after it, and `answer` given every other request -- its method, the file
+-- it is about, the file's text and the byte it points at -- answering `None`
+-- for one it cannot. `own` are the methods the language answers itself,
+-- which may be about no file, and `extra` what else it says the server can
+-- do.
+@pub fun serve name features (own : [String]) extra opened setText diagnose answer =
+  loop (name, features, own, extra) (edited opened setText) diagnose answer (emptyDocs ())
+
+-- What a server does with a file's text: told first where the file is, if
+-- the editor has just opened it.
+fun edited opened setText =
+  \opening file t ->
+    let u =
+      (match opening with
+       | Just uri -> opened file uri
+       | None -> ())
+    in setText file t
+
+-- The path of a `file:` uri, as the disk has it -- `file:///c%3A/a%20b` is
+-- `c:/a b` -- and any other uri as it is.
+@pub fun pathOf (uri : String) : String =
+  if not (S.startsWith "file://" uri) then uri
+  else
+    let p = decoded (S.drop uri 7) in
+    -- A drive's path is written after a `/`: `/c:/x`.
+    let cs = S.chars p in
+    if V.len cs >= 3 and V.getOr ' ' cs 0 == '/' and V.getOr ' ' cs 2 == ':' then S.drop p 1 else p
+
+-- `%XX` escapes as the bytes they are, read as UTF-8.
+fun decoded (s : String) : String =
+  let cs = S.chars s in
+  let hex = \i -> M.andThen (\c -> C.hexDigitToInt c) (V.get cs i) in
+  let rec go (i : Int) (bytes : [Int]) (out : [Char]) =
+    if i >= V.len cs then V.append out (utf8 bytes)
+    else
+      match (V.get cs i, hex (i + 1), hex (i + 2)) with
+      | (Just '%', Just a, Just b) -> go (i + 3) (V.pushBack bytes (a * 16 + b)) out
+      | (Just c, _, _) -> go (i + 1) [] (V.pushBack (V.append out (utf8 bytes)) c)
+      | _ -> out
+  in S.fromChars (go 0 [] [])
+
+-- The characters of UTF-8 bytes; a byte that begins none is itself.
+fun utf8 (bytes : [Int]) : [Char] =
+  let b = \i -> V.getOr 0 bytes i in
+  let rec go (i : Int) (out : [Char]) =
+    if i >= V.len bytes then out
+    else
+      let x = b i in
+      if x >= 240 and i + 3 < V.len bytes then
+        go
+          (i + 4)
+          (V.pushBack
+             out
+             (C.fromCode
+                ((x - 240) * 262144
+                   + (b (i + 1) - 128) * 4096
+                   + (b (i + 2) - 128) * 64
+                   + (b (i + 3) - 128))))
+      else if x >= 224 and i + 2 < V.len bytes then
+        go
+          (i + 3)
+          (V.pushBack
+             out
+             (C.fromCode ((x - 224) * 4096 + (b (i + 1) - 128) * 64 + (b (i + 2) - 128))))
+      else if x >= 192 and i + 1 < V.len bytes then
+        go (i + 2) (V.pushBack out (C.fromCode ((x - 192) * 64 + (b (i + 1) - 128))))
+      else go (i + 1) (V.pushBack out (C.fromCode x))
+  in go 0 []
 
 fun loop about setText diagnose answer docs =
   match about with
@@ -325,7 +388,9 @@ fun looping about name own setText diagnose answer docs =
             | Just t ->
                 (match withText docs uri t with
                  | (d2, file) ->
-                     (let u = setText file t in
+                     (let u =
+                        setText (if method == "textDocument/didOpen" then Just uri else None) file t
+                      in
                       let w = publishAll name diagnose d2 in
                       loop about setText diagnose answer d2)))
       else if method == "textDocument/didClose" then
@@ -407,6 +472,7 @@ data Arrived = Got Json | NoMore | Found Int
     features
     (own : [String])
     extra
+    opened
     setText
     diagnose
     answer
@@ -416,7 +482,7 @@ data Arrived = Got Json | NoMore | Found Int
   let reader = Thread.spawn (\() -> reading inbox) in
   attending
     (name, features, own, extra)
-    setText
+    (edited opened setText)
     diagnose
     answer
     interrupt
@@ -488,7 +554,12 @@ fun attending about setText diagnose answer interrupt allow inbox docs (edit : I
                     (let s = stopping working interrupt allow in
                      match withText docs uri t with
                      | (d2, file) ->
-                         let u = setText file t in
+                         let u =
+                           setText
+                             (if method == "textDocument/didOpen" then Just uri else None)
+                             file
+                             t
+                         in
                          let files = openFiles d2 in
                          let at = edit + 1 in
                          let task =
@@ -915,7 +986,7 @@ use Lingua.Pipe (named)
 def features : [String] =
   [
     "text", "diagnostics", "tree", "hover", "definition", "references", "completion", "symbols",
-    "format", "resolved", "requests", "capabilities"
+    "format", "resolved", "requests", "capabilities", "opened"
   ]
 
 -- `| hover = hoverAt`: a feature, where it was written, and the function.
@@ -986,6 +1057,7 @@ fun lspCode pub name lang db (threaded : Bool) fs =
     [${S.join ", " (V.map (\f -> "\"${fst (fst f)}\"") fs)}]
     (LinguaLsp.methodsOf ${requests})
     ${if has "capabilities" then fn "capabilities" else "[]"}
+    (\\file uri -> ${if has "opened" then "${fn "opened"} db file uri" else "()"})
     (\\file t -> ${fn "text"} db file t)
     (\\file -> ${if has "diagnostics" then "${fn "diagnostics"} db file" else "[]"})
     (\\docs method file t offset params ->
@@ -1071,6 +1143,7 @@ fun lengths () =
        ["text"]
        (methodsOf own)
        [("experimental", J.jBool True)]
+       (\file uri -> ())
        (\file t -> ())
        (\file -> [])
        (\docs method file t offset params ->
@@ -1129,7 +1202,7 @@ fun attended (arrived : [Arrived]) setText diagnose answer interrupt allow =
        (withOutput (\() ->
           attending
             ("test", ["text"], ["test/go"], [])
-            setText
+            (\o file t -> setText file t)
             diagnose
             answer
             interrupt
@@ -1212,3 +1285,53 @@ fun attended (arrived : [Arrived]) setText diagnose answer interrupt allow =
     (encode [((0, 0), 3, 0), ((0, 4), 2, 1), ((1, 2), 1, 5)])
     [0, 0, 3, 0, 0, 0, 4, 2, 1, 0, 1, 2, 1, 5, 0]
     "the same line from its column, the next from the start"
+
+@test fun aFileUriIsThePathOnTheDisk () =
+  assertEq
+    (V.map pathOf [
+       "file:///c%3A/Users/Chris%20M/a.idl",
+       "file:///home/x/caf%C3%A9.idl",
+       "file:///C:/x.idl",
+       "untitled:1"
+     ])
+    ["c:/Users/Chris M/a.idl", "/home/x/café.idl", "C:/x.idl", "untitled:1"]
+    "a drive's path without its `/`, escapes as what they are, and any other uri as it is"
+
+-- A server told where each file is when it is opened: it answers what it was
+-- told, in order, with each text it was given after.
+fun located () =
+  let seen = newRef [] in
+  let own = [("test/seen", \db (a : Asked) -> J.jString (S.join ", " (getRef seen)))] in
+  serve
+    "test"
+    ["text", "opened"]
+    (methodsOf own)
+    []
+    (\file uri -> setRef seen (V.pushBack (getRef seen) "${show file} at ${pathOf uri}"))
+    (\file t -> setRef seen (V.pushBack (getRef seen) "${show file} is ${t}"))
+    (\file -> [])
+    (\docs method file t offset params -> answered own () (asked docs method file t offset params))
+
+@test fun aServerIsToldWhereAFileIsBeforeItsText () =
+  let said =
+    told
+      [
+        opening "file:///w/a.idl" "one",
+        J.jObject [
+          ("jsonrpc", J.jString "2.0"),
+          ("method", J.jString "textDocument/didChange"),
+          (
+            "params",
+            J.jObject [
+              ("textDocument", J.jObject [("uri", J.jString "file:///w/a.idl")]),
+              ("contentChanges", J.jArray [J.jObject [("text", J.jString "two")]])
+            ]
+          )
+        ],
+        request 1 "test/seen" (about "file:///w/a.idl")
+      ]
+      located
+  in assertEq
+       (M.andThen resultOf (V.last said))
+       (Just (J.jString "1 at /w/a.idl, 1 is one, 1 is two"))
+       "where, once, when it is opened; its text then, and at each edit"

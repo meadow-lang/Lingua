@@ -35,6 +35,7 @@ converts to and from the protocol's lines and UTF-16 columns.
 | feature        | type                                         | answers                                          |
 | -------------- | -------------------------------------------- | ------------------------------------------------ |
 | `text`         | `db -> Int -> String -> ()`                  | how an edit reaches the compiler                 |
+| `opened`       | `db -> Int -> String -> ()`                  | where a file is, when the editor opens it: its uri |
 | `diagnostics`  | `db -> Int -> [Diagnostic]`                  | published for every open file after each edit    |
 | `tree`         | `db -> Int -> Green k`                       | semantic tokens, folding ranges, selection ranges |
 | `resolved`     | `db -> Int -> [(Int, String)]`               | what name resolution says particular tokens are  |
@@ -46,6 +47,15 @@ converts to and from the protocol's lines and UTF-16 columns.
 | `format`       | `db -> Int -> String`                        | formatting, as one edit (see [format.md](format.md)) |
 | `requests`     | `[(String, db -> Asked -> Json)]`            | the language's own requests, below               |
 | `capabilities` | `[(String, Json)]`                           | what else the server says it can do              |
+
+`opened` is called when a file is opened, before its `text`, with the
+file's number and its uri. `Lingua.Lsp.pathOf` turns a `file:` uri into the
+path on disk, so `file:///c%3A/a%20b.idl` becomes `c:/a b.idl`. Like every
+feature, its function can do anything the server can, reading the disk
+included. A language that checks a file together with the rest of its
+package can use it to find the package's manifest and set the other modules'
+texts as inputs. A query can't read the disk, but `opened` can, before
+anything is asked.
 
 ## A language's own requests
 
