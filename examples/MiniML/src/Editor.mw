@@ -662,7 +662,19 @@ mcp! {
     | tool typeOf "the type of a MiniML program" (source : String) = typeTool
     | tool describe "a program's type and value, in a file" (source : String, file : Maybe Int) =
         describeTool
+    | tool typeIn "the type of the program in a file already given" (file : Int) = typeInTool
+    | tool echo "what it is given, back" (text : String) = echoTool
 }
+
+-- The type of a file's program, as a tool asks the session: a file nobody
+-- set the text of raises, which the agent is told as the tool's error.
+fun typeInTool db (file : Int) =
+  match sessionTyped db file with
+  | Ok t -> Ok t
+  | Err _ -> Err "the program has no type"
+
+-- A handler that asks nothing, and so raises nothing.
+fun echoTool db (text : String) = Ok text
 
 fun typeTool db (source : String) =
   let u = setSessionSource db 1 source in
@@ -720,7 +732,10 @@ fun describeTool db (source : String) (file : Maybe Int) =
   let a =
     assertEq
       (names, required)
-      ([Just "typeOf", Just "describe"], Just (J.jArray [J.jString "source"]))
+      (
+        [Just "typeOf", Just "describe", Just "typeIn", Just "echo"],
+        Just (J.jArray [J.jString "source"])
+      )
       "the tools, a `Maybe` one not required"
   in
   let b =
@@ -743,3 +758,36 @@ fun describeTool db (source : String) (file : Maybe Int) =
                 ("shown", J.jString "3 : Int")
               ])))
        "a value as data, in the file asked for"
+
+@test fun aToolThatRaisesIsAnErrorOfTheTools () =
+  let callTool =
+    \id n args ->
+      J.jObject [
+        ("jsonrpc", J.jString "2.0"),
+        ("id", J.jInt id),
+        ("method", J.jString "tools/call"),
+        ("params", J.jObject [("name", J.jString n), ("arguments", args)])
+      ]
+  in
+  let said =
+    Mcp.told
+      [
+        callTool 1 "typeIn" (J.jObject [("file", J.jInt 9)]),
+        callTool 2 "echo" (J.jObject [("text", J.jString "hi")])
+      ]
+      serveAgent
+  in
+  let text =
+    \i ->
+      M.andThen (J.path ["result", "content"]) (V.get said i)
+        |> M.andThen (J.index 0)
+        |> M.andThen (J.get "text")
+        |> M.andThen J.asString
+  in assertEq
+       (
+         M.andThen (J.path ["result", "isError"]) (V.get said 0),
+         M.map (S.startsWith "the tool could not finish") (text 0),
+         text 1
+       )
+       (Just (J.jBool True), Just True, Just "hi")
+       "an input nobody set, the tool's error, and the server goes on"

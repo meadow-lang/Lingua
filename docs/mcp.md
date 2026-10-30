@@ -47,7 +47,11 @@ fun typeTool db (source : String) =
 ```
 
 A handler can do anything an ordinary function can: ask the database, read
-the disk, run proof search.
+the disk, run proof search. A handler doesn't need to catch what the database
+raises (for example, asking for an input nobody set, or a query that depends
+on itself). The server catches it and reports it as the tool's error, and
+keeps serving. A handler that raises any other type of exception must catch
+it itself.
 
 ## What is written
 
