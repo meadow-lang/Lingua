@@ -13,7 +13,8 @@
 -- those for one an agent may leave out. The schema an agent is shown is made
 -- of them. Its handler is given the database and the arguments, in order,
 -- and answers `Result String String` -- the text an agent reads, or why the
--- tool failed, which the agent is told as an error it can act on -- or
+-- tool failed, which the agent is told as an error it can act on, as it is
+-- what the database raises, an input nobody set, say -- or
 -- `Result String Json`, the same with a value an agent can read as data,
 -- given as its text too. Anything else a server answers on its own: what it
 -- is, `ping`, and that a method it does not know is not one.
@@ -36,6 +37,9 @@ use Std.Maybe as M
 use Std.Json as J
 use Std.Json (Json)
 use Std.Console (Console, readLine, writeOutput, writeError, withInput, withOutput)
+use Std.Exn (toResult)
+use Lingua.Query (QueryError)
+use Lingua.Query.QueryError.*
 
 -- --- tools -------------------------------------------------------------------
 
@@ -124,10 +128,28 @@ fun textContent (s : String) : Json = J.jObject [("type", J.jString "text"), ("t
                  | Just d -> [("structuredContent", d)]
                  | None -> [])
               ]))
-  | Err why -> J.jObject [("content", J.jArray [textContent why]), ("isError", J.jBool True)]
+  | Err why -> failed why
+
+fun failed (why : String) : Json =
+  J.jObject [("content", J.jArray [textContent why]), ("isError", J.jBool True)]
 
 -- A handler's answer, as a call's result.
 @pub fun done r : Result String Json = Ok (callResult r)
+
+-- What a handler answers when it is run, as a call's result -- and, where it
+-- raised what the database raises instead -- asked for an input nobody set,
+-- say -- that, as an error of the tool's: so a handler need not catch it. A
+-- handler that raises anything else catches it itself.
+@pub fun doneBy act =
+  match toResult act with
+  | Ok r -> done r
+  | Err e -> Ok (failed "the tool could not finish: ${raisedText e}")
+
+fun raisedText (e : QueryError k) : String =
+  match e with
+  | Unset _ -> "it asked for something nobody has given yet -- a file not opened or checked, say"
+  | Cycle _ -> "what it asked for depends on itself"
+  | Interrupted -> "it was stopped before it finished"
 
 -- An argument read, and what follows from it -- or why it could not be.
 @pub fun andArg (r : Result String a) k = match r with | Ok x -> k x | Err why -> Err why
@@ -416,7 +438,7 @@ fun toolCode t : String =
       let rec chain (i : Int) =
         match V.get ps i with
         | None ->
-            "LinguaMcp.done (${f} lingua_db${S.join "" (V.map (\j -> " lingua_a${show j}") (V.range 0 (V.len ps)))})"
+            "LinguaMcp.doneBy (\\() -> ${f} lingua_db${S.join "" (V.map (\j -> " lingua_a${show j}") (V.range 0 (V.len ps)))})"
         | Just p ->
             (match p with
              | (pn, _, _) ->
