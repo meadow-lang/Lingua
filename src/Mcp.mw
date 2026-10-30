@@ -1,0 +1,575 @@
+-- `mcp!`: a language's tools, served to agents over the Model Context
+-- Protocol.
+--
+--   mcp! {
+--     pub Agent "idyll" for Session
+--       | instructions = "Check Idyll programs and work on their goals."
+--       | tool check "check a file; its diagnostics" (path : String) = checkTool
+--       | tool prove "proof search on a goal" (path : String, goal : String, limit : Maybe Int) = proveTool
+--   }
+--
+-- A tool has a name, what it does -- which an agent reads to choose it -- and
+-- its parameters, each a `String`, an `Int` or a `Bool`, or `Maybe` one of
+-- those for one an agent may leave out. The schema an agent is shown is made
+-- of them. Its handler is given the database and the arguments, in order,
+-- and answers `Result String String` -- the text an agent reads, or why the
+-- tool failed, which the agent is told as an error it can act on -- or
+-- `Result String Json`, the same with a value an agent can read as data,
+-- given as its text too. Anything else a server answers on its own: what it
+-- is, `ping`, and that a method it does not know is not one.
+--
+-- What is written, for a server `Agent` of a database `Session`:
+--
+-- - `toolsAgent ()`, the tools, as `Lingua.Mcp.tool` makes them;
+-- - `answerAgent db message`, the reply to one message -- `None` for a
+--   notification, which has none -- for a test, or a transport of one's own;
+-- - `serveAgent ()`, the server: a new session, and every message read from
+--   standard input answered on standard output, one JSON value a line, until
+--   the input ends.
+--
+-- `told messages server` is what a server writes when sent `messages`: its
+-- replies, for a test.
+
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Maybe as M
+use Std.Json as J
+use Std.Json (Json)
+use Std.Console (Console, readLine, writeOutput, writeError, withInput, withOutput)
+
+-- --- tools -------------------------------------------------------------------
+
+-- A tool's parameter: its name, its type as a schema says it -- `string`,
+-- `integer` or `boolean` -- and whether an agent must give it.
+@pub data Param = Param String String Bool
+
+@pub fun param (name : String) (ty : String) (required : Bool) : Param = Param name ty required
+
+-- A tool: its name, what it does, its parameters, and what answers a call of
+-- it -- the database and the call's arguments, to why they are not what the
+-- tool takes, or the call's result. A tuple, so that what answers may do
+-- whatever its handler does: ask the database, read the disk.
+@pub fun tool (name : String) (about : String) (params : [Param]) run = (name, about, params, run)
+
+fun toolName t = match t with | (n, _, _, _) -> n
+
+fun toolRun t = match t with | (_, _, _, r) -> r
+
+-- What `tools/list` says of a tool.
+fun toolJson t : Json =
+  match t with
+  | (name, about, params, _) ->
+      J.jObject [
+        ("name", J.jString name),
+        ("description", J.jString about),
+        (
+          "inputSchema",
+          J.jObject [
+            ("type", J.jString "object"),
+            (
+              "properties",
+              J.jObject
+                (V.map
+                   (\p ->
+                     match p with
+                     | Param n ty _ -> (n, J.jObject [("type", J.jString ty)]))
+                   params)
+            ),
+            (
+              "required",
+              J.jArray
+                (V.concatMap
+                   (\p ->
+                     match p with
+                     | Param n _ r -> if r then [J.jString n] else [])
+                   params)
+            )
+          ]
+        )
+      ]
+
+-- --- what a handler answers ----------------------------------------------------
+
+-- What a tool answers, as an agent reads it: its content, and -- for a value
+-- an agent can read as data -- that value.
+@pub trait Answer a {
+  fun answerContent : a -> ([Json], Maybe Json)
+}
+
+impl Answer String {
+  fun answerContent s = ([textContent s], None)
+}
+
+-- A value is given as its text too, for an agent that reads only text; and as
+-- data when it is an object, which is what the protocol takes as that.
+impl Answer Json {
+  fun answerContent j =
+    ([textContent (J.render j)], (match J.asObject j with | Just _ -> Just j | None -> None))
+}
+
+fun textContent (s : String) : Json = J.jObject [("type", J.jString "text"), ("text", J.jString s)]
+
+-- A call's result: what the handler answered, or why it failed, which an
+-- agent is told as an error of the tool's -- one it can act on, not one of
+-- the protocol's.
+@pub fun callResult r : Json =
+  match r with
+  | Ok x ->
+      (match answerContent x with
+       | (content, value) ->
+           J.jObject
+             (V.concat [
+                [("content", J.jArray content), ("isError", J.jBool False)],
+                (match value with
+                 | Just d -> [("structuredContent", d)]
+                 | None -> [])
+              ]))
+  | Err why -> J.jObject [("content", J.jArray [textContent why]), ("isError", J.jBool True)]
+
+-- A handler's answer, as a call's result.
+@pub fun done r : Result String Json = Ok (callResult r)
+
+-- An argument read, and what follows from it -- or why it could not be.
+@pub fun andArg (r : Result String a) k = match r with | Ok x -> k x | Err why -> Err why
+
+fun argOf (read : Json -> Maybe a) (what : String) (args : Json) (name : String)
+    : Result String (Maybe a) =
+  match J.get name args with
+  | None -> Ok None
+  | Just v ->
+      if J.isNull v then Ok None
+      else
+        (match read v with
+         | Just x -> Ok (Just x)
+         | None -> Err "`${name}` is ${what}")
+
+fun required (r : Result String (Maybe a)) (name : String) : Result String a =
+  match r with
+  | Err why -> Err why
+  | Ok (Just x) -> Ok x
+  | Ok None -> Err "`${name}` is missing: the tool needs it"
+
+@pub fun stringArg (args : Json) (name : String) : Result String String =
+  required (argOf J.asString "a string" args name) name
+
+@pub fun intArg (args : Json) (name : String) : Result String Int =
+  required (argOf J.asInt "an integer" args name) name
+
+@pub fun boolArg (args : Json) (name : String) : Result String Bool =
+  required (argOf J.asBool "true or false" args name) name
+
+@pub fun maybeStringArg (args : Json) (name : String) : Result String (Maybe String) =
+  argOf J.asString "a string" args name
+
+@pub fun maybeIntArg (args : Json) (name : String) : Result String (Maybe Int) =
+  argOf J.asInt "an integer" args name
+
+@pub fun maybeBoolArg (args : Json) (name : String) : Result String (Maybe Bool) =
+  argOf J.asBool "true or false" args name
+
+-- --- answering -------------------------------------------------------------------
+
+-- The protocol's version a server speaks when a client does not say which.
+def protocolVersion : String = "2025-06-18"
+
+fun result (id : Json) (r : Json) : Json =
+  J.jObject [("jsonrpc", J.jString "2.0"), ("id", id), ("result", r)]
+
+fun failure (id : Json) (code : Int) (message : String) : Json =
+  J.jObject [
+    ("jsonrpc", J.jString "2.0"),
+    ("id", id),
+    ("error", J.jObject [("code", J.jInt code), ("message", J.jString message)])
+  ]
+
+-- The reply to one message from an agent: what the server is, the tools, a
+-- call's result, `ping`'s nothing -- or, to a method it does not know, that
+-- it is not one. A notification has no reply.
+@pub fun answer (name : String) (version : String) (instructions : String) tools db (msg : Json) =
+  let method = M.unwrapOr "" (M.andThen J.asString (J.get "method" msg)) in
+  let params = M.unwrapOr (J.jObject []) (J.get "params" msg) in
+  match J.get "id" msg with
+  | None -> None
+  | Just id ->
+      Just
+        (if method == "initialize" then
+           result
+             id
+             (J.jObject
+                (V.concat [
+                   [
+                     (
+                       "protocolVersion",
+                       J.jString
+                         (M.unwrapOr
+                            protocolVersion
+                            (M.andThen J.asString (J.get "protocolVersion" params)))
+                     ),
+                     (
+                       "capabilities",
+                       J.jObject [("tools", J.jObject [("listChanged", J.jBool False)])]
+                     ),
+                     (
+                       "serverInfo",
+                       J.jObject [("name", J.jString name), ("version", J.jString version)]
+                     )
+                   ],
+                   if S.isEmpty instructions then [] else [("instructions", J.jString instructions)]
+                 ]))
+         else if method == "ping" then result id (J.jObject [])
+         else if method == "tools/list" then
+           result id (J.jObject [("tools", J.jArray (V.map toolJson tools))])
+         else if method == "tools/call" then
+           let called = M.unwrapOr "" (M.andThen J.asString (J.get "name" params)) in
+           let args = M.unwrapOr (J.jObject []) (J.get "arguments" params) in
+           match V.find (\t -> toolName t == called) tools with
+           | None ->
+               failure
+                 id
+                 (0 - 32602)
+                 "no tool is called `${called}`: the tools are ${S.join ", " (V.map (\t -> "`${toolName t}`") tools)}"
+           | Just t ->
+               (match (toolRun t) db args with
+                | Ok r -> result id r
+                | Err why -> failure id (0 - 32602) "`${called}`: ${why}")
+         else failure id (0 - 32601) "no method is called `${method}`")
+
+-- --- serving ---------------------------------------------------------------------
+
+-- A message, written: one JSON value, and a line break -- the protocol's stdio
+-- transport. Writing nothing to standard error sends what standard output
+-- holds, so an agent has each reply as it is written.
+fun write (j : Json) : () ! { Console | e } = let u = writeOutput "${J.render j}\n" in writeError ""
+
+-- A server, until its input ends: each line a message, each reply a line.
+@pub fun serve (name : String) (version : String) (instructions : String) tools db =
+  match readLine () with
+  | None -> ()
+  | Just line ->
+      let u =
+        if S.isEmpty (S.trim line) then ()
+        else
+          (match J.parse line with
+           | Err why -> write (failure (J.jNull ()) (0 - 32700) "not JSON: ${why}")
+           | Ok msg ->
+               (match answer name version instructions tools db msg with
+                | Just reply -> write reply
+                | None -> ()))
+      in serve name version instructions tools db
+
+-- What `server` writes when it is sent `messages` and then no more: each of
+-- its replies, in order.
+@pub fun told (messages : [Json]) server =
+  match withInput (V.map J.render messages) (\() -> withOutput server) with
+  | (_, out) ->
+      V.concatMap
+        (\l ->
+          if S.isEmpty (S.trim l) then [] else (match J.parse l with | Ok j -> [j] | Err _ -> []))
+        (S.lines out)
+
+-- --- mcp! ------------------------------------------------------------------------
+
+use Std.Macro (TokenTree, Loc, isPunct)
+use Std.Macro.TokenTree.*
+use Std.Macro.Loc.*
+use Std.Macro.Delim.*
+use Std.Macro.Parse (Tokens, parseTokens, ident, keyword, punct, stringLit, group)
+use Std.String.Parse as P
+use Std.String.Parse (Parser)
+use Std.String.Parse (keep, skip)
+use Lingua.Pipe (named)
+use Std.Macro (Expand)
+
+-- What a call holds: a setting -- its name, where it was written, and its
+-- value -- or a tool: its name and where, what it does, its parameters --
+-- each a name, where it was written, whether it may be left out, and its
+-- type -- and its handler.
+data McpItem
+  = McpSetting (String, Loc) String
+  | McpTool (String, Loc) String [((String, Loc), Bool, (String, Loc))] String
+
+use McpItem.*
+
+fun comma p = P.thenSkip p (P.optional (punct ","))
+
+def paramP : Parser Tokens ((String, Loc), Bool, (String, Loc)) =
+  comma
+    (P.pure (\n m t -> (n, M.isSome m, t))
+       |> keep named
+       |> skip (punct ":")
+       |> keep (P.optional (keyword "Maybe"))
+       |> keep named)
+
+def toolP : Parser Tokens McpItem =
+  P.pure (\n about ps f -> McpTool n about ps f)
+    |> skip (punct "|")
+    |> skip (keyword "tool")
+    |> keep named
+    |> keep stringLit
+    |> keep (P.map (\o -> M.unwrapOr [] o) (P.optional (group Paren (P.many paramP))))
+    |> skip (punct "=")
+    |> keep ident
+
+def settingP : Parser Tokens McpItem =
+  P.pure (\n v -> McpSetting n v)
+    |> skip (punct "|")
+    |> keep named
+    |> skip (punct "=")
+    |> keep stringLit
+
+def mcpCall : Parser Tokens (Bool, String, String, String, [McpItem]) =
+  P.pure (\pub name lang db items -> (M.isSome pub, name, lang, db, items))
+    |> keep (P.optional (keyword "pub"))
+    |> keep ident
+    |> keep stringLit
+    |> skip (keyword "for")
+    |> keep ident
+    |> keep (P.many (P.alt (P.try toolP) settingP))
+
+-- The settings a server may have.
+def settings : [String] = ["instructions", "version"]
+
+-- The types a parameter may have, and what a schema calls each.
+def types : [(String, String)] = [("String", "string"), ("Int", "integer"), ("Bool", "boolean")]
+
+@macro
+@pub fun mcp (ts : [TokenTree]) : [TokenTree] ! { Expand | e } =
+  match parseTokens mcpCall ts with
+  | Err failed -> failed
+  | Ok (pub, name, lang, db, items) ->
+      let ss = V.concatMap (\i -> match i with | McpSetting n v -> [(n, v)] | _ -> []) items in
+      let tools =
+        V.concatMap (\i -> match i with | McpTool n a ps f -> [(n, a, ps, f)] | _ -> []) items
+      in
+      let toolNameOf = \t -> (match t with | (n, _, _, _) -> fst n) in
+      let badSetting = V.find (\s -> not (V.elem (fst (fst s)) settings)) ss in
+      let badType =
+        V.concatMap
+          (\t ->
+            match t with
+            | (_, _, ps, _) ->
+                V.concatMap
+                  (\p ->
+                    match p with
+                    | (_, _, ty) -> if V.any (\x -> fst x == fst ty) types then [] else [ty])
+                  ps)
+          tools
+      in
+      let twice =
+        V.find
+          (\i ->
+            V.any
+              (\j -> j < i and M.map toolNameOf (V.get tools j) == M.map toolNameOf (V.get tools i))
+              (V.range 0 (V.len tools)))
+          (V.range 0 (V.len tools))
+      in match badSetting with
+         | Just s ->
+             [Fail
+                "a server has no setting `${fst (fst s)}`: they are `instructions` and `version`, and `tool name \"what it does\" (params) = handler`"
+                (snd (fst s))]
+         | None ->
+             match V.get badType 0 with
+             | Just ty ->
+                 [Fail
+                    "a tool's parameter is a `String`, an `Int` or a `Bool`, or `Maybe` one of them -- not `${fst ty}`"
+                    (snd ty)]
+             | None ->
+                 match M.andThen (\i -> V.get tools i) twice with
+                 | Just (n, _, _, _) -> [Fail "two tools are called `${fst n}`" (snd n)]
+                 | None ->
+                     if V.isEmpty tools then
+                       [Fail
+                          "a server needs a tool: `| tool name \"what it does\" (params) = handler`"
+                          Nowhere]
+                     else [Code (mcpCode (if pub then "@pub " else "") name lang db ss tools)]
+
+fun quoted (s : String) : String =
+  "\""
+    ++ S.join
+      ""
+      (V.map
+         (\i ->
+           let c = stringSlice s i (i + 1) in
+           if c == "\"" then "\\\""
+           else if c == "\\" then "\\\\"
+           else if c == "$" then "\\$"
+           else if c == "\n" then "\\n"
+           else c)
+         (V.range 0 (stringByteLength s)))
+    ++ "\""
+
+-- A tool, as the `Tool` it is: its handler given the arguments read in turn.
+fun toolCode t : String =
+  match t with
+  | (n, about, ps, f) ->
+      let reader =
+        \p ->
+          match p with
+          | (_, optional, ty) ->
+              "${if optional then "maybe${fst ty}" else "${S.toLower (fst ty)}"}Arg"
+      in
+      let schemaTy =
+        \p ->
+          (match p with
+           | (_, _, ty) -> M.unwrapOr "string" (M.map snd (V.find (\x -> fst x == fst ty) types)))
+      in
+      let rec chain (i : Int) =
+        match V.get ps i with
+        | None ->
+            "LinguaMcp.done (${f} lingua_db${S.join "" (V.map (\j -> " lingua_a${show j}") (V.range 0 (V.len ps)))})"
+        | Just p ->
+            (match p with
+             | (pn, _, _) ->
+                 "LinguaMcp.andArg (LinguaMcp.${reader p} lingua_args \"${fst pn}\") (\\lingua_a${show i} -> ${chain (i + 1)})")
+      in "LinguaMcp.tool ${quoted (fst n)} ${quoted about} [${S.join ", " (V.map (\p -> match p with | (pn, optional, _) -> "LinguaMcp.param ${quoted (fst pn)} ${quoted (schemaTy p)} ${if optional then "False" else "True"}") ps)}] (\\lingua_db lingua_args -> ${chain 0})"
+
+fun mcpCode pub name lang db ss tools : String =
+  let get = \k d -> M.unwrapOr d (M.map snd (V.find (\s -> fst (fst s) == k) ss)) in
+  let about =
+    "${quoted lang} ${quoted (get "version" "0.1.0")} ${quoted (get "instructions" "")}"
+  in "use Lingua.Mcp as LinguaMcp
+
+-- ${lang}'s tools, as an agent is shown them.
+${pub}fun tools${name} () =
+  [
+    ${S.join ",\n    " (V.map toolCode tools)}
+  ]
+
+-- The reply to one message from an agent, of the database `db`: `None` for a
+-- notification.
+${pub}fun answer${name} db msg = LinguaMcp.answer ${about} (tools${name} ()) db msg
+
+-- ${lang}'s tools served to an agent over the Model Context Protocol, on
+-- standard input and output, until the input ends.
+${pub}fun serve${name} () =
+  let db = new${db} () in
+  LinguaMcp.serve ${about} (tools${name} ()) db
+"
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertEq)
+
+fun call (id : Int) (method : String) (params : Json) : Json =
+  J.jObject [
+    ("jsonrpc", J.jString "2.0"),
+    ("id", J.jInt id),
+    ("method", J.jString method),
+    ("params", params)
+  ]
+
+-- A server by hand: a tool that greets, and one that adds, answering data.
+fun greeter () =
+  let tools =
+    [
+      tool
+        "greet"
+        "say hello"
+        [param "who" "string" True, param "loud" "boolean" False]
+        (\db args ->
+          andArg (stringArg args "who") (\who ->
+            andArg (maybeBoolArg args "loud") (\loud ->
+              done
+                (if who == "" then Err "nobody to greet"
+                 else Ok (if loud == Just True then "HELLO ${who}" else "hello ${who}"))))),
+      tool "add" "add two numbers" [param "a" "integer" True, param "b" "integer" True] (\db args ->
+        andArg (intArg args "a") (\a ->
+          andArg (intArg args "b") (\b -> done (Ok (J.jObject [("sum", J.jInt (a + b))])))))
+    ]
+  in serve "test" "1.0" "for tests" tools ()
+
+@test fun aServerSaysWhatItIsAndListsItsTools () =
+  let said =
+    told
+      [
+        call 1 "initialize" (J.jObject [("protocolVersion", J.jString "2025-03-26")]),
+        J.jObject [("jsonrpc", J.jString "2.0"), ("method", J.jString "notifications/initialized")],
+        call 2 "tools/list" (J.jObject []),
+        call 3 "ping" (J.jObject [])
+      ]
+      greeter
+  in
+  let a =
+    assertEq
+      (
+        M.andThen (J.path ["result", "protocolVersion"]) (V.get said 0),
+        M.andThen (J.path ["result", "serverInfo", "name"]) (V.get said 0),
+        M.andThen (J.path ["result", "instructions"]) (V.get said 0)
+      )
+      (Just (J.jString "2025-03-26"), Just (J.jString "test"), Just (J.jString "for tests"))
+      "the client's version, its name, and what it is for"
+  in
+  let tools =
+    M.unwrapOr [] (M.andThen J.asArray (M.andThen (J.path ["result", "tools"]) (V.get said 1)))
+  in
+  let b =
+    assertEq
+      (
+        V.len said,
+        V.map (\t -> M.andThen J.asString (J.get "name" t)) tools,
+        M.map J.render (M.andThen (J.path ["inputSchema"]) (V.get tools 0))
+      )
+      (
+        3,
+        [Just "greet", Just "add"],
+        Just
+          (J.render
+             (J.jObject [
+                ("type", J.jString "object"),
+                (
+                  "properties",
+                  J.jObject [
+                    ("who", J.jObject [("type", J.jString "string")]),
+                    ("loud", J.jObject [("type", J.jString "boolean")])
+                  ]
+                ),
+                ("required", J.jArray [J.jString "who"])
+              ]))
+      )
+      "no reply to the notification; each tool, with a schema of its parameters"
+  in assertEq
+       (M.andThen (J.get "result") (V.get said 2))
+       (Just (J.jObject []))
+       "and `ping` answered"
+
+@test fun aToolIsCalledWithItsArguments () =
+  let callTool =
+    \id n args -> call id "tools/call" (J.jObject [("name", J.jString n), ("arguments", args)])
+  in
+  let said =
+    told
+      [
+        callTool 1 "greet" (J.jObject [("who", J.jString "Idyll"), ("loud", J.jBool True)]),
+        callTool 2 "greet" (J.jObject [("who", J.jString "")]),
+        callTool 3 "add" (J.jObject [("a", J.jInt 2), ("b", J.jInt 3)]),
+        callTool 4 "add" (J.jObject [("a", J.jInt 2)]),
+        callTool 5 "fly" (J.jObject []),
+        call 6 "resources/list" (J.jObject [])
+      ]
+      greeter
+  in
+  let text = \i -> M.andThen (J.path ["result", "content"]) (V.get said i) in
+  let a =
+    assertEq
+      (text 0, M.andThen (J.path ["result", "isError"]) (V.get said 0))
+      (
+        Just (J.jArray [J.jObject [("type", J.jString "text"), ("text", J.jString "HELLO Idyll")]]),
+        Just (J.jBool False)
+      )
+      "what it answered, as text"
+  in
+  let b =
+    assertEq
+      (M.andThen (J.path ["result", "isError"]) (V.get said 1))
+      (Just (J.jBool True))
+      "what failed, an error of the tool's"
+  in
+  let c =
+    assertEq
+      (M.andThen (J.path ["result", "structuredContent", "sum"]) (V.get said 2))
+      (Just (J.jInt 5))
+      "a value, as data"
+  in assertEq
+       (V.map (\i -> M.andThen (J.path ["error", "code"]) (V.get said i)) [3, 4, 5])
+       [Just (J.jInt (0 - 32602)), Just (J.jInt (0 - 32602)), Just (J.jInt (0 - 32601))]
+       "an argument missing and a tool there is not, not what the tool takes; a method there is not, not one"

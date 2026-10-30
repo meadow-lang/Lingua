@@ -3,7 +3,8 @@
 -- changed: hovering reads the elaboration, going to a definition the binders,
 -- and neither runs again until the file does.
 
-use Lingua (lsp!, repl!)
+use Lingua (lsp!, repl!, mcp!)
+use Lingua.Mcp as Mcp
 use Lingua.Green (Green)
 use Lingua.Repl (Reply)
 use Lingua.Lsp (Asked, positionIn, pathOf)
@@ -649,3 +650,96 @@ fun opening (uri : String) (text : String) : Json =
        (M.andThen (J.get "result") (V.get said 1))
        (Just (J.jString "c:/work/a.ml"))
        "its path"
+
+-- --- tools for an agent (`mcp!`) ---------------------------------------------
+--
+-- MiniML over the Model Context Protocol, from the same session: a tool that
+-- says what type a program has, and one that gives its type and value as
+-- data, in a file of the agent's choosing.
+mcp! {
+  pub Agent "miniml" for Session
+    | instructions = "Type and run MiniML programs."
+    | tool typeOf "the type of a MiniML program" (source : String) = typeTool
+    | tool describe "a program's type and value, in a file" (source : String, file : Maybe Int) =
+        describeTool
+}
+
+fun typeTool db (source : String) =
+  let u = setSessionSource db 1 source in
+  match sessionTyped db 1 with
+  | Ok t -> Ok t
+  | Err _ -> Err "the program has no type: it has a mistake in it"
+
+fun describeTool db (source : String) (file : Maybe Int) =
+  let n = M.unwrapOr 1 file in
+  let u = setSessionSource db n source in
+  match sessionTyped db n with
+  | Ok t ->
+      Ok
+        (J.jObject [
+           ("file", J.jInt n),
+           ("type", J.jString t),
+           ("shown", J.jString (sessionShown db n))
+         ])
+  | Err _ -> Err "the program has no type: it has a mistake in it"
+
+@test fun anAgentIsServedTheLanguagesTools () =
+  let callTool =
+    \id n args ->
+      J.jObject [
+        ("jsonrpc", J.jString "2.0"),
+        ("id", J.jInt id),
+        ("method", J.jString "tools/call"),
+        ("params", J.jObject [("name", J.jString n), ("arguments", args)])
+      ]
+  in
+  let said =
+    Mcp.told
+      [
+        J.jObject [
+          ("jsonrpc", J.jString "2.0"),
+          ("id", J.jInt 1),
+          ("method", J.jString "tools/list")
+        ],
+        callTool 2 "typeOf" (J.jObject [("source", J.jString "fun x -> x + 1")]),
+        callTool 3 "typeOf" (J.jObject [("source", J.jString "1 + true")]),
+        callTool 4 "describe" (J.jObject [("source", J.jString "1 + 2"), ("file", J.jInt 7)])
+      ]
+      serveAgent
+  in
+  let names =
+    V.map
+      (\t -> M.andThen J.asString (J.get "name" t))
+      (M.unwrapOr [] (M.andThen J.asArray (M.andThen (J.path ["result", "tools"]) (V.get said 0))))
+  in
+  let required =
+    M.andThen (J.path ["result", "tools"]) (V.get said 0)
+      |> M.andThen (J.index 1)
+      |> M.andThen (J.path ["inputSchema", "required"])
+  in
+  let a =
+    assertEq
+      (names, required)
+      ([Just "typeOf", Just "describe"], Just (J.jArray [J.jString "source"]))
+      "the tools, a `Maybe` one not required"
+  in
+  let b =
+    assertEq
+      (
+        M.andThen (J.path ["result", "content"]) (V.get said 1)
+          |> M.andThen (J.index 0)
+          |> M.andThen (J.get "text"),
+        M.andThen (J.path ["result", "isError"]) (V.get said 2)
+      )
+      (Just (J.jString "(Int -> Int)"), Just (J.jBool True))
+      "a type, and a program with none an error of the tool's"
+  in assertEq
+       (M.andThen (J.path ["result", "structuredContent"]) (V.get said 3) |> M.map J.render)
+       (Just
+          (J.render
+             (J.jObject [
+                ("file", J.jInt 7),
+                ("type", J.jString "Int"),
+                ("shown", J.jString "3 : Int")
+              ])))
+       "a value as data, in the file asked for"
