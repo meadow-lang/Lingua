@@ -17,6 +17,7 @@ write, what gets generated, the defaults, the errors and the limits.
 | [server.md](server.md)             | `lsp!`: features, a language's own requests, what the server says it can do, and testing one |
 | [debugger.md](debugger.md)       | `dap!`: a debugger from a machine the language can step -- breakpoints, steps, pause, frames, variables, the console -- and testing one |
 | [repl.md](repl.md)                 | `repl!`: features, multi-line entries, keys, completion, the finder, themes, and commands: `:help`, `:quit`, `:theme` and a language's own |
+| [mcp.md](mcp.md)                   | `mcp!`: a language's tools served to agents over the Model Context Protocol -- tools, their parameters and answers, and testing a server |
 | [highlighting.md](highlighting.md) | semantic tokens: how a token gets its class, `resolved`, and how the editor and the prompt share one answer |
 
 Most examples in the guides are taken from tested code in

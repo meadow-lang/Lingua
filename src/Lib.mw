@@ -28,6 +28,7 @@
 @pub mod Format
 @pub mod Repl
 @pub mod Dap
+@pub mod Mcp
 
 @pub use Lingua.Gen (syntax)
 @pub use Lingua.Pass (lang, pass)
@@ -38,3 +39,4 @@
 @pub use Lingua.Format (format)
 @pub use Lingua.Repl (repl)
 @pub use Lingua.Dap (dap)
+@pub use Lingua.Mcp (mcp)
