@@ -638,9 +638,10 @@ fun plan us root before done dir deps decode opts =
          match opts.resolve dir manifest with
          | Err why -> Blocked2 dir why
          | Ok o ->
-             -- What a unit is compiled from: its sources, and what of its
-             -- options compiling depends on.
-             let fp = hash (sources, opts.compileKey o) in
+             -- What a unit is compiled from: its sources, what of its options
+             -- compiling depends on, and what the language says of the
+             -- compiler.
+             let fp = hash (sources, saltedKey us.salt (opts.compileKey o)) in
              let against =
                V.concatMap
                  (\d -> M.unwrapOr [] (M.map (\f -> [(d, f)]) (fingerprintIn done d)))
@@ -654,6 +655,13 @@ fun plan us root before done dir deps decode opts =
                    Kept dir (Built s ds f)
                  else compiling root sub decode done dir deps sources fp o
              | None -> compiling root sub decode done dir deps sources fp o
+
+-- A key with what a language says of its compiler in it: `salt`, which
+-- `compilerId` cannot see when the compiler is run by something else -- under
+-- `meadow run` the program running is `meadow`, whatever it runs. No salt is
+-- the key as it is, so a build that gives none compiles nothing again for it.
+@pub fun saltedKey (salt : String) (key : Int) : Int =
+  if S.isEmpty salt then key else hash (salt, key)
 
 fun compiling root (sub : String) decode done dir deps sources (fp : Int) o =
   let imports =
@@ -1338,7 +1346,7 @@ def settings : [String] = ["sources", "manifest"]
 def optional : [String] =
   [
     "compile", "dependencies", "files", "parallel", "link", "overrides", "pinned", "parts",
-    "compilePart", "assemble", "lock", "cache", "cacheEnv"
+    "compilePart", "assemble", "lock", "cache", "cacheEnv", "salt"
   ]
 
 -- An option's type: a truth, a number, a text, maybe one of the last two,
@@ -1701,8 +1709,10 @@ fun written (pub : Bool) (name : String) (lang : String) ss declared profiles (o
           if withOpts then "(\\o u -> ${get "compile"} o u)" else "(\\o u -> ${get "compile"} u)"
       | Just ps ->
           let o = if withOpts then "o " else "" in
-          let key = if withOpts then "(lingua${name}_compileKey o)" else "0" in
-          "(\\o u -> LinguaMake.inParts ${if given "parallel" == Just "false" then "False" else "True"} ${key} (\\lingua_s -> ${ps} lingua_s) (\\lingua_p -> ${get "compilePart"} ${o}lingua_p) (\\lingua_u lingua_ps -> ${get "assemble"} ${o}lingua_u lingua_ps) LinguaMake.encodeReflect LinguaMake.decodeReflect u)"
+          let plain = if withOpts then "(lingua${name}_compileKey o)" else "0" in
+          let key =
+            if M.isSome (given "salt") then "(LinguaMake.saltedKey lingua_salt ${plain})" else plain
+          in "(\\o u -> LinguaMake.inParts ${if given "parallel" == Just "false" then "False" else "True"} ${key} (\\lingua_s -> ${ps} lingua_s) (\\lingua_p -> ${get "compilePart"} ${o}lingua_p) (\\lingua_u lingua_ps -> ${get "assemble"} ${o}lingua_u lingua_ps) LinguaMake.encodeReflect LinguaMake.decodeReflect u)"
   in
   -- A build with a lock file resolves what its manifests name, by
   -- `lingua_resolver`, before it reads the units they are.
@@ -1715,8 +1725,10 @@ fun written (pub : Bool) (name : String) (lang : String) ss declared profiles (o
   in
   let unitsIn =
     \sub ->
-      "{ manifest = \"${get "manifest"}\", ext = \"${get "sources"}\", sub = ${sub}, deps = ${M.unwrapOr "None" (M.map deps (given "dependencies"))}, files = ${M.unwrapOr "None" (M.map (\f -> "Just (\\d -> ${f} d)") (given "files"))} }"
+      "{ manifest = \"${get "manifest"}\", ext = \"${get "sources"}\", sub = ${sub}, salt = ${if M.isSome (given "salt") then "lingua_salt" else "\"\""}, deps = ${M.unwrapOr "None" (M.map deps (given "dependencies"))}, files = ${M.unwrapOr "None" (M.map (\f -> "Just (\\d -> ${f} d)") (given "files"))} }"
   in
+  -- What the language says of its compiler, asked once for each build.
+  let salted = M.unwrapOr "" (M.map (\f -> "let lingua_salt = ${f} () in\n  ") (given "salt")) in
   let resolverWith =
     \args ->
       "LinguaMake.resolverOf \"${M.unwrapOr "~/.${lang}/git" (given "cache")}\" \"${get "cacheEnv"}\" \"${get "lock"}\" root ${args}"
@@ -1745,7 +1757,7 @@ ${vis}fun build${name} ${params}(root : String) = build${name}With False False $
 -- manifest takes -- those in `lingua_names`, or every one when it is empty --
 -- what moved said, and the lock file written unless it is a dry run.
 ${vis}fun update${name} (root : String) (lingua_names : [String]) (lingua_dryRun : Bool) =
-  let lingua_resolver = ${resolverWith "False False True lingua_names"} in
+  ${salted}let lingua_resolver = ${resolverWith "False False True lingua_names"} in
   LinguaMake.updated lingua_resolver \"${lang}\" (${unitsIn "\"\""}) root lingua_names lingua_dryRun
 " in
   let unknown =
@@ -1780,11 +1792,11 @@ ${vis}fun update${name} (root : String) (lingua_names : [String]) (lingua_dryRun
 -- ${lang}'s build: the unit at `root` and every unit it depends on, each
 -- compiled only if what it would be compiled from has changed.${if M.isSome lock then " Offline, it\n-- reaches no network: what it depends on must be in the cache. Locked, it\n-- fails rather than change the lock file." else ""}
 ${vis}fun build${name}${withName} ${flags}(root : String) =
-  ${settle "\"\""}LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "\"\""}) root LinguaMake.noOptions ${compiled False} (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect
+  ${salted}${settle "\"\""}LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "\"\""}) root LinguaMake.noOptions ${compiled False} (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect
 
 -- What the unit at `dir` was compiled from in `root`'s last build.
 ${vis}fun given${name} (root : String) (dir : String) =
-  ${givenResolver}LinguaMake.givenOf (${unitsIn "\"\""}) root dir LinguaMake.decodeReflect
+  ${salted}${givenResolver}LinguaMake.givenOf (${unitsIn "\"\""}) root dir LinguaMake.decodeReflect
 ${lockCode "" ""}"]
      else
        -- A build with options and no profile written has one, `debug`: what
@@ -1812,14 +1824,14 @@ ${vis}fun build${name}${withName} ${flags}(lingua_profile : String) (lingua_set 
   match ${lower}Profile lingua_profile with
   | None -> (let lingua_u = LinguaMake.sayError \"${lang} has no profile `\${lingua_profile}`: it has \${LinguaS.join \", \" ${lower}Profiles}\" in False)
   | Just lingua_base ->
-      ${settle "lingua_profile"}LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "lingua_profile"}) root
+      ${salted}${settle "lingua_profile"}LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "lingua_profile"}) root
         { resolve = \\lingua_dir lingua_manifest -> (let lingua_r = (match ${lower}With lingua_base ${over} with | Err lingua_e -> Err lingua_e | Ok lingua_o -> ${lower}With lingua_o lingua_set) in ${last}), compileKey = lingua${name}_compileKey, linkKey = lingua${name}_linkKey }
         ${compiled True} (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} o l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect
 
 -- What the unit at `dir` was compiled from in `root`'s last build as that
 -- profile.
 ${vis}fun given${name} (lingua_profile : String) (root : String) (dir : String) =
-  ${givenResolver}LinguaMake.givenOf (${unitsIn "lingua_profile"}) root dir LinguaMake.decodeReflect
+  ${salted}${givenResolver}LinguaMake.givenOf (${unitsIn "lingua_profile"}) root dir LinguaMake.decodeReflect
 ${lockCode "(lingua_profile : String) (lingua_set : [(String, String)]) " "lingua_profile lingua_set "}"]]
 
 -- --- tests ---------------------------------------------

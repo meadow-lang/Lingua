@@ -35,6 +35,7 @@ the last build, for a tool that wants to ask the compiler about a unit again.
 | `parts`        | no       | how a unit's sources import each other, to compile it a part at a time; see [Parts of a unit](#parts-of-a-unit) |
 | `compilePart`  | with `parts` | the compiler of one part: a function of a `Part i p` answering `Result String p` |
 | `assemble`     | with `parts` | a unit's interface, of its parts': a function of a `Given i` and the parts' interfaces, answering `Result String i` |
+| `salt`         | no       | what the language says of its compiler: a function of nothing answering a `String`; see [When a unit is compiled](#when-a-unit-is-compiled) |
 | `lock`         | no       | the lock file, beside the root unit's manifest, for a build that fetches what it depends on; see [Dependencies fetched](#dependencies-fetched) |
 | `cache`        | with `lock` | where what is fetched is kept, `"~/.idyll/git"`; `~/.<language>/git` by default |
 | `cacheEnv`     | with `lock` | a variable that, when set, moves the cache under it: `$IDYLL_HOME/git` |
@@ -125,6 +126,17 @@ that has gone missing makes its unit compile again.
 
 A build kept by a different compiler binary, or by an older layout of these
 files, is not trusted: every unit is compiled once more.
+
+**A compiler that changed.** What a build keeps is the compiler's as much as
+the sources', so a build by another compiler starts again. It knows the
+compiler by the program that is running: its path, length and time. A compiler
+run by `meadow run` is `meadow` to that test, and stays the same however its
+sources change, so a fixed compiler would go on using what the broken one
+built. `| salt = saltOf` says what does change: `saltOf ()` is a `String`
+asked once per build, such as the compiler's own build id or a hash of its
+prelude. Folded into what each unit and each part is compiled from, a
+different salt compiles everything again and links it. A build with no salt,
+or an empty one, is unaffected.
 
 ## Parts of a unit
 
