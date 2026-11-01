@@ -406,3 +406,26 @@ fun laidBy (format : Green Blocks -> String) (src : String) =
        (laidBy formatUnder "x = let p = q in a\n")
        "x =\n  let\n    p = q\n  in a\n"
        "and with one, its break"
+
+@test fun aCommentKeepsItsColumnWhereItsLineGoesOnWithNothing () =
+  let header = "-- a\n-- b\nx = 1\n" in
+  let a = assertEq (laidBy formatBare header) header "a header's lines at the left, and the item" in
+  let b = assertEq (both header) header "the same with the binding's rule" in
+  let e = assertEq (laidBy formatBare "-- a\nx = 1\n") "-- a\nx = 1\n" "and after one line" in
+  -- A file of comments has no block for the layout to open, so nothing to
+  -- read back: it is only laid out.
+  let c =
+    assertEq
+      (formatBare (fst (parseBlocks "-- a\n\n-- b\n")))
+      "-- a\n\n-- b\n"
+      "a file of nothing else"
+  in
+  let d =
+    assertEq
+      (laidBy formatBare "-- a\n   -- b\nx = 1\n")
+      "-- a\n   -- b\nx = 1\n"
+      "further in stays further in"
+  in assertEq
+       (laidBy formatBare "x = a ->\n-- note\n  b\n")
+       "x = a ->\n-- note\n  b\n"
+       "and a line that goes on keeps its level past a comment at the left"

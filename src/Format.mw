@@ -515,7 +515,7 @@ fun breaksOf (strength : Int) : Int =
 -- far in from the line the node began on as it was -- in a language whose
 -- layout is part of its meaning, a line further in goes on with the one
 -- before -- but for a child whose rule begins with a break, which its rule
--- sets in.
+-- sets in. A comment has no place in the layout, and nothing goes on from one.
 --
 -- So the breaks are written when what follows them is: the fold holds what
 -- is written, the breaks owed, how many it ends with already, the space the
@@ -544,8 +544,8 @@ fun writtenParts (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
          -- asked for them; how many it ends with already; the space the text
          -- had, which a break that follows drops; how far in the line the
          -- text broke to was written; how far in the line being written is
-         -- set; and whether anything is written yet, before which blank space
-         -- is no one's.
+         -- set; whether anything is written yet, before which blank space is
+         -- no one's; and whether anything but a comment is.
          let start =
            {
              doc = PP.nil,
@@ -555,16 +555,17 @@ fun writtenParts (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
              gap = "",
              col = 0 - 1,
              cur = 0,
-             shown = False
+             shown = False,
+             begun = False
            }
          in
          -- `d` written next, which begins with `opens` breaks of its own. A
          -- line a rule broke to -- the layout's `;` before it, say -- or one
          -- that begins with a break of its own is set in as what is around it
-         -- says. A line only the text broke to goes on with the one before:
-         -- it is as far in from the node's first line as it was, and further
-         -- in than that line by a level at least -- at its column, in a
-         -- language whose layout is part of its meaning, it would be a new
+         -- says. A line only the text broke to is as far in from the node's
+         -- first line as it was; and once it has something to go on with,
+         -- further in than that line by a level at least -- at its column, in
+         -- a language whose layout is part of its meaning, it would be a new
          -- item.
          let put =
            \w opens d ->
@@ -573,7 +574,7 @@ fun writtenParts (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
              let set =
                if not fresh then w.cur
                else if opens > 0 or w.asked or w.col < 0 then 0
-               else max (w.col - base) (unitOf st)
+               else max (w.col - base) (if w.begun then unitOf st else 0)
              in
              let lead =
                if fresh then breaksAfter PP.nil n else PP.text (if w.shown then w.gap else "")
@@ -585,7 +586,8 @@ fun writtenParts (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
                   gap = "",
                   col = 0 - 1,
                   cur = set,
-                  shown = True
+                  shown = True,
+                  begun = True
                 }
          in
          let step =
@@ -597,8 +599,10 @@ fun writtenParts (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
                    let t = R.text c in
                    if not (S.isEmpty (S.trim t)) then
                      -- A comment on a line of its own between two items is
-                     -- neither's: the next line is set in as it would be.
-                     (let after = put w 0 (PP.text (S.trim t)) in { after | asked = w.asked })
+                     -- neither's: the next line is set in as it would be. It
+                     -- is no new item at its column, so goes on with nothing.
+                     (let after = put { w | begun = False } 0 (PP.text (S.trim t)) in
+                      { after | asked = w.asked, begun = w.begun })
                    else
                      let lines = S.split "\n" t in
                      let n = min 2 (V.len lines - 1) in
