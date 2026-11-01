@@ -240,7 +240,7 @@ fun loadState (root : String) (sub : String) : HashMap String Built ! { Fs, Proc
 -- when it was written, which a rebuilt compiler always changes. Its length
 -- alone let a rebuild that came out the same size pass for the old one, and
 -- the old one's interfaces be taken for its own.
-fun compilerId () : String ! { Fs, Process | e } =
+@pub fun compilerId () : String ! { Fs, Process | e } =
   match (let exe = currentExe () in if S.isEmpty exe then None else Just exe) with
   | None -> ""
   | Just exe ->
@@ -1715,9 +1715,13 @@ fun written (pub : Bool) (name : String) (lang : String) ss declared profiles (o
       | Just ps ->
           let o = if withOpts then "o " else "" in
           let plain = if withOpts then "(lingua${name}_compileKey o)" else "0" in
-          let key =
+          let seasoned =
             if M.isSome (given "salt") then "(LinguaMake.saltedKey lingua_salt ${plain})" else plain
-          in "(\\o u -> LinguaMake.inParts ${if given "parallel" == Just "false" then "False" else "True"} ${key} (\\lingua_s -> ${ps} lingua_s) (\\lingua_p -> ${get "compilePart"} ${o}lingua_p) (\\lingua_u lingua_ps -> ${get "assemble"} ${o}lingua_u lingua_ps) LinguaMake.encodeReflect LinguaMake.decodeReflect u)"
+          in
+          -- A part is the compiler's as much as a unit is, and what is kept of
+          -- it is read whatever compiler kept it.
+          let key = "(LinguaMake.saltedKey lingua_compiler ${seasoned})" in
+          "(\\o u -> LinguaMake.inParts ${if given "parallel" == Just "false" then "False" else "True"} ${key} (\\lingua_s -> ${ps} lingua_s) (\\lingua_p -> ${get "compilePart"} ${o}lingua_p) (\\lingua_u lingua_ps -> ${get "assemble"} ${o}lingua_u lingua_ps) LinguaMake.encodeReflect LinguaMake.decodeReflect u)"
   in
   -- A build with a lock file resolves what its manifests name, by
   -- `lingua_resolver`, before it reads the units they are.
@@ -1734,6 +1738,11 @@ fun written (pub : Bool) (name : String) (lang : String) ss declared profiles (o
   in
   -- What the language says of its compiler, asked once for each build.
   let salted = M.unwrapOr "" (M.map (\f -> "let lingua_salt = ${f} () in\n  ") (given "salt")) in
+  -- The compiler, asked once for each build that keeps parts, before any
+  -- unit is compiled.
+  let building =
+    if M.isSome (given "parts") then "let lingua_compiler = LinguaMake.compilerId () in\n  " else ""
+  in
   let resolverWith =
     \args ->
       "LinguaMake.resolverOf \"${M.unwrapOr "~/.${lang}/git" (given "cache")}\" \"${get "cacheEnv"}\" \"${get "lock"}\" root ${args}"
@@ -1797,7 +1806,7 @@ ${vis}fun update${name} (root : String) (lingua_names : [String]) (lingua_dryRun
 -- ${lang}'s build: the unit at `root` and every unit it depends on, each
 -- compiled only if what it would be compiled from has changed.${if M.isSome lock then " Offline, it\n-- reaches no network: what it depends on must be in the cache. Locked, it\n-- fails rather than change the lock file." else ""}
 ${vis}fun build${name}${withName} ${flags}(root : String) =
-  ${salted}${settle "\"\""}LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "\"\""}) root LinguaMake.noOptions ${compiled False} (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect
+  ${salted}${building}${settle "\"\""}LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "\"\""}) root LinguaMake.noOptions ${compiled False} (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect
 
 -- What the unit at `dir` was compiled from in `root`'s last build.
 ${vis}fun given${name} (root : String) (dir : String) =
@@ -1829,7 +1838,7 @@ ${vis}fun build${name}${withName} ${flags}(lingua_profile : String) (lingua_set 
   match ${lower}Profile lingua_profile with
   | None -> (let lingua_u = LinguaMake.sayError \"${lang} has no profile `\${lingua_profile}`: it has \${LinguaS.join \", \" ${lower}Profiles}\" in False)
   | Just lingua_base ->
-      ${salted}${settle "lingua_profile"}LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "lingua_profile"}) root
+      ${salted}${building}${settle "lingua_profile"}LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "lingua_profile"}) root
         { resolve = \\lingua_dir lingua_manifest -> (let lingua_r = (match ${lower}With lingua_base ${over} with | Err lingua_e -> Err lingua_e | Ok lingua_o -> ${lower}With lingua_o lingua_set) in ${last}), compileKey = lingua${name}_compileKey, linkKey = lingua${name}_linkKey }
         ${compiled True} (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} o l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect
 
