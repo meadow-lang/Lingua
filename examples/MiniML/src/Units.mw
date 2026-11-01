@@ -293,6 +293,7 @@ make! {
     | sources = ".ml"
     | manifest = "Unit"
     | compile = compileTuned
+    | salt = noSalt
     | options {
       level : Low | High = Low "how hard to try"
       twice : Bool = False "check each file twice"
@@ -585,6 +586,7 @@ make! {
     | dependencies = fetchedDeps
     | lock = "Unit.lock"
     | cache = "target/fetched-cache/git"
+    | salt = noSalt
 }
 
 fun fetchedDeps (root : String) (dir : String) (text : String) : Result String [Dep] =
@@ -680,3 +682,110 @@ fun gitIn (dir : String) (args : [String]) =
        (fst refused, S.contains "the build is locked" (snd refused), lockNow () == afterUpdate)
        (False, True, True)
        "a locked build refuses what the lock file does not pin"
+
+-- --- what a language says of its compiler -------------------------------------
+--
+-- Run by `meadow run`, a compiler's own program is `meadow`, which does not
+-- change when the compiler does: `salt` says what does. Here it is read from
+-- a file, which a test writes as a rebuilt compiler would change it.
+make! {
+  Salted "miniml"
+    | sources = ".ml"
+    | manifest = "Unit"
+    | compile = compileUnit
+    | link = linkProgram
+    | salt = saltOfUnits
+}
+
+make! {
+  SaltedParts "miniml"
+    | sources = ".ml"
+    | manifest = "Unit"
+    | parts = importsIn
+    | compilePart = compiledPart
+    | assemble = assembledParts
+    | salt = saltOfParts
+}
+
+fun noSalt () = ""
+
+fun saltOfUnits () = Res.unwrapOr "" (readToString "target/salt-units")
+
+fun saltOfParts () = Res.unwrapOr "" (readToString "target/salt-parts")
+
+@test fun aSaltChangedCompilesEveryUnitAgainAndLinksThem () =
+  let root = "target/build-salted" in
+  let z = removeDirAll root in
+  let y = writeString ("target/salt-units", "one") in
+  let lib = Path.join root "lib" in
+  let app = Path.join root "app" in
+  let a = write lib "Unit" "" in
+  let b = write lib "double.ml" "fun x -> x + x" in
+  let c = write app "Unit" "../lib\n" in
+  let d = write app "main.ml" "double 21" in
+  let lines = \said -> V.filter (\l -> S.startsWith "   " l) (S.lines said) in
+  let build = \u -> withOutput (\() -> buildSalted app) in
+  let first = build () in
+  let second = build () in
+  let e = writeString ("target/salt-units", "two") in
+  let third = build () in
+  let x = assertEq (fst first, fst second, fst third) (True, True, True) "each build" in
+  let w =
+    assertEq
+      (lines (snd second))
+      ["   Fresh lib", "   Fresh app", "   Fresh link"]
+      "the same salt, nothing to do"
+  in assertEq
+       (V.take (lines (snd third)) 3)
+       ["   Compiled lib", "   Compiled app", "   Linked app"]
+       "another salt: every unit, though its sources are the same, and the link"
+
+@test fun aSaltChangedCompilesEveryPartAgain () =
+  let root = "target/build-salted-parts" in
+  let z = removeDirAll root in
+  let y = writeString ("target/salt-parts", "one") in
+  let app = Path.join root "app" in
+  let a = write app "Unit" "" in
+  let b = write app "a.ml" "1" in
+  let c = write app "b.ml" "2" in
+  let log = Path.joinAll [app, "target", "units", "app", "compiled.log"] in
+  let compiled = \u -> V.len (S.lines (Res.unwrapOr "" (readToString log))) in
+  let build = \u -> fst (withOutput (\() -> buildSaltedParts app)) in
+  let first = build () in
+  let afterFirst = compiled () in
+  let second = build () in
+  let afterSecond = compiled () in
+  let d = writeString ("target/salt-parts", "two") in
+  let third = build () in
+  assertEq
+    ((first, second, third), afterFirst, afterSecond, compiled ())
+    ((True, True, True), 2, 2, 4)
+    "two parts, none the same salt, and both again with another"
+
+@test fun aPartIsCompiledAgainWhenAUnitItsUnitDependsOnChanges () =
+  let root = "target/build-parts-deps" in
+  let z = removeDirAll root in
+  let lib = Path.join root "lib" in
+  let app = Path.join root "app" in
+  let a = write lib "Unit" "" in
+  let b = write lib "one.ml" "1" in
+  let c = write app "Unit" "../lib\n" in
+  let d = write app "a.ml" "1" in
+  let e = write app "b.ml" "2" in
+  let log = Path.joinAll [app, "target", "units", "app", "compiled.log"] in
+  let compiled = \u -> V.len (S.lines (Res.unwrapOr "" (readToString log))) in
+  let build = \u -> fst (withOutput (\() -> buildParted app)) in
+  let first = build () in
+  let afterFirst = compiled () in
+  -- `lib` is fresh, its interface read back from where it is kept: a part
+  -- that did not change is still what it was compiled from.
+  let f = write app "a.ml" "11" in
+  let second = build () in
+  let afterSecond = compiled () in
+  -- `lib`'s interface changes, and nothing of `app` does.
+  let g = write lib "two.ml" "2" in
+  let third = build () in
+  assertEq
+    ((first, second, third), afterFirst, afterSecond, compiled ())
+    ((True, True, True), 2, 3, 5)
+    "both parts; the one that changed; and both, against the new interface"
