@@ -104,7 +104,7 @@ use Std.Test (assertEq)
 use Std.Console (withOutput)
 use Std.Fs (Fs, createDirAll, removeDirAll, removeFile, appendString, readToString)
 use Std.Result as Res
-use Std.Process (spawn)
+use Std.Process (spawn, currentExe)
 use Lingua.Resolve (Dep, GitRef, reqOf)
 
 -- Build `root` and say, for each unit, how it went.
@@ -789,3 +789,63 @@ fun saltOfParts () = Res.unwrapOr "" (readToString "target/salt-parts")
     ((first, second, third), afterFirst, afterSecond, compiled ())
     ((True, True, True), 2, 3, 5)
     "both parts; the one that changed; and both, against the new interface"
+
+-- A build as compiled by the program `exe`.
+fun asCompiler (exe : String) act =
+  handle act () with { currentExe () resume -> resume exe, return x -> x }
+
+@test fun aPartIsCompiledAgainByAnotherCompiler () =
+  let root = "target/build-parts-compiler" in
+  let z = removeDirAll root in
+  let app = Path.join root "app" in
+  let a = write app "Unit" "" in
+  let b = write app "a.ml" "1" in
+  let c = write app "b.ml" "2" in
+  let log = Path.joinAll [app, "target", "units", "app", "compiled.log"] in
+  let compiled = \u -> V.len (S.lines (Res.unwrapOr "" (readToString log))) in
+  let build = \exe -> fst (asCompiler exe (\() -> withOutput (\() -> buildParted app))) in
+  let first = build "compiler-one" in
+  let afterFirst = compiled () in
+  let second = build "compiler-one" in
+  let afterSecond = compiled () in
+  let third = build "compiler-two" in
+  assertEq
+    ((first, second, third), afterFirst, afterSecond, compiled ())
+    ((True, True, True), 2, 2, 4)
+    "both parts; none by the same compiler; both by another, not what the last one kept"
+
+-- A build in parts with options: each part is given them, and is compiled
+-- again by another compiler as one with none is.
+make! {
+  TunedParts "miniml"
+    | sources = ".ml"
+    | manifest = "Unit"
+    | parts = importsIn
+    | compilePart = tunedPart
+    | assemble = tunedParts
+    | options { twice : Bool = False "check each file twice" }
+}
+
+fun tunedPart o (x : Part [String] String) = compiledPart x
+
+fun tunedParts o (g : Given [String]) (ps : [String]) = assembledParts g ps
+
+@test fun aPartWithOptionsIsCompiledAgainByAnotherCompiler () =
+  let root = "target/build-parts-tuned" in
+  let z = removeDirAll root in
+  let app = Path.join root "app" in
+  let a = write app "Unit" "" in
+  let b = write app "a.ml" "1" in
+  let log = Path.joinAll [app, "target", "debug", "units", "app", "compiled.log"] in
+  let compiled = \u -> V.len (S.lines (Res.unwrapOr "" (readToString log))) in
+  let build =
+    \exe -> fst (asCompiler exe (\() -> withOutput (\() -> buildTunedParts "debug" [] app)))
+  in
+  let first = build "compiler-one" in
+  let second = build "compiler-one" in
+  let afterSecond = compiled () in
+  let third = build "compiler-two" in
+  assertEq
+    ((first, second, third), afterSecond, compiled ())
+    ((True, True, True), 1, 2)
+    "once, and again"

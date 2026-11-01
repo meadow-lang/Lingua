@@ -125,7 +125,7 @@ nothing was compiled reads no interface and writes nothing. An interface file
 that has gone missing makes its unit compile again.
 
 A build kept by a different compiler binary, or by an older layout of these
-files, is not trusted: every unit is compiled once more.
+files, is not trusted: every unit is compiled once more, and so is every part.
 
 **A compiler that changed.** What a build keeps is the compiler's as much as
 the sources', so a build by another compiler starts again. It knows the
