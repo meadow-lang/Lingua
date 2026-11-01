@@ -974,8 +974,12 @@ type PartDone p = (String, Int, [(String, Int)], Result (Bool, String) (p, Int))
       (V.range 0 (V.len comps))
   in
   let deepest = V.foldl (\d n -> max d (HashMap.getOr 0 n depths)) 0 names in
+  -- A part is compiled against every unit its unit depends on: each one's
+  -- interface is something it was compiled from. Hashed once, for all of them.
+  let units = V.map (\x -> (fst x, hash (snd x))) (unitImports u) in
   let step =
-    \done i -> partStep key compilePart encode decode u dir comps names importsOf before done i
+    \done i ->
+      partStep key units compilePart encode decode u dir comps names importsOf before done i
   in
   let stepped =
     V.foldl
@@ -1033,7 +1037,7 @@ type PartDone p = (String, Int, [(String, Int)], Result (Bool, String) (p, Int))
 
 -- Part `i`, compiled -- unless what it would be compiled from is what it was,
 -- and its interface is still kept -- given what became of the parts before it.
-fun partStep key compilePart encode decode u dir comps names importsOf before done i =
+fun partStep key units compilePart encode decode u dir comps names importsOf before done i =
   let name = V.getOr "" names i in
   let members = V.getOr [] comps i in
   let deps = importsOf i in
@@ -1052,7 +1056,8 @@ fun partStep key compilePart encode decode u dir comps names importsOf before do
     hash (
       V.filter (\x -> V.elem (fst x) members) (unitSources u),
       key,
-      sort (V.map fst (unitSources u))
+      sort (V.map fst (unitSources u)),
+      units
     )
   in match blocker with
      | Just n -> (name, src, [], Err (True, "${name} imports ${n}, which did not build"))

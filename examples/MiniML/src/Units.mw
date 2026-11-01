@@ -761,3 +761,31 @@ fun saltOfParts () = Res.unwrapOr "" (readToString "target/salt-parts")
     ((first, second, third), afterFirst, afterSecond, compiled ())
     ((True, True, True), 2, 2, 4)
     "two parts, none the same salt, and both again with another"
+
+@test fun aPartIsCompiledAgainWhenAUnitItsUnitDependsOnChanges () =
+  let root = "target/build-parts-deps" in
+  let z = removeDirAll root in
+  let lib = Path.join root "lib" in
+  let app = Path.join root "app" in
+  let a = write lib "Unit" "" in
+  let b = write lib "one.ml" "1" in
+  let c = write app "Unit" "../lib\n" in
+  let d = write app "a.ml" "1" in
+  let e = write app "b.ml" "2" in
+  let log = Path.joinAll [app, "target", "units", "app", "compiled.log"] in
+  let compiled = \u -> V.len (S.lines (Res.unwrapOr "" (readToString log))) in
+  let build = \u -> fst (withOutput (\() -> buildParted app)) in
+  let first = build () in
+  let afterFirst = compiled () in
+  -- `lib` is fresh, its interface read back from where it is kept: a part
+  -- that did not change is still what it was compiled from.
+  let f = write app "a.ml" "11" in
+  let second = build () in
+  let afterSecond = compiled () in
+  -- `lib`'s interface changes, and nothing of `app` does.
+  let g = write lib "two.ml" "2" in
+  let third = build () in
+  assertEq
+    ((first, second, third), afterFirst, afterSecond, compiled ())
+    ((True, True, True), 2, 3, 5)
+    "both parts; the one that changed; and both, against the new interface"

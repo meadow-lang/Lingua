@@ -193,6 +193,10 @@ interface it reads changed, as always. Then, inside it:
 - a part that fails blocks the parts that import it, and the unit fails with
   what its compiler said.
 
+A part is compiled against every unit its unit depends on, so when one of
+their interfaces changes, every part of the unit is compiled again, whether
+or not its own sources changed.
+
 What a part was compiled from, and its interface, are kept in the unit's own
 directory, under `parts/`. A part's name is made from its sources' paths, so
 the same sources are the same part from one build to the next, and what is
