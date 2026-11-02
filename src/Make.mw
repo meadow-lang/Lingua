@@ -30,7 +30,8 @@
 --
 -- The compiler is held to that. It runs under a handler for `Fs` through
 -- which it can read its unit's sources and what is in its own directory, and
--- write only in that directory; anything else it asks for fails, so a read
+-- write only in that directory; anything else it asks for fails -- and what it
+-- may not read is not there, to anything that asks whether it is -- so a read
 -- the build system did not know about cannot leave a unit's answer stale.
 --
 -- A language whose units say more than a list of paths -- Meadow's
@@ -74,7 +75,8 @@ use Std.Thread as Thread
 use Std.Compact as Compact
 use Std.Fs (
   Fs, FileMeta, readToString, readBytes, writeString, writeBytes, appendString, removeFile,
-  removeDirAll, createDirAll, readDir, isDir, exists, metadata, rename, copy
+  removeDirAll, removeDir, createDir, createDirAll, readDir, isDir, isFile, exists, metadata,
+  rename, copy
 )
 use Std.Process (Process, currentExe, currentPid)
 use Std.Console (Console, writeOutput)
@@ -424,18 +426,20 @@ use Outcome.*
       (\acc r -> if V.elem r acc then acc else V.pushBack acc r)
       []
       (V.map Path.normalize roots)
-  in made
-       schedule
-       lang
-       us
-       home
-       (V.map (\r -> (r, linkDirOf home us.sub r)) each)
-       False
-       opts
-       compile
-       link
-       encode
-       decode
+  in if V.isEmpty each then (let u = sayError "there are no roots to build in ${home}" in False)
+     else
+       made
+         schedule
+         lang
+         us
+         home
+         (V.map (\r -> (r, linkDirOf home us.sub r)) each)
+         False
+         opts
+         compile
+         link
+         encode
+         decode
 
 -- A build kept at `base` of `places`, each root and where its link writes:
 -- the whole of what is kept there, or -- not `whole` -- a part of it.
@@ -668,17 +672,22 @@ fun said lang root dir outcome =
 -- `target/units`, named for its path from the directory the root unit is in
 -- (`lib`, `app`) -- or, for one elsewhere, for its last part and a hash of the
 -- whole, since a path from another drive or directory would reach out of
--- `units` altogether.
+-- `units` altogether. A `_` stands between the parts of a path, so a path with
+-- one in a part has a hash too: `a_b/c` and `a/b_c` are not one unit.
 fun outDir root (sub : String) dir =
   Path.joinAll [home (Path.normalize root) sub, "units", outName root dir]
 
 fun outName root dir =
   let d = Path.normalize dir in
   let name = relative root d in
-  if name != d then S.join "_" (Path.components name)
-  else
-    let h = hash d in
-    "${Path.fileName d}-${show (if h < 0 then 0 - h else h)}"
+  let parts = Path.components name in
+  if name == d then hashedName (Path.fileName d) d
+  else if V.any (\p -> S.contains "_" p) parts then hashedName (S.join "_" parts) name
+  else S.join "_" parts
+
+fun hashedName (name : String) (whole : String) : String =
+  let h = hash whole in
+  "${name}-${show (if h < 0 then 0 - h else h)}"
 
 -- A unit's name: its path from the directory the root unit is in -- `lib`
 -- and `app`, side by side -- or the whole of it, for one elsewhere.
@@ -1259,7 +1268,8 @@ fun partStep key units compilePart encode decode u dir comps names importsOf bef
 -- covers: the dependencies they reach brought to the newest their manifests
 -- take -- those in `names`, or every one when it is empty -- what moved said,
 -- and the lock file written unless this is a dry run, with what nothing wants
--- any more dropped. Whether it could be.
+-- any more dropped. Whether it could be. With no roots it could not: nothing
+-- would want anything, and the lock file would be left with nothing in it.
 @pub fun updated
     (r : R.Resolver)
     (lang : String)
@@ -1275,42 +1285,44 @@ fun partStep key units compilePart encode decode u dir comps names importsOf bef
         match R.settle r lang with
         | Err why -> (let x = sayError why in False)
         | Ok _ -> True
-  in match graphOf us root roots with
-     | Err why -> (let u = sayError why in False)
-     | Ok _ ->
-         let known = R.seenNames r in
-         match V.find (\n -> not (V.elem n known)) names with
-         | Just n ->
-             let u =
-               sayError
-                 "`${n}` is not a git dependency of this unit.\nIts dependencies are: ${if V.isEmpty known then "none" else S.join ", " known}"
-             in False
-         | None ->
-             let moved = R.movedBy r in
-             let one = V.len moved == 1 in
-             let u =
-               writeOutput
-                 "   Locking ${show (V.len moved)} ${if one then "dependency" else "dependencies"} to the latest commit${if one then "" else "s"}\n"
-             in if V.isEmpty moved then
-                  (let w = writeOutput "   Unchanged every git dependency is already current\n" in
-                   settling ())
-                else
-                  let w =
-                    V.foldl
-                      (\acc m ->
-                        match m with
-                        | (n, was, now) ->
-                            writeOutput
-                              (if S.isEmpty was then "   Adding ${n} ${now}\n"
-                               else "   Updating ${n} ${was} -> ${now}\n"))
-                      ()
-                      moved
-                  in
-                  let x =
-                    if dryRun then
-                      writeOutput "warning: not updating the lock file, as this is a dry run\n"
-                    else ()
-                  in settling ()
+  in if V.isEmpty roots then (let u = sayError "there are no roots to update in ${root}" in False)
+     else
+       match graphOf us root roots with
+       | Err why -> (let u = sayError why in False)
+       | Ok _ ->
+           let known = R.seenNames r in
+           match V.find (\n -> not (V.elem n known)) names with
+           | Just n ->
+               let u =
+                 sayError
+                   "`${n}` is not a git dependency of this unit.\nIts dependencies are: ${if V.isEmpty known then "none" else S.join ", " known}"
+               in False
+           | None ->
+               let moved = R.movedBy r in
+               let one = V.len moved == 1 in
+               let u =
+                 writeOutput
+                   "   Locking ${show (V.len moved)} ${if one then "dependency" else "dependencies"} to the latest commit${if one then "" else "s"}\n"
+               in if V.isEmpty moved then
+                    (let w = writeOutput "   Unchanged every git dependency is already current\n" in
+                     settling ())
+                  else
+                    let w =
+                      V.foldl
+                        (\acc m ->
+                          match m with
+                          | (n, was, now) ->
+                              writeOutput
+                                (if S.isEmpty was then "   Adding ${n} ${now}\n"
+                                 else "   Updating ${n} ${was} -> ${now}\n"))
+                        ()
+                        moved
+                    in
+                    let x =
+                      if dryRun then
+                        writeOutput "warning: not updating the lock file, as this is a dry run\n"
+                      else ()
+                    in settling ()
 
 -- A truth, as an option is given one on a command line or in a manifest.
 @pub fun asBool (value : String) : Maybe Bool =
@@ -1335,50 +1347,42 @@ fun partStep key units compilePart encode decode u dir comps names importsOf bef
 
 -- --- the compiler, held to its unit ------------------------------------------
 
--- A copy from what is `readable` to under `out`, into a directory made for
--- it: a copy, not a read and a write, so that an executable stays one.
-fun copied readable refused out w =
-  if not (readable (fst w)) then refused (fst w)
-  else if not (under out (snd w)) then refused (snd w)
-  else let u = M.map createDirAll (Path.parent (snd w)) in copy w
-
 -- `act`, able to read `sources` and what is under `out`, and to write only
 -- under `out`: anything else it asks the file system for fails, saying why.
 @pub fun sandboxed (sources : [String]) (out : String) act =
-  let made = \p -> M.map createDirAll (Path.parent p) in
-  let readable = \p -> V.elem (Path.normalize p) (V.map Path.normalize sources) or under out p in
-  let refused = \p -> Err "${p} is not an input of this unit" in
-  handle act () with {
-    readToString p resume -> resume (if readable p then readToString p else refused p),
-    readBytes p resume -> resume (if readable p then readBytes p else refused p),
-    readDir p resume ->
-      resume (if under out p then (if exists p then readDir p else Ok []) else refused p),
-    writeString w resume ->
-      resume
-        (if under out (fst w) then (let u = made (fst w) in writeString w) else refused (fst w)),
-    writeBytes w resume ->
-      resume
-        (if under out (fst w) then (let u = made (fst w) in writeBytes w) else refused (fst w)),
-    appendString w resume ->
-      resume
-        (if under out (fst w) then (let u = made (fst w) in appendString w) else refused (fst w)),
-    removeFile p resume -> resume (if under out p then removeFile p else refused p),
-    createDirAll p resume -> resume (if under out p then createDirAll p else refused p),
-    copy w resume -> resume (copied readable refused out w),
-    return x -> x
-  }
+  let inputs = V.map Path.normalize sources in
+  heldTo
+    (\p -> V.elem (Path.normalize p) inputs or under out p)
+    "is not an input of this unit"
+    out
+    act
 
 -- A link, able to read what is under each of `units` -- the directories the
 -- units wrote into -- and under `out`, and to write only under `out`.
 @pub fun linkingIn (units : [String]) (out : String) act =
+  heldTo
+    (\p -> under out p or V.any (\d -> under d p) units)
+    "is not what a unit of this build wrote"
+    out
+    act
+
+-- `act`, able to read what is `readable` and to change what is under `out`.
+-- What it may not ask fails, saying `why`; whether a thing is there has no way
+-- to fail, and what it may not read is not there. A copy goes from what it may
+-- read to under `out`, into a directory made for it: a copy, not a read and a
+-- write, so that an executable stays one.
+fun heldTo readable (why : String) (out : String) act =
   let made = \p -> M.map createDirAll (Path.parent p) in
-  let readable = \p -> under out p or V.any (\d -> under d p) units in
-  let refused = \p -> Err "${p} is not what a unit of this build wrote" in
+  let refused = \p -> Err "${p} ${why}" in
   handle act () with {
     readToString p resume -> resume (if readable p then readToString p else refused p),
     readBytes p resume -> resume (if readable p then readBytes p else refused p),
     readDir p resume ->
       resume (if readable p then (if exists p then readDir p else Ok []) else refused p),
+    metadata p resume -> resume (if readable p then metadata p else refused p),
+    exists p resume -> resume (readable p and exists p),
+    isFile p resume -> resume (readable p and isFile p),
+    isDir p resume -> resume (readable p and isDir p),
     writeString w resume ->
       resume
         (if under out (fst w) then (let u = made (fst w) in writeString w) else refused (fst w)),
@@ -1389,8 +1393,20 @@ fun copied readable refused out w =
       resume
         (if under out (fst w) then (let u = made (fst w) in appendString w) else refused (fst w)),
     removeFile p resume -> resume (if under out p then removeFile p else refused p),
+    removeDir p resume -> resume (if under out p then removeDir p else refused p),
+    removeDirAll p resume -> resume (if under out p then removeDirAll p else refused p),
+    createDir p resume -> resume (if under out p then createDir p else refused p),
     createDirAll p resume -> resume (if under out p then createDirAll p else refused p),
-    copy w resume -> resume (copied readable refused out w),
+    rename w resume ->
+      resume
+        (if not (under out (fst w)) then refused (fst w)
+         else if not (under out (snd w)) then refused (snd w)
+         else rename w),
+    copy w resume ->
+      resume
+        (if not (readable (fst w)) then refused (fst w)
+         else if not (under out (snd w)) then refused (snd w)
+         else (let u = made (snd w) in copy w)),
     return x -> x
   }
 
@@ -2065,6 +2081,85 @@ use Std.Result as Res
        compiled
        (True, Err "${root}/elsewhere is not an input of this unit")
        "a compiler is held the same way"
+
+@test fun aCompilerCanNeitherSeeNorChangeWhatIsNotItsOwn () =
+  let root = "target/lingua-held" in
+  let z = removeDirAll root in
+  let out = Path.join root "out" in
+  let outside = Path.join root "outside" in
+  let dir = Path.join outside "dir" in
+  let file = Path.join outside "file" in
+  let mine = Path.join out "mine" in
+  let a = createDirAll dir in
+  let b = createDirAll out in
+  let c = writeString (file, "kept") in
+  let d = writeString (mine, "mine") in
+  let refused = \p -> Err "${p} is not an input of this unit" in
+  let seen =
+    sandboxed [] out (\() -> (exists file, isFile file, isDir dir, Res.isOk (metadata file)))
+  in
+  let e = assertEq seen (False, False, False, False) "nothing there, as far as it can tell" in
+  let changed =
+    sandboxed [] out (\() ->
+      (
+        createDir (Path.join outside "new"),
+        removeDir dir,
+        removeDirAll outside,
+        rename (file, Path.join out "taken"),
+        rename (mine, Path.join outside "put")
+      ))
+  in
+  let f =
+    assertEq
+      changed
+      (
+        refused (Path.join outside "new"),
+        refused dir,
+        refused outside,
+        refused file,
+        refused (Path.join outside "put")
+      )
+      "each refused"
+  in
+  let g =
+    assertEq
+      (exists file, exists dir, exists (Path.join outside "new"), exists mine)
+      (True, True, False, True)
+      "and none of it done"
+  in
+  let own =
+    sandboxed [] out (\() ->
+      let sub = Path.join out "sub" in
+      (
+        (exists mine, isFile mine, isDir out, Res.isOk (metadata mine)),
+        (
+          Res.isOk (createDir sub),
+          Res.isOk (rename (mine, Path.join sub "moved")),
+          Res.isOk (removeDirAll sub)
+        )
+      ))
+  in
+  let h =
+    assertEq own ((True, True, True, True), (True, True, True)) "what is its own is its own"
+  in assertEq
+       (linkingIn [dir] out (\() -> (isDir dir, isDir outside, exists file)))
+       (True, False, False)
+       "and a link sees what a unit of its build wrote, and no more"
+
+@test fun aUnitsNameIsNoOtherUnits () =
+  let named = \dir -> outName "top/ws" "top/${dir}" in
+  let a =
+    assertEq
+      (named "a/lib", named "a/one/two", outName "top/ws" "x/lib" == outName "top/ws" "y/lib")
+      ("a_lib", "a_one_two", False)
+      "a path from the root's parent, as ever"
+  in
+  let b =
+    assertEq
+      (named "a_b/c" == named "a/b_c", named "a/b" == named "a_b", named "a_b" == named "a_b")
+      (False, False, True)
+      "and one with `_` in it is not taken for one with a part more"
+  in assertEq (S.startsWith "a_b_c-" (named "a_b/c")) True "still to be read"
 
 @test fun unitsAreBuiltInRoundsOfWhatTheyDependOn () =
   assertEq
