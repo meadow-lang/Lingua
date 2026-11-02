@@ -57,6 +57,11 @@
 -- And `givenBuild root dir`: what the unit at `dir` was compiled from in
 -- `root`'s last build -- its sources, and the interfaces it imported -- for a
 -- tool that asks the compiler about a unit again.
+--
+-- A workspace is several roots in one place: `buildBuildIn home roots` builds
+-- the units `roots` reach as one graph, each once, kept under `home`'s
+-- `target`, and runs the link once for each root. `home` is no unit unless a
+-- root says it is, and which roots a workspace has is the language's to say.
 
 use Std.Collections.Vector as V
 use Std.Collections.HashMap as HashMap
@@ -69,7 +74,7 @@ use Std.Thread as Thread
 use Std.Compact as Compact
 use Std.Fs (
   Fs, FileMeta, readToString, readBytes, writeString, writeBytes, appendString, removeFile,
-  removeDirAll, createDirAll, readDir, isDir, exists, metadata, rename
+  removeDirAll, createDirAll, readDir, isDir, exists, metadata, rename, copy
 )
 use Std.Process (Process, currentExe, currentPid)
 use Std.Console (Console, writeOutput)
@@ -150,7 +155,18 @@ fun filesOf us (dir : String) : [String] ! { Fs | e } =
 -- first thing wrong: a unit that is not one, or units that depend on each
 -- other in a circle.
 fun graph us (root : String) : Result String [(String, [String])] ! { Fs | e } =
-  visit us (Path.normalize root) [] [] (Path.normalize root)
+  graphOf us root [root]
+
+-- The same of several roots, each unit once whichever reaches it: `home` is
+-- the root a language's `dependencies` is told of.
+fun graphOf us (home : String) (roots : [String]) =
+  V.foldl
+    (\acc r ->
+      match acc with
+      | Err e -> Err e
+      | Ok done -> visit us (Path.normalize home) [] done (Path.normalize r))
+    (Ok [])
+    roots
 
 fun visit us root (path : [String]) (done : [(String, [String])]) (dir : String) =
   if V.any (\d -> fst d == dir) done then Ok done
@@ -203,15 +219,21 @@ fun home root (sub : String) : String =
 
 fun statePath root (sub : String) = Path.join (home root sub) "lingua-build.json"
 
--- What the units were compiled from when the build was last linked, as one
--- number -- if it was, by this compiler.
-fun loadLinked (root : String) (sub : String) : Maybe Int ! { Fs, Process | e } =
+-- What the units were compiled from when each link last ran, as one number,
+-- by the directory it wrote into -- for those that did, by this compiler.
+fun loadLinks (root : String) (sub : String) : [(String, Int)] ! { Fs, Process | e } =
   match M.andThen (\text -> okOf (J.parse text)) (okOf (readToString (statePath root sub))) with
-  | None -> None
+  | None -> []
   | Just state ->
       if M.andThen J.asString (J.get "compiler" state) != Just (compilerId ())
-        or M.andThen J.asInt (J.get "lingua" state) != Just layout then None
-      else M.andThen J.asInt (J.get "linked" state)
+        or M.andThen J.asInt (J.get "lingua" state) != Just layout then []
+      else
+        V.concatMap
+          (\l ->
+            match J.asInt (snd l) with
+            | Just f -> [(fst l, f)]
+            | None -> [])
+          (M.unwrapOr [] (M.andThen J.asObject (J.get "links" state)))
 
 fun loadState (root : String) (sub : String) : HashMap String Built ! { Fs, Process | e } =
   match readToString (statePath root sub) with
@@ -314,7 +336,11 @@ fun prune (root : String) (sub : String) (owned : [String]) =
        ()
        (M.unwrapOr [] (okOf (readDir interfaces)))
 
-fun saveState (root : String) (sub : String) (state : HashMap String Built) (linked : Maybe Int) =
+fun saveState
+    (root : String)
+    (sub : String)
+    (state : HashMap String Built)
+    (links : [(String, Int)]) =
   let units =
     V.map
       (\p ->
@@ -342,16 +368,12 @@ fun saveState (root : String) (sub : String) (state : HashMap String Built) (lin
     writeString (
       aside,
       J.render
-        (J.jObject
-           (V.append
-              [
-                ("lingua", J.jInt layout),
-                ("compiler", J.jString (compilerId ())),
-                ("units", J.jObject units)
-              ]
-              (match linked with
-               | Just f -> [("linked", J.jInt f)]
-               | None -> [])))
+        (J.jObject [
+           ("lingua", J.jInt layout),
+           ("compiler", J.jString (compilerId ())),
+           ("units", J.jObject units),
+           ("links", J.jObject (V.map (\l -> (fst l, J.jInt (snd l))) links))
+         ])
     )
   in rename (aside, statePath root sub)
 
@@ -378,22 +400,71 @@ use Outcome.*
 -- is compiled from: change one a unit's compiling depends on and that unit is
 -- compiled again; change one only the link reads and only the link is run.
 @pub fun makeUnits schedule lang us root opts compile link encode decode =
+  made
+    schedule
+    lang
+    us
+    root
+    [(Path.normalize root, linkDirIn root us.sub)]
+    True
+    opts
+    compile
+    link
+    encode
+    decode
+
+-- The same of several roots, kept in `home`'s `target`: every unit they reach
+-- as one graph, each compiled once, and the link run for each root by itself,
+-- each in a directory of its own (`linkDirOf`). Which roots a build is told of
+-- may change from one build to the next, so it takes away nothing it did not
+-- reach: what another root built is there when that root is built again.
+@pub fun makeRoots schedule lang us home roots opts compile link encode decode =
+  let each =
+    V.foldl
+      (\acc r -> if V.elem r acc then acc else V.pushBack acc r)
+      []
+      (V.map Path.normalize roots)
+  in made
+       schedule
+       lang
+       us
+       home
+       (V.map (\r -> (r, linkDirOf home us.sub r)) each)
+       False
+       opts
+       compile
+       link
+       encode
+       decode
+
+-- A build kept at `base` of `places`, each root and where its link writes:
+-- the whole of what is kept there, or -- not `whole` -- a part of it.
+fun made schedule lang us base places (whole : Bool) opts compile link encode decode =
   let sub = us.sub in
   let rootOptions =
-    opts.resolve
-      (Path.normalize root)
-      (M.unwrapOr "" (okOf (readToString (Path.join (Path.normalize root) us.manifest))))
-  in match (graph us root, rootOptions) with
+    V.foldl
+      (\acc p ->
+        match acc with
+        | Err e -> Err e
+        | Ok os ->
+            (match opts.resolve
+               (fst p)
+               (M.unwrapOr "" (okOf (readToString (Path.join (fst p) us.manifest)))) with
+             | Err e -> Err e
+             | Ok o -> Ok (V.pushBack os (fst p, snd p, o))))
+      (Ok [])
+      places
+  in match (graphOf us base (V.map fst places), rootOptions) with
      | (Err why, _) -> (let u = writeOutput "error: ${why}\n" in False)
      | (_, Err why) -> (let u = writeOutput "error: ${why}\n" in False)
-     | (Ok units, Ok linkOptions) ->
-         let before = loadState root sub in
+     | (Ok units, Ok roots) ->
+         let before = loadState base sub in
          let done =
            schedule
              (\done dir ->
                plan
                  us
-                 root
+                 base
                  before
                  done
                  dir
@@ -401,19 +472,21 @@ use Outcome.*
                  decode
                  opts)
              (\p -> carryOut compile p)
-             (\r -> keeping root sub encode r)
+             (\r -> keeping base sub encode r)
              (\r ->
                match r with
                | (dir, outcome, b, i) ->
-                   (let u = writeOutput (said lang root dir outcome) in (dir, outcome, b, i)))
+                   (let u = writeOutput (said lang base dir outcome) in (dir, outcome, b, i)))
              units
          in
          let dirs = V.map fst units in
          let kept =
-           V.foldl
-             (\m kv -> if V.elem (fst kv) dirs then HashMap.insert (fst kv) (snd kv) m else m)
-             HashMap.empty
-             (HashMap.toVec before)
+           if not whole then before
+           else
+             V.foldl
+               (\m kv -> if V.elem (fst kv) dirs then HashMap.insert (fst kv) (snd kv) m else m)
+               HashMap.empty
+               (HashMap.toVec before)
          in
          let state =
            V.foldl
@@ -424,7 +497,7 @@ use Outcome.*
              kept
              done
          in
-         let p = prune root sub (V.map (outName root) dirs) in
+         let p = if whole then prune base sub (V.map (outName base) dirs) else () in
          let counts = \p -> V.len (V.filter (\d -> match d with | (_, o, _, _) -> p o) done) in
          let compiled = counts (\o -> match o with | Compiled -> True | _ -> False) in
          let fresh = counts (\o -> match o with | Fresh -> True | _ -> False) in
@@ -439,58 +512,75 @@ use Outcome.*
            writeOutput
              "${lang}: ${show compiled} compiled, ${show fresh} up to date${if failed > 0 then ", ${show failed} failed" else ""}\n"
          in
-         -- The link, once every unit is built: unless the units are compiled
-         -- from what they were when it last ran, and what it wrote is there.
+         -- Each root's link, once every unit it reaches is built: unless they
+         -- are compiled from what they were when it last ran, and what it
+         -- wrote is there. It reads what its root reaches and no more, so
+         -- what another root reaches does not run it.
          let inOrder = V.concat (rounds units) in
-         let from =
-           hash (
-             opts.linkKey linkOptions,
-             V.concatMap
-               (\dir ->
-                 match HashMap.lookup dir state with
-                 | Just (Built s ds _) -> [(dir, s, ds)]
-                 | None -> [])
-               inOrder
-           )
+         let table = V.foldl (\m u -> HashMap.insert (fst u) (snd u) m) HashMap.empty units in
+         let unbuilt =
+           V.concatMap (\d -> match d with | (dir, _, None, _) -> [dir] | _ -> []) done
          in
-         let was = loadLinked root sub in
-         let out = linkDirIn root sub in
+         let was = loadLinks base sub in
          -- What is kept is written again only when it is not what was read: a
          -- build that compiled nothing writes nothing.
          let same = compiled == 0 and HashMap.size state == HashMap.size before in
          let keep =
-           \linked ->
-             if same and linked == was then () else (let w = saveState root sub state linked in ())
-         in match link with
-            | None -> (let u = keep None in failed == 0)
-            | Just put ->
-                if failed > 0 then (let u = keep was in False)
-                else if was == Just from and exists out then
-                  (let u = keep was in
-                   let v = writeOutput "   Fresh link\n" in
-                   True)
-                else
-                  (let linking =
-                     Linking
-                       (Path.normalize root)
-                       (V.concatMap
-                          (\dir ->
-                            match interfaceIn root sub decode done dir with
-                            | Just c -> [(dir, Compact.get c, outDir root sub dir)]
-                            | None -> [])
-                          inOrder)
-                       out
-                   in match linkingIn (V.map (\dir -> outDir root sub dir) inOrder) out (\() ->
-                        put linkOptions linking) with
-                      | Ok _ ->
-                          (let u = keep (Just from) in
-                           let v =
-                             writeOutput "   Linked ${relative root (Path.normalize root)}\n"
-                           in True)
-                      | Err report ->
-                          (let u = keep None in
-                           let v = writeOutput "   Failed link\n${report}" in
-                           False))
+           \links ->
+             if same and links == was then () else (let w = saveState base sub state links in ())
+         in
+         let others = \links out -> V.filter (\l -> fst l != out) links in
+         match link with
+         | None -> (let u = keep was in failed == 0)
+         | Just put ->
+             let ran =
+               V.foldl
+                 (\acc r ->
+                   match (acc, r) with
+                   | ((links, ok), (root, out, linkOptions)) ->
+                       let reached = reachFrom table table root in
+                       let these = V.filter (\d -> HashMap.member d reached) inOrder in
+                       let from =
+                         hash (
+                           opts.linkKey linkOptions,
+                           V.concatMap
+                             (\dir ->
+                               match HashMap.lookup dir state with
+                               | Just (Built s ds _) -> [(dir, s, ds)]
+                               | None -> [])
+                             these
+                         )
+                       in if V.any (\d -> V.elem d unbuilt) these then (links, False)
+                          else if M.map snd (V.find (\l -> fst l == out) links) == Just from
+                            and exists out then
+                            (let v =
+                               writeOutput
+                                 "   Fresh link${if whole then "" else " ${relative base root}"}\n"
+                             in acc)
+                          else
+                            let linking =
+                              Linking
+                                root
+                                (V.concatMap
+                                   (\dir ->
+                                     match interfaceIn base sub decode done dir with
+                                     | Just c -> [(dir, Compact.get c, outDir base sub dir)]
+                                     | None -> [])
+                                   these)
+                                out
+                            in match linkingIn
+                                 (V.map (\dir -> outDir base sub dir) these)
+                                 out
+                                 (\() -> put linkOptions linking) with
+                               | Ok _ ->
+                                   (let v = writeOutput "   Linked ${relative base root}\n" in
+                                    (V.pushBack (others links out) (out, from), ok))
+                               | Err report ->
+                                   (let v = writeOutput "   Failed link\n${report}" in
+                                    (others links out, False)))
+                 (was, True)
+                 roots
+             in (let u = keep (fst ran) in snd ran)
 
 -- Where a build's link may write: a directory of its own under `target`.
 @pub fun linkDir (root : String) : String = linkDirIn root ""
@@ -498,6 +588,10 @@ use Outcome.*
 -- The same, of a build as profile `sub`.
 @pub fun linkDirIn (root : String) (sub : String) : String =
   Path.join (home (Path.normalize root) sub) "link"
+
+-- The same, of `root` among the roots of a build kept in `home`.
+@pub fun linkDirOf (home : String) (sub : String) (root : String) : String =
+  Path.join (linkDirIn home sub) (outName home root)
 
 -- A scheduler is given how a unit is planned from what is done so far --
 -- which reads the interfaces of the units it depends on -- how a plan is
@@ -732,9 +826,13 @@ fun dirOf r = match r with | (dir, _, _, _) -> dir
 -- that build left them -- or why there is none: the build did not reach it, or
 -- something it depends on did not build.
 @pub fun givenOf us root dir decode : Result String (Given i) ! { Fs | e } =
+  givenIn us root [root] dir decode
+
+-- The same of the last build of `roots` kept in `root`.
+@pub fun givenIn us root roots dir decode : Result String (Given i) ! { Fs | e } =
   let r = Path.normalize root in
   let d = Path.normalize dir in
-  match graph us r with
+  match graphOf us r roots with
   | Err why -> Err why
   | Ok units ->
       let state = loadState r us.sub in
@@ -1138,66 +1236,81 @@ fun partStep key units compilePart encode decode u dir comps names importsOf bef
 @pub fun resolvedDirs (r : R.Resolver) (from : String) (deps : Result String [R.Dep]) =
   R.dirsOf r from deps
 
--- Every unit `root` reaches, the dependencies its manifests name resolved by
--- `r`, and the lock file brought to what they resolved to: whether it could
--- be, the first thing wrong said.
-@pub fun settled (r : R.Resolver) (lang : String) us (root : String) =
-  match graph us root with
+-- Every unit `roots` reach, the dependencies their manifests name resolved by
+-- `r`, and the lock file in `root` brought to what they resolved to: whether
+-- it could be, the first thing wrong said. Unless `whole` -- these are all the
+-- roots the lock file covers -- it only gains: what they did not reach is left
+-- in it for those that do.
+@pub fun settled
+    (r : R.Resolver)
+    (lang : String)
+    us
+    (root : String)
+    (roots : [String])
+    (whole : Bool) =
+  match graphOf us root roots with
   | Err why -> (let u = sayError why in False)
   | Ok _ ->
-      (match R.settle r lang with
+      (match (if whole then R.settle r lang else R.settleSome r lang) with
        | Err why -> (let u = sayError why in False)
        | Ok _ -> True)
 
--- An update of the build of the unit at `root`: the dependencies it reaches
--- brought to the newest their manifests take -- those in `names`, or every one
--- when it is empty -- what moved said, and the lock file written unless this
--- is a dry run. Whether it could be.
+-- An update of the build of `roots`, every root the lock file in `root`
+-- covers: the dependencies they reach brought to the newest their manifests
+-- take -- those in `names`, or every one when it is empty -- what moved said,
+-- and the lock file written unless this is a dry run, with what nothing wants
+-- any more dropped. Whether it could be.
 @pub fun updated
     (r : R.Resolver)
     (lang : String)
     us
     (root : String)
+    (roots : [String])
     (names : [String])
     (dryRun : Bool) =
-  match graph us root with
-  | Err why -> (let u = sayError why in False)
-  | Ok _ ->
-      let known = R.seenNames r in
-      match V.find (\n -> not (V.elem n known)) names with
-      | Just n ->
-          let u =
-            sayError
-              "`${n}` is not a git dependency of this unit.\nIts dependencies are: ${if V.isEmpty known then "none" else S.join ", " known}"
-          in False
-      | None ->
-          let moved = R.movedBy r in
-          let one = V.len moved == 1 in
-          let u =
-            writeOutput
-              "   Locking ${show (V.len moved)} ${if one then "dependency" else "dependencies"} to the latest commit${if one then "" else "s"}\n"
-          in if V.isEmpty moved then
-               (let w = writeOutput "   Unchanged every git dependency is already current\n" in
-                True)
-             else
-               let w =
-                 V.foldl
-                   (\acc m ->
-                     match m with
-                     | (n, was, now) ->
-                         writeOutput
-                           (if S.isEmpty was then "   Adding ${n} ${now}\n"
-                            else "   Updating ${n} ${was} -> ${now}\n"))
-                   ()
-                   moved
-               in if dryRun then
-                    (let x =
-                       writeOutput "warning: not updating the lock file, as this is a dry run\n"
-                     in True)
-                  else
-                    match R.settle r lang with
-                    | Err why -> (let x = sayError why in False)
-                    | Ok _ -> True
+  let settling =
+    \u ->
+      if dryRun then True
+      else
+        match R.settle r lang with
+        | Err why -> (let x = sayError why in False)
+        | Ok _ -> True
+  in match graphOf us root roots with
+     | Err why -> (let u = sayError why in False)
+     | Ok _ ->
+         let known = R.seenNames r in
+         match V.find (\n -> not (V.elem n known)) names with
+         | Just n ->
+             let u =
+               sayError
+                 "`${n}` is not a git dependency of this unit.\nIts dependencies are: ${if V.isEmpty known then "none" else S.join ", " known}"
+             in False
+         | None ->
+             let moved = R.movedBy r in
+             let one = V.len moved == 1 in
+             let u =
+               writeOutput
+                 "   Locking ${show (V.len moved)} ${if one then "dependency" else "dependencies"} to the latest commit${if one then "" else "s"}\n"
+             in if V.isEmpty moved then
+                  (let w = writeOutput "   Unchanged every git dependency is already current\n" in
+                   settling ())
+                else
+                  let w =
+                    V.foldl
+                      (\acc m ->
+                        match m with
+                        | (n, was, now) ->
+                            writeOutput
+                              (if S.isEmpty was then "   Adding ${n} ${now}\n"
+                               else "   Updating ${n} ${was} -> ${now}\n"))
+                      ()
+                      moved
+                  in
+                  let x =
+                    if dryRun then
+                      writeOutput "warning: not updating the lock file, as this is a dry run\n"
+                    else ()
+                  in settling ()
 
 -- A truth, as an option is given one on a command line or in a manifest.
 @pub fun asBool (value : String) : Maybe Bool =
@@ -1222,6 +1335,13 @@ fun partStep key units compilePart encode decode u dir comps names importsOf bef
 
 -- --- the compiler, held to its unit ------------------------------------------
 
+-- A copy from what is `readable` to under `out`, into a directory made for
+-- it: a copy, not a read and a write, so that an executable stays one.
+fun copied readable refused out w =
+  if not (readable (fst w)) then refused (fst w)
+  else if not (under out (snd w)) then refused (snd w)
+  else let u = M.map createDirAll (Path.parent (snd w)) in copy w
+
 -- `act`, able to read `sources` and what is under `out`, and to write only
 -- under `out`: anything else it asks the file system for fails, saying why.
 @pub fun sandboxed (sources : [String]) (out : String) act =
@@ -1244,6 +1364,7 @@ fun partStep key units compilePart encode decode u dir comps names importsOf bef
         (if under out (fst w) then (let u = made (fst w) in appendString w) else refused (fst w)),
     removeFile p resume -> resume (if under out p then removeFile p else refused p),
     createDirAll p resume -> resume (if under out p then createDirAll p else refused p),
+    copy w resume -> resume (copied readable refused out w),
     return x -> x
   }
 
@@ -1269,6 +1390,7 @@ fun partStep key units compilePart encode decode u dir comps names importsOf bef
         (if under out (fst w) then (let u = made (fst w) in appendString w) else refused (fst w)),
     removeFile p resume -> resume (if under out p then removeFile p else refused p),
     createDirAll p resume -> resume (if under out p then createDirAll p else refused p),
+    copy w resume -> resume (copied readable refused out w),
     return x -> x
   }
 
@@ -1749,10 +1871,20 @@ fun written (pub : Bool) (name : String) (lang : String) ss declared profiles (o
   in
   -- What a build with a lock file does first: resolve, and settle the lock.
   let settle =
-    \sub ->
+    \sub roots whole ->
       if M.isSome lock then
-        "let lingua_resolver = ${resolverWith "lingua_offline lingua_locked False []"} in\n  if not (LinguaMake.settled lingua_resolver \"${lang}\" (${unitsIn sub}) root) then False\n  else\n  "
+        "let lingua_resolver = ${resolverWith "lingua_offline lingua_locked False []"} in\n  if not (LinguaMake.settled lingua_resolver \"${lang}\" (${unitsIn sub}) root ${roots} ${whole}) then False\n  else\n  "
       else ""
+  in
+  -- How a build begins, up to its options: of the unit at `root`, or of those
+  -- at `lingua_roots`, kept at `root`, which may be some of them.
+  let ofRoot =
+    \sub ->
+      "${settle sub "[root]" "True"}LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn sub}) root"
+  in
+  let ofRoots =
+    \sub ->
+      "${settle sub "lingua_roots" "False"}LinguaMake.makeRoots ${schedule} \"${lang}\" (${unitsIn sub}) root lingua_roots"
   in
   -- What it was compiled from is read with what is in the cache alone.
   let givenResolver =
@@ -1772,7 +1904,13 @@ ${vis}fun build${name} ${params}(root : String) = build${name}With False False $
 -- what moved said, and the lock file written unless it is a dry run.
 ${vis}fun update${name} (root : String) (lingua_names : [String]) (lingua_dryRun : Bool) =
   ${salted}let lingua_resolver = ${resolverWith "False False True lingua_names"} in
-  LinguaMake.updated lingua_resolver \"${lang}\" (${unitsIn "\"\""}) root lingua_names lingua_dryRun
+  LinguaMake.updated lingua_resolver \"${lang}\" (${unitsIn "\"\""}) root [root] lingua_names lingua_dryRun
+
+-- The same of the units at `lingua_roots`, every root the lock file at `root`
+-- covers.
+${vis}fun update${name}In (root : String) (lingua_roots : [String]) (lingua_names : [String]) (lingua_dryRun : Bool) =
+  ${salted}let lingua_resolver = ${resolverWith "False False True lingua_names"} in
+  LinguaMake.updated lingua_resolver \"${lang}\" (${unitsIn "\"\""}) root lingua_roots lingua_names lingua_dryRun
 " in
   let unknown =
     V.concatMap
@@ -1801,16 +1939,29 @@ ${vis}fun update${name} (root : String) (lingua_names : [String]) (lingua_dryRun
           "`overrides` and `pinned` say what a unit's options are, and this build has none: say them in `options { … }`"
           Nowhere]
      else if not (V.isEmpty unknown) then V.take unknown 1
-     else if V.isEmpty declared then [Code "use Lingua.Make as LinguaMake
+     else if V.isEmpty declared then
+       let plain =
+         \begin ->
+           "${salted}${building}${begin "\"\""} LinguaMake.noOptions ${compiled False} (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect"
+       in [Code "use Lingua.Make as LinguaMake
 
 -- ${lang}'s build: the unit at `root` and every unit it depends on, each
 -- compiled only if what it would be compiled from has changed.${if M.isSome lock then " Offline, it\n-- reaches no network: what it depends on must be in the cache. Locked, it\n-- fails rather than change the lock file." else ""}
 ${vis}fun build${name}${withName} ${flags}(root : String) =
-  ${salted}${building}${settle "\"\""}LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "\"\""}) root LinguaMake.noOptions ${compiled False} (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect
+  ${plain ofRoot}
+
+-- The same of the units at `lingua_roots`, as one graph with a link for each,
+-- kept in `root`'s `target`. They may be some of what is kept there.
+${vis}fun build${name}In ${flags}(root : String) (lingua_roots : [String]) =
+  ${plain ofRoots}
 
 -- What the unit at `dir` was compiled from in `root`'s last build.
 ${vis}fun given${name} (root : String) (dir : String) =
   ${salted}${givenResolver}LinguaMake.givenOf (${unitsIn "\"\""}) root dir LinguaMake.decodeReflect
+
+-- The same of a build of the units at `lingua_roots`, kept in `root`'s `target`.
+${vis}fun given${name}In (root : String) (lingua_roots : [String]) (dir : String) =
+  ${salted}${givenResolver}LinguaMake.givenIn (${unitsIn "\"\""}) root lingua_roots dir LinguaMake.decodeReflect
 ${lockCode "" ""}"]
      else
        -- A build with options and no profile written has one, `debug`: what
@@ -1829,28 +1980,41 @@ ${lockCode "" ""}"]
           | Just f ->
               "(match lingua_r with | Err lingua_e -> Err lingua_e | Ok lingua_o -> ${lower}With lingua_o (${f} root lingua_dir lingua_manifest lingua_profile))"
           | None -> "lingua_r")
-       in V.concat [optionsCode vis name lang opts named, [Code "
+       in
+       let profiled = \begin -> "match ${lower}Profile lingua_profile with
+  | None -> (let lingua_u = LinguaMake.sayError \"${lang} has no profile `\${lingua_profile}`: it has \${LinguaS.join \", \" ${lower}Profiles}\" in False)
+  | Just lingua_base ->
+      ${salted}${building}${begin "lingua_profile"}
+        { resolve = \\lingua_dir lingua_manifest -> (let lingua_r = (match ${lower}With lingua_base ${over} with | Err lingua_e -> Err lingua_e | Ok lingua_o -> ${lower}With lingua_o lingua_set) in ${last}), compileKey = lingua${name}_compileKey, linkKey = lingua${name}_linkKey }
+        ${compiled True} (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} o l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect" in
+       V.concat [optionsCode vis name lang opts named, [Code "
 -- ${lang}'s build, as profile `lingua_profile` and with `lingua_set` over
 -- it: the unit at `root` and every unit it depends on, each compiled with
 -- its own options and only if what it would be compiled from -- those
 -- among it -- has changed. What it builds is under `target/<profile>`.${if M.isSome lock then " Offline,\n-- it reaches no network: what it depends on must be in the cache. Locked, it\n-- fails rather than change the lock file." else ""}
 ${vis}fun build${name}${withName} ${flags}(lingua_profile : String) (lingua_set : [(String, String)]) (root : String) =
-  match ${lower}Profile lingua_profile with
-  | None -> (let lingua_u = LinguaMake.sayError \"${lang} has no profile `\${lingua_profile}`: it has \${LinguaS.join \", \" ${lower}Profiles}\" in False)
-  | Just lingua_base ->
-      ${salted}${building}${settle "lingua_profile"}LinguaMake.makeUnits ${schedule} \"${lang}\" (${unitsIn "lingua_profile"}) root
-        { resolve = \\lingua_dir lingua_manifest -> (let lingua_r = (match ${lower}With lingua_base ${over} with | Err lingua_e -> Err lingua_e | Ok lingua_o -> ${lower}With lingua_o lingua_set) in ${last}), compileKey = lingua${name}_compileKey, linkKey = lingua${name}_linkKey }
-        ${compiled True} (${M.unwrapOr "None" (M.map (\f -> "Just (\\o l -> ${f} o l)") (given "link"))}) LinguaMake.encodeReflect LinguaMake.decodeReflect
+  ${profiled ofRoot}
+
+-- The same of the units at `lingua_roots`, as one graph with a link for each,
+-- kept in `root`'s `target`, with `root` what `dependencies`, `overrides` and
+-- `pinned` are told. They may be some of what is kept there.
+${vis}fun build${name}In ${flags}(lingua_profile : String) (lingua_set : [(String, String)]) (root : String) (lingua_roots : [String]) =
+  ${profiled ofRoots}
 
 -- What the unit at `dir` was compiled from in `root`'s last build as that
 -- profile.
 ${vis}fun given${name} (lingua_profile : String) (root : String) (dir : String) =
   ${salted}${givenResolver}LinguaMake.givenOf (${unitsIn "lingua_profile"}) root dir LinguaMake.decodeReflect
+
+-- The same of a build of the units at `lingua_roots`, kept in `root`'s `target`.
+${vis}fun given${name}In (lingua_profile : String) (root : String) (lingua_roots : [String]) (dir : String) =
+  ${salted}${givenResolver}LinguaMake.givenIn (${unitsIn "lingua_profile"}) root lingua_roots dir LinguaMake.decodeReflect
 ${lockCode "(lingua_profile : String) (lingua_set : [(String, String)]) " "lingua_profile lingua_set "}"]]
 
 -- --- tests ---------------------------------------------
 
 use Std.Test (assertEq)
+use Std.Result as Res
 @test fun aCompilerCanReadOnlyItsUnit () =
   let read =
     sandboxed ["src/a.ml"] "target/out" (\() ->
@@ -1859,6 +2023,49 @@ use Std.Test (assertEq)
        read
        (Err "src/b.ml is not an input of this unit", Err "elsewhere/x is not an input of this unit")
        "a read and a write outside it"
+@test fun whatIsCopiedIsHeldToWhatMayBeReadAndWritten () =
+  let root = "target/lingua-copy" in
+  let z = removeDirAll root in
+  let unit = Path.join root "unit" in
+  let out = Path.join root "out" in
+  let a = createDirAll unit in
+  let b = writeString (Path.join unit "object", "made") in
+  let c = writeString (Path.join root "elsewhere", "kept") in
+  let tried =
+    linkingIn [unit] out (\() ->
+      (
+        Res.isOk (copy (Path.join unit "object", Path.join out "bin/program")),
+        copy (Path.join root "elsewhere", Path.join out "stolen"),
+        copy (Path.join unit "object", Path.join root "escaped")
+      ))
+  in
+  let d =
+    assertEq
+      tried
+      (
+        True,
+        Err "${root}/elsewhere is not what a unit of this build wrote",
+        Err "${root}/escaped is not what a unit of this build wrote"
+      )
+      "from a unit into the link's own, into a directory made for it; and neither way out"
+  in
+  let e =
+    assertEq
+      (readToString (Path.join out "bin/program"), exists (Path.join root "escaped"))
+      (Ok "made", False)
+      "what was copied is there, and what was refused is not"
+  in
+  let compiled =
+    sandboxed [Path.join unit "object"] out (\() ->
+      (
+        Res.isOk (copy (Path.join unit "object", Path.join out "copied")),
+        copy (Path.join root "elsewhere", Path.join out "stolen")
+      ))
+  in assertEq
+       compiled
+       (True, Err "${root}/elsewhere is not an input of this unit")
+       "a compiler is held the same way"
+
 @test fun unitsAreBuiltInRoundsOfWhatTheyDependOn () =
   assertEq
     (rounds [("a", []), ("b", ["a"]), ("c", ["a"]), ("d", ["b", "c"])])

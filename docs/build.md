@@ -40,6 +40,9 @@ the last build, for a tool that wants to ask the compiler about a unit again.
 | `cache`        | with `lock` | where what is fetched is kept, `"~/.idyll/git"`; `~/.<language>/git` by default |
 | `cacheEnv`     | with `lock` | a variable that, when set, moves the cache under it: `$IDYLL_HOME/git` |
 
+Every build also has a form for several roots in one place, `build<Name>In`;
+see [Several roots in one home](#several-roots-in-one-home).
+
 A setting the build does not have, a missing required one, or a `parallel` that
 is neither `true` nor `false` is an error where it was written.
 
@@ -97,8 +100,10 @@ made again. A link that answers `Err report` fails the build, and runs again
 the next time.
 
 It runs under a handler for `Fs` that lets it read what any unit wrote and its
-own directory, and write only in its own. A unit's compiler writes what the
-link needs -- an object file, say -- into `unitOut`.
+own directory, and write only in its own, and `copy` is held to the same: from
+what it may read to its own directory. A copy keeps what a read and a write
+would not, the bit that makes a file executable. A unit's compiler writes what
+the link needs -- an object file, say -- into `unitOut`.
 
 ## When a unit is compiled
 
@@ -264,6 +269,63 @@ as an option is refused.
 [Units.mw](../examples/MiniML/src/Units.mw) has `Fetched`, whose manifest
 names a release with a line `git name url version`, and a test that locks,
 updates and builds it offline.
+
+## Several roots in one home
+
+`build<Name> root` has `root` do four jobs: it is the unit built, where
+`target/` is, where the lock file is, and the one thing linked. A workspace
+needs them apart. Its root is often no unit at all, and making a unit that
+depends on every member goes wrong as soon as the root is a package a member
+depends on, which is a circle.
+
+```meadow
+buildUnitsIn home roots
+```
+
+With a `lock` it takes the flags first, and with options the profile and
+settings after them, as `build<Name>With` does:
+`build<Name>In offline locked profile set home roots`.
+
+`home` is where `target/` and the lock file are, and it need not be a unit: its
+manifest is read only if `roots` names it. `roots` are the units to build. What
+a workspace is -- its member patterns, `-p`, `default-members` -- is the
+language's, and `make!` hears only these two.
+
+- **One graph.** Every unit the roots reach is built once, whichever reaches
+  it, into `home`'s `target/`. A root may depend on another, or on `home`.
+- **A link for each root.** It gets that root's `linkRoot`, that root's
+  options, the units that root reaches and no others, and a directory of its
+  own, `linkDirOf home profile root` (`target/<profile>/link/<name>`, named as
+  units are). Each is fresh or not by itself, so a change only one root reaches
+  links only that root. Links run one after another. A build says
+  `Fresh link <root>`, as it says `Linked <root>`.
+- **A root that fails** stops its own link. The others are linked, and the
+  build answers `False`. The next build links only what it did not.
+- **`home` is the root a language is told of.** `dependencies`, `overrides` and
+  `pinned` get `home` as their `root`, so that they can read the workspace's
+  manifest there.
+- **The roots may be some of what is kept there.** `-p NAME` is a build with
+  fewer `roots`, so a build in a home takes nothing away: going from one root
+  to another compiles nothing twice, a build only adds to the lock file, and
+  what no root reaches any more stays under `target/` until something clears
+  it. A unit that is kept is checked as ever when it is next reached, so what
+  changed while it was not built is compiled then.
+- **`update<Name>In home roots names dryRun`** is told every root the lock file
+  covers. It is what drops from the lock file what nothing wants any more, so
+  `roots` should be all of them, not the ones picked by `-p`.
+- **`given<Name>In home roots dir`** reads what a unit was compiled from, as
+  `given<Name>` does.
+
+`build<Name> root` builds units the same way and keeps its link in
+`target/link` itself, but it takes away what its root does not reach. So a
+place is built one way or the other: a `build<Name>` at a home clears what the
+other roots kept there, and they are compiled again.
+
+`linkDir`, `linkDirIn` and `linkDirOf` say where a link writes, so a driver can
+find what it made without being told.
+
+[Units.mw](../examples/MiniML/src/Units.mw) has `Homed`, `Tagged` and
+`FetchedHome`, with tests of each of these.
 
 ## Scheduling
 

@@ -5,7 +5,8 @@
 
 use Lingua (make!)
 use Lingua.Make (
-  Given, Linking, Part, unitSources, unitImports, unitOut, linkUnits, linkOut, partSources, partOut
+  Given, Linking, Part, unitSources, unitImports, unitOut, linkRoot, linkUnits, linkOut, linkDirOf,
+  partSources, partOut
 )
 use Lingua.Diagnostic (renderToOutput)
 use MiniML.Types
@@ -102,7 +103,7 @@ fun compiling (u : Given Interface) =
 
 use Std.Test (assertEq)
 use Std.Console (withOutput)
-use Std.Fs (Fs, createDirAll, removeDirAll, removeFile, appendString, readToString)
+use Std.Fs (Fs, createDirAll, removeDirAll, removeFile, appendString, readToString, exists)
 use Std.Result as Res
 use Std.Process (spawn, currentExe)
 use Lingua.Resolve (Dep, GitRef, reqOf)
@@ -849,3 +850,303 @@ fun tunedParts o (g : Given [String]) (ps : [String]) = assembledParts g ps
     ((first, second, third), afterSecond, compiled ())
     ((True, True, True), 1, 2)
     "once, and again"
+
+-- --- several roots in one home ---------------------------------------------------
+--
+-- A workspace: its units built as one graph into one `target`, a link for each
+-- of its roots. One unit after another, so that what is said comes in order.
+make! {
+  Homed "miniml"
+    | sources = ".ml"
+    | manifest = "Unit"
+    | compile = compileUnit
+    | link = linkProgram
+    | parallel = false
+}
+
+-- A home with no unit of its own, `lib` and two roots that depend on it.
+fun home root =
+  let z = removeDirAll root in
+  let ws = Path.join root "ws" in
+  let lib = Path.join ws "lib" in
+  let one = Path.join ws "one" in
+  let two = Path.join ws "two" in
+  let a = write lib "Unit" "" in
+  let b = write lib "double.ml" "fun x -> x + x" in
+  let c = write one "Unit" "../lib\n" in
+  let d = write one "main.ml" "double 1" in
+  let e = write two "Unit" "../lib\n" in
+  let f = write two "main.ml" "double 2" in
+  (ws, lib, one, two)
+
+fun homed ws roots =
+  match withOutput (\() -> buildHomedIn ws roots) with
+  | (ok, said) -> (ok, V.filter (\l -> S.startsWith "   " l) (S.lines said))
+
+@test fun rootsInAHomeShareTheirUnitsAndEachIsLinkedByItself () =
+  match home "target/build-home" with
+  | (ws, lib, one, two) ->
+      let roots = [one, two] in
+      let first = homed ws roots in
+      let second = homed ws roots in
+      -- A body changes in one root: the other is linked as it was.
+      let a = write two "main.ml" "double 3" in
+      let third = homed ws roots in
+      let out = \root -> linkDirOf ws "" root in
+      let runs =
+        \root ->
+          M.map (\t -> V.len (S.lines t)) (Res.toMaybe (readToString (Path.join (out root) "runs")))
+      in
+      let x =
+        assertEq
+          [first, second, third]
+          [
+            (
+              True,
+              [
+                "   Compiled ws/lib",
+                "   Compiled ws/one",
+                "   Compiled ws/two",
+                "   Linked ws/one",
+                "   Linked ws/two"
+              ]
+            ),
+            (
+              True,
+              [
+                "   Fresh ws/lib",
+                "   Fresh ws/one",
+                "   Fresh ws/two",
+                "   Fresh link ws/one",
+                "   Fresh link ws/two"
+              ]
+            ),
+            (
+              True,
+              [
+                "   Fresh ws/lib",
+                "   Fresh ws/one",
+                "   Compiled ws/two",
+                "   Fresh link ws/one",
+                "   Linked ws/two"
+              ]
+            )
+          ]
+          "`lib` once for both; and each link by itself"
+      in
+      let y =
+        assertEq
+          (
+            readToString (Path.join (out one) "program"),
+            readToString (Path.join (out two) "program"),
+            runs one,
+            runs two
+          )
+          (Ok "lib\none", Ok "lib\ntwo", Just 1, Just 2)
+          "a link is given what its root reaches, and no other root's unit"
+      in assertEq
+           (out one, exists (Path.join one "target"), exists (Path.join ws "target"))
+           ("target/build-home/ws/target/link/ws_one", False, True)
+           "what is kept is in the home's `target`, not a member's"
+
+@test fun aBuildOfSomeRootsLeavesWhatTheOthersBuilt () =
+  match home "target/build-home-some" with
+  | (ws, lib, one, two) ->
+      let first = homed ws [one] in
+      let second = homed ws [two] in
+      let third = homed ws [one] in
+      let a = write lib "double.ml" "fun x -> x * 2" in
+      let fourth = homed ws [one] in
+      let fifth = homed ws [two] in
+      assertEq
+        [first, second, third, fourth, fifth]
+        [
+          (True, ["   Compiled ws/lib", "   Compiled ws/one", "   Linked ws/one"]),
+          (True, ["   Fresh ws/lib", "   Compiled ws/two", "   Linked ws/two"]),
+          (True, ["   Fresh ws/lib", "   Fresh ws/one", "   Fresh link ws/one"]),
+          (True, ["   Compiled ws/lib", "   Fresh ws/one", "   Linked ws/one"]),
+          (True, ["   Fresh ws/lib", "   Fresh ws/two", "   Linked ws/two"])
+        ]
+        "nothing built twice for going between them; and `lib`'s change reaches each when it is built"
+
+@test fun aHomeMayBeARootThatAMemberDependsOn () =
+  let root = "target/build-home-unit" in
+  let z = removeDirAll root in
+  let ws = Path.join root "ws" in
+  let member = Path.join ws "member" in
+  let a = write ws "Unit" "" in
+  let b = write ws "double.ml" "fun x -> x + x" in
+  let c = write member "Unit" "..\n" in
+  let d = write member "main.ml" "double 1" in
+  let first = homed ws [ws, member, member] in
+  let x =
+    assertEq
+      first
+      (True, ["   Compiled ws", "   Compiled ws/member", "   Linked ws", "   Linked ws/member"])
+      "no circle, and each root once however often it is named"
+  in assertEq
+       (
+         readToString (Path.join (linkDirOf ws "" ws) "program"),
+         readToString (Path.join (linkDirOf ws "" member) "program")
+       )
+       (Ok "ws", Ok "ws\nmember")
+       "each with what it reaches"
+
+@test fun aRootThatFailsLeavesTheOthersLinked () =
+  match home "target/build-home-fail" with
+  | (ws, lib, one, two) ->
+      let a = write two "main.ml" "1 + true" in
+      match withOutput (\() -> buildHomedIn ws [one, two]) with
+      | (ok, said) ->
+          let x =
+            assertEq
+              (ok, S.contains "   Linked ws/one\n" said, S.contains "Linked ws/two" said)
+              (False, True, False)
+              "the build fails, and what could be linked is"
+          in
+          let b = write two "main.ml" "double 2" in
+          assertEq
+            (homed ws [one, two])
+            (
+              True,
+              [
+                "   Fresh ws/lib",
+                "   Fresh ws/one",
+                "   Compiled ws/two",
+                "   Fresh link ws/one",
+                "   Linked ws/two"
+              ]
+            )
+            "and the next links only what it did not"
+
+@test fun aUnitOfAHomeIsReadBackAsItWasCompiled () =
+  match home "target/build-home-given" with
+  | (ws, lib, one, two) ->
+      let a = homed ws [one, two] in
+      assertEq
+        (match givenHomedIn ws [one, two] one with
+         | Ok (g : Given Interface) -> (V.map fst (unitImports g), unitOut g)
+         | Err why -> ([why], ""))
+        ([Path.normalize lib], "target/build-home-given/ws/target/units/ws_one")
+        "what a unit of the home was compiled from, from what the home keeps"
+
+@test fun rootsInAHomeAreBuiltAtOnceAsAnyUnitsAre () =
+  match home "target/build-home-threads" with
+  | (ws, lib, one, two) ->
+      let built = withOutput (\() -> buildLinkedIn ws [one, two]) in
+      let again = withOutput (\() -> buildLinkedIn ws [one, two]) in
+      assertEq
+        (
+          fst built,
+          S.contains "miniml: 3 compiled, 0 up to date\n" (snd built),
+          fst again,
+          S.contains "miniml: 0 compiled, 3 up to date\n" (snd again)
+        )
+        (True, True, True, True)
+        "`lib` once though two roots reach it, and nothing the second time"
+
+@test fun aBuildOfOneRootInAHomeOfItsOwnStaysAsItWas () =
+  match home "target/build-home-alone" with
+  | (ws, lib, one, two) ->
+      let a = withOutput (\() -> buildHomed one) in
+      assertEq
+        (fst a, exists (Path.joinAll [one, "target", "link", "program"]))
+        (True, True)
+        "the unit at `root`, its link directly in its own `target/link`"
+
+-- With options: `overrides` is told the home, and a link its own root's.
+make! {
+  Tagged "miniml"
+    | sources = ".ml"
+    | manifest = "Unit"
+    | compile = taggedUnit
+    | link = taggedLink
+    | parallel = false
+    | options { tag : String = "none" "what a link writes down" for link }
+    | overrides = tagOf
+}
+
+fun tagOf (root : String) (dir : String) (manifest : String) (profile : String) =
+  [("tag", "${profile} ${Path.fileName root} ${Path.fileName dir}")]
+
+fun taggedUnit (o : TaggedOptions) (u : Given Interface) = compileUnit u
+
+fun taggedLink (o : TaggedOptions) (l : Linking Interface) : Result String () ! { Fs | e } =
+  let w =
+    writeString (Path.join (linkOut l) "tag", "${o.tag} from ${Path.fileName (linkRoot l)}")
+  in Ok ()
+
+@test fun aRootIsGivenItsOwnOptionsAndTheHomeIsWhatOverridesAreTold () =
+  match home "target/build-home-tuned" with
+  | (ws, lib, one, two) ->
+      let built = withOutput (\() -> buildTaggedIn "debug" [] ws [one, two]) in
+      let tag = \root -> readToString (Path.join (linkDirOf ws "debug" root) "tag") in
+      assertEq
+        (fst built, tag one, tag two)
+        (True, Ok "debug ws one from one", Ok "debug ws two from two")
+        "under the profile's directory, each root's own"
+
+-- With a lock: one, in the home, that a build of some roots only adds to. A
+-- cache of its own, as `Fetched`'s is removed by its own test.
+make! {
+  FetchedHome "miniml"
+    | sources = ".ml"
+    | manifest = "Unit"
+    | compile = compileUnit
+    | dependencies = fetchedDeps
+    | lock = "Unit.lock"
+    | cache = "target/fetched-home-cache/git"
+}
+
+fun repoAt (dir : String) (name : String) =
+  let a = write dir "Unit" "" in
+  let b = write dir "${name}.ml" "fun x -> x + x" in
+  let c = gitIn dir ["init", "--quiet", "-b", "main"] in
+  let d = gitIn dir ["add", "-A"] in
+  let e = gitIn dir ["commit", "--quiet", "-m", "one"] in
+  let f = gitIn dir ["tag", "v1.0.0"] in
+  match gitIn dir ["rev-parse", "--show-toplevel"] with
+  | Ok (0, out, _) -> S.trim out
+  | _ -> dir
+
+@test fun aHomesLockCoversEveryRootAndABuildOfSomeDropsNothing () =
+  let root = "target/build-home-lock" in
+  let z = removeDirAll root in
+  let y = removeDirAll "target/fetched-home-cache" in
+  let first = repoAt (Path.join root "first") "first" in
+  let second = repoAt (Path.join root "second") "second" in
+  let ws = Path.join root "ws" in
+  let one = Path.join ws "one" in
+  let two = Path.join ws "two" in
+  let a = createDirAll ws in
+  let b = write one "Unit" "git first ${first} 1.0.0\n" in
+  let c = write one "main.ml" "first 1" in
+  let d = write two "Unit" "git second ${second} 1.0.0\n" in
+  let e = write two "main.ml" "second 2" in
+  let lock = \u -> Res.unwrapOr "" (readToString (Path.join ws "Unit.lock")) in
+  let names =
+    \u -> (S.contains "name = \"first\"" (lock ()), S.contains "name = \"second\"" (lock ()))
+  in
+  let build =
+    \offline locked roots -> fst (withOutput (\() -> buildFetchedHomeIn offline locked ws roots))
+  in
+  let built = build False False [one] in
+  let x = assertEq (built, names ()) (True, (True, False)) "what the root reached" in
+  let builtTwo = build False False [two] in
+  let x2 = assertEq (builtTwo, names ()) (True, (True, True)) "and the other's added to it" in
+  let builtOne = build False False [one] in
+  let x3 =
+    assertEq (builtOne, names ()) (True, (True, True)) "and none of it dropped by a build of one"
+  in
+  let locked = build True True [one] in
+  let x4 = assertEq (locked, names ()) (True, (True, True)) "not a change, so a locked build may" in
+  -- `one` no longer wants what it did: a build keeps it, as it cannot know
+  -- no other root does, and an update told of them all does not.
+  let f = write one "Unit" "" in
+  let g = write one "main.ml" "1" in
+  let builtBoth = build False False [one, two] in
+  let x5 = assertEq (builtBoth, names ()) (True, (True, True)) "a build leaves it" in
+  let dry = fst (withOutput (\() -> updateFetchedHomeIn ws [one, two] [] True)) in
+  let x6 = assertEq (dry, names ()) (True, (True, True)) "and so does a dry run" in
+  let update = fst (withOutput (\() -> updateFetchedHomeIn ws [one, two] [] False)) in
+  assertEq (update, names ()) (True, (False, True)) "an update of every root drops it"

@@ -695,11 +695,18 @@ fun tagOf r (url : String) (v : Version) =
 -- that would change it fails instead. `program` is named in the header.
 @pub fun settle (r : Resolver) (program : String) =
   let seen = getRef (seenOf r) in
-  let kept =
-    V.filter
-      (\l -> V.any (\s -> fst s == (lockedName l, lockedSource l)) seen)
-      (getRef (entriesOf r))
-  in
+  lockWritten
+    r
+    program
+    (V.filter
+       (\l -> V.any (\s -> fst s == (lockedName l, lockedSource l)) seen)
+       (getRef (entriesOf r)))
+
+-- The same for a build of some of what the lock file covers: what it did not
+-- reach may be what the rest depends on, so nothing is dropped.
+@pub fun settleSome (r : Resolver) (program : String) = lockWritten r program (getRef (entriesOf r))
+
+fun lockWritten (r : Resolver) (program : String) (kept : [Locked]) =
   let text = lockText program kept in
   let before = M.unwrapOr "" (okOf (readToString (lockPathOf r))) in
   if text == before or (V.isEmpty kept and S.isEmpty before) then Ok ()
