@@ -1150,3 +1150,54 @@ fun repoAt (dir : String) (name : String) =
   let x6 = assertEq (dry, names ()) (True, (True, True)) "and so does a dry run" in
   let update = fst (withOutput (\() -> updateFetchedHomeIn ws [one, two] [] False)) in
   assertEq (update, names ()) (True, (False, True)) "an update of every root drops it"
+
+@test fun rootsWhoseNamesWouldReadTheSameAreKeptApart () =
+  let root = "target/build-home-names" in
+  let z = removeDirAll root in
+  let ws = Path.join root "ws" in
+  let one = Path.joinAll [ws, "a_b", "c"] in
+  let two = Path.joinAll [ws, "a", "b_c"] in
+  let a = write one "Unit" "" in
+  let b = write one "one.ml" "1" in
+  let c = write two "Unit" "" in
+  let d = write two "two.ml" "true" in
+  let built = homed ws [one, two] in
+  let x = assertEq (fst built) True "both built" in
+  let y =
+    assertEq
+      (
+        readToString (Path.join (linkDirOf ws "" one) "program"),
+        readToString (Path.join (linkDirOf ws "" two) "program")
+      )
+      (Ok "c", Ok "b_c")
+      "each link its own"
+  in assertEq
+       (linkDirOf ws "" one == linkDirOf ws "" two, snd (homed ws [one, two]))
+       (
+         False,
+         [
+           "   Fresh ws/a_b/c",
+           "   Fresh ws/a/b_c",
+           "   Fresh link ws/a_b/c",
+           "   Fresh link ws/a/b_c"
+         ]
+       )
+       "and each unit's own, nothing taken for the other's"
+
+@test fun aBuildOrAnUpdateOfNoRootsIsRefused () =
+  let root = "target/build-home-none" in
+  let z = removeDirAll root in
+  let ws = Path.join root "ws" in
+  let a = write ws "Unit.lock" "# kept\n" in
+  let build = withOutput (\() -> buildHomedIn ws []) in
+  let update = withOutput (\() -> updateFetchedHomeIn ws [] [] False) in
+  assertEq
+    (
+      fst build,
+      S.startsWith "error: " (snd build),
+      fst update,
+      S.startsWith "error: " (snd update),
+      readToString (Path.join ws "Unit.lock")
+    )
+    (False, True, False, True, Ok "# kept\n")
+    "said, and the lock file left as it was, not emptied"

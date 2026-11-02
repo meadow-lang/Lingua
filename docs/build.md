@@ -76,7 +76,10 @@ that writes it to its file. Nothing is copied from thread to thread.
 The compiler runs under a handler for `Fs` that lets it read its unit's sources
 and its own output directory, and write only in that directory. Anything else
 fails with `… is not an input of this unit`, so a read the build did not know
-about is an error rather than a stale answer.
+about is an error rather than a stale answer. `exists`, `isFile` and `isDir`
+have no way to fail, so what it may not read is simply not there to them.
+`files` and `dependencies` are not held to this: they say what the units are,
+and run before any compiler does.
 
 ## Linking
 
@@ -100,10 +103,10 @@ made again. A link that answers `Err report` fails the build, and runs again
 the next time.
 
 It runs under a handler for `Fs` that lets it read what any unit wrote and its
-own directory, and write only in its own, and `copy` is held to the same: from
-what it may read to its own directory. A copy keeps what a read and a write
-would not, the bit that makes a file executable. A unit's compiler writes what
-the link needs -- an object file, say -- into `unitOut`.
+own directory, and write only in its own, as a compiler is held to its unit.
+`copy` goes from what it may read to its own directory, and keeps what a read
+and a write would not, the bit that makes a file executable. A unit's compiler
+writes what the link needs -- an object file, say -- into `unitOut`.
 
 ## When a unit is compiled
 
@@ -296,7 +299,9 @@ language's, and `make!` hears only these two.
 - **A link for each root.** It gets that root's `linkRoot`, that root's
   options, the units that root reaches and no others, and a directory of its
   own, `linkDirOf home profile root` (`target/<profile>/link/<name>`, named as
-  units are). Each is fresh or not by itself, so a change only one root reaches
+  units are: a path with its `/` as `_`, and with a hash after it when a part
+  has a `_` of its own, so that `a_b/c` and `a/b_c` stay two). Each is fresh or
+  not by itself, so a change only one root reaches
   links only that root. Links run one after another. A build says
   `Fresh link <root>`, as it says `Linked <root>`.
 - **A root that fails** stops its own link. The others are linked, and the
@@ -313,6 +318,9 @@ language's, and `make!` hears only these two.
 - **`update<Name>In home roots names dryRun`** is told every root the lock file
   covers. It is what drops from the lock file what nothing wants any more, so
   `roots` should be all of them, not the ones picked by `-p`.
+- **No roots** is an error, for a build and an update alike, and the lock file
+  is left as it was: a member pattern that matches nothing should not look
+  like a build that worked, or empty the lock file.
 - **`given<Name>In home roots dir`** reads what a unit was compiled from, as
   `given<Name>` does.
 
