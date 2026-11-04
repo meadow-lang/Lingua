@@ -232,7 +232,8 @@ states are one list.
 
 A pane a command opens has no line to put text on: what it puts begins the
 next entry instead, the cursor after it, for its user to go on with, and its
-`before` is entered with that entry.
+`before` is entered with that entry. Without a terminal, a pane a command
+opens is closed at once, as nobody is there to press a key.
 
 ## Colour
 
@@ -329,6 +330,7 @@ the line, trimmed. It answers a `Lingua.Repl.Reply`:
 | reply          | the prompt then                                              |
 | -------------- | ------------------------------------------------------------ |
 | `Said text`    | writes `text`, or nothing if it is empty, and reads on       |
+| `Pages title pages` | shows `pages`, each a name and its text, a page at a time (see below) |
 | `Entry text`   | enters `text` as if it had been typed: evaluated, and kept in the history file |
 | `Edit text`    | begins the next entry with `text`, the cursor after it, for its user to go on with |
 | `Leave text`   | writes `text` and ends the prompt; in a mode, leaves the mode with nothing |
@@ -339,6 +341,42 @@ The database is the one the entries are typed into, so a command asks the
 compiler what an entry would: `:type` above sets the text and asks for its
 type. What a command has to remember between lines, such as which module
 entries are read in, it keeps in an input of the database.
+
+**Pages** are for more than a line or two: what an entry is at each stage
+of the compiler, say. At a terminal they are a pane under the line, `title`
+in its border and each page's number and name across its top:
+
+```
+╭─ :ir 1 + 2 ──────────────────────────────────────────────╮
+│ 1 tokens · 2 parse · 3 types                             │
+│──────────────────────────────────────────────────────────│
+│Int 1                                                     │
+│Plus                                                      │
+│Int 2                                                     │
+╰─ ←→ page · ↑↓ scroll · esc close ────────────────────────╯
+```
+
+←/→, Tab and Shift-Tab, `h`/`l` or a page's number go from page to page, each
+keeping how far it was scrolled. ↑/↓, PgUp/PgDn, Space, Home/End, `j`/`k`,
+`g`/`G` and Ctrl-D/Ctrl-U scroll, and the bottom edge says which lines are
+shown when not all of them fit. Escape or `q` closes it and reads on. The pane
+is as tall as the longest page needs, up to what the terminal has room for.
+Without a terminal each page is written under its name, a line between them
+(`Lingua.Repl.pagesText`):
+
+```
+── tokens ──
+Int 1
+…
+
+── parse ──
+…
+```
+
+A test reads pages as it reads anything else said, from what the command
+answered: `match act db "1 + 2" with | Reply.Pages _ pages -> …`. The pane
+itself is `Lingua.Repl.pagesPane title pages rows`, which a language can also
+give as one of its own `panes`.
 
 A language's command with the name of one of the prompt's own replaces it:
 give a `quit` to say something on the way out, or a `help` to write your own.
@@ -404,7 +442,8 @@ own ignores `.*_history`.
 
 When input is a file or a pipe, entries are read a line at a time, as many
 lines as each takes to be finished, and nothing is drawn. A prompt run by a
-script prints what it would have.
+script prints what it would have: a command's pages one after another, each
+under its name, and no pane a command opens.
 
 ## Testing a prompt
 
@@ -443,7 +482,7 @@ Everything `repl!` writes is a call into `Lingua.Repl`, which is usable
 directly: `unfinished`, `candidates`, `painted`, `coloured`, `finder`,
 `findKey`, `findDrawn`, `themes`, `themeNamed`, `command`, `commandOf`,
 `commandNames`, `commandCandidates`, `helped`, `Hit`, `ranked`, `declared`,
-`finderOf`, `findWith`, `pane`, `opened`, `showing`, `finderPane`, `editorOf`,
-`run`, `runMode`.
+`finderOf`, `findWith`, `pane`, `opened`, `showing`, `finderPane`, `pagesPane`,
+`pagesText`, `editorOf`, `run`, `runMode`.
 The three packages underneath work without Lingua at all, for a compiler not
 written with it.

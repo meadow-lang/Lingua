@@ -94,10 +94,10 @@
 -- prompt. A language adds its own with `commands`: each a name, what is
 -- written after it, what help says of it, and what it does -- a function of
 -- the database and the rest of the line, answering a `Reply`: something
--- `Said`, an `Entry` to be entered as if it had been typed, or `Leave`, which
--- ends the prompt. Where the language names a command as the prompt names
--- one of its own, the language's is the one that is run. Tab completes a
--- command's name.
+-- `Said`, `Pages` to be read a page at a time, an `Entry` to be entered as if
+-- it had been typed, or `Leave`, which ends the prompt. Where the language
+-- names a command as the prompt names one of its own, the language's is the
+-- one that is run. Tab completes a command's name.
 --
 -- Only `text` and `eval` are needed. What is written is `runRepl ()`: entries
 -- read, each printed as `eval` says, until there are no more.
@@ -111,7 +111,8 @@
 --
 -- Where the input is not a terminal -- a file, a pipe -- entries are read a
 -- line at a time, as many lines as each takes to be finished, and nothing is
--- drawn: a prompt run by a script prints what it would have.
+-- drawn: a prompt run by a script prints what it would have -- pages one
+-- after another, and no pane a command opens.
 
 use Std.Collections.Vector as V
 use Std.String as S
@@ -304,14 +305,16 @@ fun sample (theme : Theme) : String =
 -- its name, what is written after it, what help says of it, and what it
 -- does, given the database and the rest of the line.
 
--- What a command answers: something said; an entry, entered as if it had
--- been typed; text the next entry begins with, for its user to go on with;
--- something said, and the prompt -- or the mode it is in -- left; a mode,
--- entered with a text; or, in a mode, text handed back to the prompt below,
--- whose next entry begins with it.
+-- What a command answers: something said; pages to be read, under a title,
+-- each a name and its text; an entry, entered as if it had been typed; text
+-- the next entry begins with, for its user to go on with; something said,
+-- and the prompt -- or the mode it is in -- left; a mode, entered with a
+-- text; or, in a mode, text handed back to the prompt below, whose next
+-- entry begins with it.
 @derive(Debug, PartialEq)
 @pub data Reply
   = Said String
+  | Pages String [(String, String)]
   | Entry String
   | Edit String
   | Leave String
@@ -613,6 +616,170 @@ fun replacedName (text : String) (at : Int) (n : String) : (String, Int) =
     Just (T.ctrl (S.drop opening 5))
   else None
 
+-- --- pages -------------------------------------------------------------------
+--
+-- What a command answers when it has more to show than a line or two -- what
+-- an entry is at each stage of a compiler, say: pages, each a name and its
+-- text. Where there is a terminal they are a pane, a page at a time, their
+-- names across its top; elsewhere each is written under its name.
+
+-- Pages being read: a title, the pages, the one showing, how far each is
+-- scrolled, and how many rows the pane has.
+record Paging = {
+  title : String,
+  pages : [(String, String)],
+  at : Int,
+  scrolled : [Int],
+  rows : Int
+}
+
+-- `pages` as a pane `rows` high, titled `title`: ←/→, Tab and Shift-Tab, `h`
+-- and `l`, or a page's number go from page to page; ↑/↓, PgUp/PgDn, Space,
+-- Home/End, `j`, `k`, `g`, `G`, Ctrl-D and Ctrl-U scroll; Escape or `q`
+-- closes it. What `Reply.Pages` shows, and a language may open it as a pane
+-- of its own.
+@pub fun pagesPane (title : String) (pages : [(String, String)]) (rows : Int) =
+  opened
+    pagesKey
+    pagesDrawn
+    (Paging {
+       title = title,
+       pages = pages,
+       at = 0,
+       scrolled = V.map (\p -> 0) pages,
+       rows = max 5 rows
+     })
+
+-- `pages` without a terminal: each under its name, a line between them.
+@pub fun pagesText (pages : [(String, String)]) : String =
+  S.join "\n\n" (V.map (\p -> "── ${fst p} ──\n${S.trimEnd (snd p)}") pages)
+
+-- How many of a page's lines the pane shows: what the border, the names and
+-- the rule under them leave.
+fun pageRows (p : Paging) : Int = max 1 (p.rows - 4)
+
+fun pageLines (p : Paging) : [String] = S.lines (snd (V.getOr ("", "") p.pages p.at))
+
+-- The page showing scrolled `by` lines, no further than its first line is at
+-- the top and its last at the bottom.
+fun scrolledBy (p : Paging) (by : Int) : Paging =
+  let most = max 0 (V.len (pageLines p) - pageRows p) in
+  { p | scrolled = V.set p.scrolled p.at (max 0 (min most (V.getOr 0 p.scrolled p.at + by))) }
+
+-- Page `i`, counted round: after the last is the first.
+fun turnedTo (p : Paging) (i : Int) : Paging =
+  let n = V.len p.pages in
+  if n == 0 then p else { p | at = (i % n + n) % n }
+
+fun pagesKey (p : Paging) (k : Key) : Step Paging =
+  let page = pageRows p in
+  let go = \q -> Step.Go q in
+  match k.code with
+  | Escape -> Step.Close
+  | Right -> go (turnedTo p (p.at + 1))
+  | Left -> go (turnedTo p (p.at - 1))
+  | Tab -> go (turnedTo p (if k.shift then p.at - 1 else p.at + 1))
+  | Down -> go (scrolledBy p 1)
+  | Up -> go (scrolledBy p (0 - 1))
+  | PageDown -> go (scrolledBy p page)
+  | PageUp -> go (scrolledBy p (0 - page))
+  | Home -> go (scrolledBy p (0 - V.len (pageLines p)))
+  | End -> go (scrolledBy p (V.len (pageLines p)))
+  | Character c ->
+      if k.ctrl then
+        (if c == "c" or c == "g" then Step.Close
+         else if c == "d" then go (scrolledBy p (page / 2))
+         else if c == "u" then go (scrolledBy p (0 - page / 2))
+         else go p)
+      else if c == "q" then Step.Close
+      else if c == "l" then go (turnedTo p (p.at + 1))
+      else if c == "h" then go (turnedTo p (p.at - 1))
+      else if c == "j" then go (scrolledBy p 1)
+      else if c == "k" then go (scrolledBy p (0 - 1))
+      else if c == " " then go (scrolledBy p page)
+      else if c == "g" then go (scrolledBy p (0 - V.len (pageLines p)))
+      else if c == "G" then go (scrolledBy p (V.len (pageLines p)))
+      else
+        (let n =
+           if S.charLength c == 1 then C.code (V.getOr (C.fromCode 32) (S.chars c) 0) - 48 else 0
+         in if n >= 1 and n <= 9 and n <= V.len p.pages then go { p | at = n - 1 } else go p)
+  | _ -> go p
+
+-- The pane, `cols` wide: the title in its border, each page's number and name
+-- across the top with the one showing marked -- from far enough along that it
+-- is in sight -- and as much of that page as fits, below a rule. Its bottom
+-- edge says which lines are shown, when not all of them are, and the keys.
+fun pagesDrawn (p : Paging) (cols : Int) : Buffer =
+  let b0 = D.blank (max 20 cols) p.rows in
+  let dim = D.dimmed D.style in
+  let b1 = D.border b0 (D.area b0) dim p.title in
+  let inner = D.inside (D.area b0) in
+  let parts = D.rows inner [Size.Cells 1, Size.Cells 1, Size.Share] in
+  let top = V.getOr inner parts 0 in
+  let body = V.getOr inner parts 2 in
+  let names =
+    V.map
+      (\i ->
+        (
+          " ${show (i + 1)} ${fst (V.getOr ("", "") p.pages i)} ",
+          if i == p.at then D.invert D.style else dim
+        ))
+      (V.range 0 (V.len p.pages))
+  in
+  let wide =
+    \from ->
+      V.foldl
+        (\w i -> w + S.charLength (fst (V.getOr ("", dim) names i)) + 1)
+        0
+        (V.range from (p.at + 1))
+  in
+  let from = M.unwrapOr p.at (V.find (\i -> wide i <= top.w) (V.range 0 p.at)) in
+  let spans = V.concatMap (\n -> [("·", dim), n]) (V.drop names from) in
+  let b2 = D.writeSpans b1 top 0 0 (V.drop spans 1) in
+  let b3 = D.fill b2 (V.getOr inner parts 1) dim "─" in
+  let lines = pageLines p in
+  let first = V.getOr 0 p.scrolled p.at in
+  let b4 =
+    V.foldl
+      (\b i -> D.writeIn b body 0 i D.style (V.getOr "" lines (first + i)))
+      b3
+      (V.range 0 body.h)
+  in
+  let shown =
+    if V.len lines > body.h then
+      "${show (first + 1)}–${show (min (V.len lines) (first + body.h))} of ${show (V.len lines)} · "
+    else ""
+  in D.writeIn
+       b4
+       (D.rect 2 (p.rows - 1) (D.width b4 - 4) 1)
+       0
+       0
+       dim
+       " ${shown}←→ page · ↑↓ scroll · esc close "
+
+-- A pane a command opens: shown as one the line opens is, in raw mode, where
+-- there is a terminal; elsewhere there is nobody to press a key, and it is
+-- closed as soon as it is opened.
+fun shownByCommand open =
+  if T.enterRaw () then
+    (let s = showing (open ()) in
+     let u = T.leaveRaw () in
+     s)
+  else Step.Close
+
+-- Pages a command answered: a pane as tall as the longest needs, and no
+-- taller than the terminal has room for below the line, where there is a
+-- terminal -- and elsewhere each written under its name.
+fun paged (title : String) (pages : [(String, String)]) =
+  if V.isEmpty pages then ()
+  else if T.enterRaw () then
+    (let room = snd (T.size ()) in
+     let longest = V.foldl (\n p -> max n (V.len (S.lines (snd p)))) 0 pages in
+     let rows = max 6 (min ((if room > 0 then room else 24) - 2) (longest + 4)) in
+     let s = showing (pagesPane title pages rows) in
+     T.leaveRaw ())
+  else writeOutput (pagesText pages ++ "\n")
+
 -- --- the prompt --------------------------------------------------------------
 
 -- The line's editor, of what the compiler says of a text: its tree, where
@@ -776,7 +943,7 @@ fun commanded p (again : [String]) (text : String) =
   | (name, rest) ->
       match V.find (\x -> fst x == ":${name}") p.panes with
       | Just (_, make) ->
-          (match showing (make rest (S.charLength rest)) with
+          (match shownByCommand (\u -> make rest (S.charLength rest)) with
            | Step.Put t _ first ->
                -- There is no line to put it on: the next entry begins with
                -- it, and what it brings waits for that.
@@ -789,6 +956,7 @@ fun commanded p (again : [String]) (text : String) =
           | Just (_, _, _, act) ->
               (match act p.db rest with
                | Reply.Said said -> on (say said)
+               | Reply.Pages title pages -> on (paged title pages)
                | Reply.Edit t -> on (beginNext p.pending t)
                | Reply.Entry entry -> on (entered p.history p.eval entry)
                | Reply.Leave said -> (let u = say said in None)
@@ -1021,7 +1189,7 @@ fun quoted (s : String) : String =
 -- --- tests -------------------------------------------------------------------
 
 use Std.Test (assertEq)
-use Std.Console (withOutput)
+use Std.Console (withOutput, withInput, rawMode)
 
 @test fun anEntryIsUnfinishedWhenItsOnlyErrorsAreAtItsEnd () =
   let a = assertEq (unfinished "let x =" [7]) True "something is missing after it" in
@@ -1474,3 +1642,172 @@ fun typing (text : String) : [Key] = V.map (\c -> T.key (Character (C.toString c
          [T.key Enter]
        ])
   in assertEq (S.contains "ran z\n" out) True "the prompt below goes on as it was"
+
+-- Three pages: the second as long as the pane has rows for twice over.
+def stages : [(String, String)] =
+  [
+    ("tokens", "Int 1\nPlus\nInt 2"),
+    ("parse", S.join "\n" (V.map (\i -> "line ${show i}") (V.range 1 13))),
+    ("types", "Int")
+  ]
+
+-- Pages after `keys`, in a pane 10 rows high, which shows 6 of a page's lines:
+-- the one showing and how far each is scrolled, or `None` once closed.
+fun paging (keys : [Key]) : Maybe (Int, [Int]) =
+  let start = Paging { title = "ir", pages = stages, at = 0, scrolled = [0, 0, 0], rows = 10 } in
+  M.map
+    (\(p : Paging) -> (p.at, p.scrolled))
+    (V.foldl
+       (\acc k ->
+         match acc with
+         | Just p -> (match pagesKey p k with | Step.Go q -> Just q | _ -> None)
+         | None -> None)
+       (Just start)
+       keys)
+
+@test fun pagesAreTurnedAndScrolledEachByItself () =
+  let a =
+    assertEq
+      (paging [T.key Right, T.key Tab, T.key Right])
+      (Just (0, [0, 0, 0]))
+      "from page to page, and round from the last to the first"
+  in
+  let b =
+    assertEq
+      (paging [T.key Left, { T.key Tab | shift = True }, T.key (Character "h")])
+      (Just (0, [0, 0, 0]))
+      "and back the other way"
+  in
+  let c =
+    assertEq
+      (paging [T.key (Character "2"), T.key Down, T.key Down, T.key Right, T.key Left])
+      (Just (1, [0, 2, 0]))
+      "a page by its number, scrolled, and still scrolled when it is come back to"
+  in
+  let d =
+    assertEq
+      (paging [T.key (Character "2"), T.key PageDown, T.key PageDown, T.key Down])
+      (Just (1, [0, 6, 0]))
+      "no further than its last line at the bottom: 12 lines, 6 shown"
+  in
+  let e =
+    assertEq
+      (paging [T.key (Character "2"), T.key End, T.key (Character "k"), T.key Home, T.key Up])
+      (Just (1, [0, 0, 0]))
+      "and no further back than its first"
+  in
+  let f =
+    assertEq
+      (paging [T.key Down, T.key (Character "9")])
+      (Just (0, [0, 0, 0]))
+      "a page that is short enough is not scrolled, and one that is not there is not turned to"
+  in assertEq
+       (paging [T.key Right, T.key Escape], paging [T.key (Character "q")], paging [T.ctrl "c"])
+       (None, None, None)
+       "Escape, `q` and Ctrl-C close it"
+
+@test fun pagesAreDrawnWithTheirNamesAcrossTheTop () =
+  let start = Paging { title = "ir", pages = stages, at = 1, scrolled = [0, 2, 0], rows = 10 } in
+  let drawn = D.plain (pagesDrawn start 50) in
+  let a =
+    assertEq
+      (V.take drawn 3)
+      [
+        "╭─ ir ───────────────────────────────────────────╮",
+        "│ 1 tokens · 2 parse · 3 types                   │",
+        "│────────────────────────────────────────────────│"
+      ]
+      "the title, and each page's number and name"
+  in
+  let b =
+    assertEq
+      (V.getOr "" drawn 3, V.getOr "" drawn 8)
+      (
+        "│line 3                                          │",
+        "│line 8                                          │"
+      )
+      "as much of the page showing as fits, from as far as it is scrolled"
+  in
+  let c =
+    assertEq
+      (V.getOr "" drawn 9)
+      "╰─ 3–8 of 12 · ←→ page · ↑↓ scroll · esc close ──╯"
+      "and which lines those are"
+  in
+  let narrow = D.plain (pagesDrawn { start | at = 2 } 24) in
+  assertEq
+    (S.contains "3 types" (V.getOr "" narrow 1), V.getOr "" narrow 9)
+    (True, "╰─ ←→ page · ↑↓ scroll─╯")
+    "a page that is chosen is in sight however narrow the pane, and one that fits says no lines"
+
+-- What a prompt whose `:ir` answers `stages` writes, given `keys` -- or, with
+-- none, `lines` and no terminal.
+fun irPrompt (keys : [Key]) (lines : [String]) =
+  let irCommands =
+    [(
+      "ir",
+      "EXPR",
+      "what an expression is at each stage",
+      \db rest -> Reply.Pages ":ir ${rest}" stages
+    )]
+  in
+  let prompt =
+    \() ->
+      run
+        (plainEditor (commandNames irCommands))
+        "plain"
+        ""
+        (\t -> "ran ${t}")
+        ()
+        irCommands
+        []
+        []
+        (\u -> "")
+  in snd
+       (withOutput (\() ->
+          if V.isEmpty keys then withoutTerminal lines prompt
+          else T.withEvents (V.map (\k -> Event.Pressed k) keys) prompt))
+
+-- `body` with `lines` as its input and no terminal to put into raw mode: a
+-- file or a pipe.
+fun withoutTerminal (lines : [String]) body =
+  withInput lines (\() -> handle body () with { rawMode on k -> k False, return x -> x })
+
+@test fun aCommandsPagesAreReadThenThePromptGoesOn () =
+  let out =
+    irPrompt
+      (V.concat [
+         typing ":ir 1 + 2",
+         [T.key Enter, T.key Right, T.key Escape],
+         typing "z",
+         [T.key Enter]
+       ])
+      []
+  in
+  let a =
+    assertEq
+      (S.contains "─ :ir 1 + 2 ─" out and S.contains "Int 1" out)
+      True
+      "the first page, shown"
+  in
+  let b = assertEq (S.contains "line 1" out) True "and the second, turned to" in
+  assertEq (S.contains "ran z\n" out) True "and closed, the prompt reads on"
+
+@test fun withNoTerminalEachPageIsWrittenUnderItsName () =
+  let out = irPrompt [] [":ir 1 + 2", "z"] in
+  let a =
+    assertEq
+      (S.contains "── tokens ──\nInt 1\nPlus\nInt 2\n\n── parse ──\nline 1\n" out)
+      True
+      "one after another, a line between them"
+  in
+  let b = assertEq (S.contains "── types ──\nInt\nran z\n" out) True "and then the next entry" in
+  let c = assertEq (S.contains "\u{1b}" out) False "and nothing drawn" in
+  let panes = [(":count", \t at -> counter () 0 t at)] in
+  assertEq
+    (snd
+       (withOutput (\() ->
+          withoutTerminal [":count", "y"] (\() ->
+            run (plainEditor []) "plain" "" (\t -> "ran ${t}") () [] panes [] (\u -> "")))))
+    "ran y\n"
+    "and a pane a command opens is not opened at all"
