@@ -173,6 +173,24 @@ format! {
     | Paren = "(" indent(expr) ")"
 }
 
+-- An `if` on one line only while it is short, however wide the line may be.
+format! {
+  Short for Mini
+  indent 2
+  width 80
+    | Let = "let" recursive name params "=" group(indent(line value) line "in") newline body
+    | If = group 20("if" cond indent(line "then" yes) indent(line "else" no))
+}
+
+-- An `if`'s branches under its condition, wherever the `if` starts.
+format! {
+  Aligned for Mini
+  indent 2
+  width 20
+    | Lam = "fun" params "->" body
+    | If = "if" align(cond line "then" yes line "else" no)
+}
+
 fun laidOut (src : String) : String = formatStyle (fst (parseMini src))
 
 fun narrow (src : String) : String = formatNarrow (fst (parseMini src))
@@ -207,6 +225,30 @@ fun written (src : String) : String =
        (narrow "let total = (first + second + third) in total")
        "let total =\n  (\n    first + second + third\n  )\nin\ntotal"
        "the value under its `=`, and the parentheses around what they hold"
+
+@test fun aShortGroupIsOneLineOnlyWhileItIsShort () =
+  let short = \src -> formatShort (fst (parseMini src)) in
+  let a = assertEq (short "if a then b else c") "if a then b else c" "18 columns: one line" in
+  assertEq
+    (short "if x < 3 then (x) else y")
+    "if x < 3\n  then (x)\n  else y"
+    "24 columns: broken, though 80 would have room for it"
+
+@test fun anAlignedPartIsSetInToWhereItStarts () =
+  assertEq
+    (formatAligned (fst (parseMini "fun z -> if x < 3 then (x) else y")))
+    "fun z -> if x < 3\n            then (x)\n            else y"
+    "each branch under the condition, not a level in from the line"
+
+@test fun theWidthCanBeGivenWhenItIsLaidOut () =
+  let within = \w src -> formatStyleWithin w (fst (parseMini src)) in
+  let src = "let x = 1 + 2 in if x < 3 then (x) else fun y -> y" in
+  let a = assertEq (within 20 src) (narrow src) "20 columns, as a formatter declared so" in
+  let b = assertEq (within 80 src) (laidOut src) "80, as declared" in
+  assertEq
+    (within 0 "let x =\n1 + 2\nin x")
+    "let x =\n  1 + 2\nin x"
+    "and 0 only sets lines in, breaking none"
 
 @test fun aNodeBreaksOnlyWhenItDoesNotFit () =
   -- The inner `let` has a body, which starts a line: so the outer value

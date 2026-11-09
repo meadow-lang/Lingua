@@ -21,6 +21,9 @@
 --   indent 3(…) what it encloses is 3 columns in -- or, `indent -1(…)`, out
 --   group(…)    what it encloses goes on one line if it fits, and breaks
 --               together if it does not; a rule is a group as a whole
+--   group 60(…) the same, on one line only while that line is 60 columns
+--               at most, however wide the width
+--   align(…)    a line it breaks to is set in to the column it starts at
 --   line        a space -- or a line's end, where its group breaks
 --   cut         nothing -- or a line's end, where its group breaks
 --   newline     a line's end, always: its group, and every one around it,
@@ -73,6 +76,8 @@
 --
 -- - `formatStyle : Green Mini -> String`, the tree's text laid out, or with
 --   every line set in, as the formatter has a width or not;
+-- - `formatStyleWithin : Int -> Green Mini -> String`, the same at a width
+--   given when it is called -- 0 to set lines in and break none;
 -- - `indentStyle : Green Mini -> String`, what the line after an unfinished
 --   entry opens with.
 --
@@ -96,7 +101,9 @@ use Pretty (Doc)
 
 -- What a rule says a node holds: a token, by its text; a child, by the names
 -- of the kinds it may be -- one, or as many as there are; several of those a
--- level in; several that go on one line or break together; and, between
+-- level in; several that go on one line or break together -- on one line
+-- only while that line is so many columns at most, for `GroupWithin`;
+-- several whose lines are set in to the column they start at; and, between
 -- them, how they are parted (`Parting`).
 @pub data Elem
   = Tok String
@@ -104,6 +111,8 @@ use Pretty (Doc)
   | Indent [Elem]
   | IndentBy Int [Elem]
   | Group [Elem]
+  | GroupWithin Int [Elem]
+  | Align [Elem]
   | Mark Int
   | NoGroup
 
@@ -131,6 +140,10 @@ def blanking : Int = 4
 @pub def nogroup : Elem = NoGroup
 
 @pub fun grouped (es : [Elem]) : Elem = Group es
+
+@pub fun groupedWithin (n : Int) (es : [Elem]) : Elem = GroupWithin n es
+
+@pub fun aligned (es : [Elem]) : Elem = Align es
 
 @pub def tight : Elem = Mark tightly
 
@@ -172,6 +185,16 @@ fun sourceOf st = match st with | Style _ _ _ _ _ t -> t
 fun reading (st : Style k) (t : String) : Style k =
   match st with | Style u w n tr r _ -> Style u w n tr r t
 
+-- The same formatter `width` columns wide -- 0 for one that only indents.
+@pub fun within (st : Style k) (width : Int) : Style k =
+  match st with
+  | Style u _ n tr r t -> Style u (max 0 width) n tr r t
+
+-- The tree's text as `st` sets it out `width` columns wide: laid out, or --
+-- with a width of 0 -- every line set in, and broken where it was.
+@pub fun formatWithin (st : Style k) (width : Int) (g : Green k) : String =
+  if width > 0 then layout (within st width) g else reindent (within st 0) g
+
 -- What an error node's kind is called, whatever the grammar: `syntax!` gives
 -- every grammar one.
 def errorNode : String = "ErrorNode"
@@ -190,6 +213,8 @@ fun leaves (es : [Elem]) : [Elem] =
       | Indent inner -> leaves inner
       | IndentBy _ inner -> leaves inner
       | Group inner -> leaves inner
+      | GroupWithin _ inner -> leaves inner
+      | Align inner -> leaves inner
       | Mark _ -> []
       | NoGroup -> []
       | other -> [other])
@@ -254,6 +279,9 @@ fun indentSpans (unit : Int) (es : [Elem]) (from : Int) : [(Int, Int, Int)] =
           (indentSpans unit inner at),
         at + V.len (leaves inner)
       )
+  in
+  let through =
+    \out at inner -> (V.append out (indentSpans unit inner at), at + V.len (leaves inner))
   in fst
        (V.foldl
           (\acc e ->
@@ -262,8 +290,9 @@ fun indentSpans (unit : Int) (es : [Elem]) (from : Int) : [(Int, Int, Int)] =
                 (match e with
                  | Indent inner -> spanOf out at unit inner
                  | IndentBy n inner -> spanOf out at n inner
-                 | Group inner ->
-                     (V.append out (indentSpans unit inner at), at + V.len (leaves inner))
+                 | Group inner -> through out at inner
+                 | GroupWithin _ inner -> through out at inner
+                 | Align inner -> through out at inner
                  | Mark _ -> (out, at)
                  | NoGroup -> (out, at)
                  | _ -> (out, at + 1)))
@@ -664,6 +693,17 @@ fun lineStartBefore (t : String) (at : Int) : Int =
 fun breaksAfter (doc : Doc ()) (n : Int) : Doc () =
   if n <= 0 then doc else breaksAfter (PP.append doc PP.hardline) (n - 1)
 
+-- `d` as a group that goes on one line only where that line is `n` columns
+-- at most from where it starts, however much room there is: what reads as a
+-- line only while it is short. What is flat is measured, and fails past `n`;
+-- broken, it is not.
+fun groupWithin (n : Int) (d : Doc ()) : Doc () =
+  PP.group
+    (PP.column (\start ->
+       PP.append
+         d
+         (PP.flatAlt PP.nil (PP.column (\stop -> if stop - start > n then PP.fail else PP.nil)))))
+
 -- A rule's items as one document: a group, unless the rule says `nogroup`.
 fun asRule (st : Style k) (elems : [Elem]) (items : [Item]) : Doc () =
   if V.any (\e -> match e with | NoGroup -> True | _ -> False) elems then assemble st items
@@ -739,11 +779,38 @@ fun itemsOf
     : ([Item], Int, Int) =
   -- What `indent(…)` encloses: nothing at all where it has nothing to
   -- write -- an empty list -- not the partings around that nothing.
-  let within =
+  let enclosed =
     \out at done inner columns ->
       match itemsOf st all places kids found inner columns at done with
       | (items, at2, done2) ->
           if V.all isParting items then (out, at2, done2) else (V.append out items, at2, done2)
+  in
+  -- What a group encloses, as one thing `wrap` makes of it: the partings it
+  -- ends with part it from what follows.
+  let wrapped =
+    \out at done inner wrap ->
+      match itemsOf st all places kids found inner 0 at done with
+      | (items, at2, done2) ->
+          let tail = V.len (V.takeWhile isParting (V.reverse items)) in
+          let body = V.take items (V.len items - tail) in
+          let after =
+            V.map
+              (\i ->
+                match i with
+                | Parting n _ -> Parting n level
+                | other -> other)
+              (V.drop items (V.len items - tail))
+          in if V.isEmpty body then (V.append out after, at2, done2)
+             else
+               (
+                 V.concat [
+                   out,
+                   [Written level (wrap (assemble st body)) (openingOf body) (0 - 1)],
+                   after
+                 ],
+                 at2,
+                 done2
+               )
   in V.foldl
        (\acc e ->
          match acc with
@@ -751,36 +818,11 @@ fun itemsOf
              (match e with
               | Mark strength -> (V.pushBack out (Parting strength level), at, done)
               | NoGroup -> acc
-              | Indent inner -> within out at done inner (level + unitOf st)
-              | IndentBy n inner -> within out at done inner (level + n)
-              | Group inner ->
-                  (match itemsOf st all places kids found inner 0 at done with
-                   | (items, at2, done2) ->
-                       -- What it ends with parts it from what follows.
-                       let tail = V.len (V.takeWhile isParting (V.reverse items)) in
-                       let body = V.take items (V.len items - tail) in
-                       let after =
-                         V.map
-                           (\i ->
-                             match i with
-                             | Parting n _ -> Parting n level
-                             | other -> other)
-                           (V.drop items (V.len items - tail))
-                       in if V.isEmpty body then (V.append out after, at2, done2)
-                          else
-                            (
-                              V.concat [
-                                out,
-                                [Written
-                                   level
-                                   (PP.group (assemble st body))
-                                   (openingOf body)
-                                   (0 - 1)],
-                                after
-                              ],
-                              at2,
-                              done2
-                            ))
+              | Indent inner -> enclosed out at done inner (level + unitOf st)
+              | IndentBy n inner -> enclosed out at done inner (level + n)
+              | Group inner -> wrapped out at done inner PP.group
+              | GroupWithin n inner -> wrapped out at done inner (groupWithin n)
+              | Align inner -> wrapped out at done inner PP.align
               | _ ->
                   let r = V.getOr absent found at in
                   if not (present r) then (out, at + 1, done)
@@ -996,11 +1038,14 @@ data Written
   | WIndent [Written]
   | WIndentBy Int [Written]
   | WGroup [Written]
+  | WGroupWithin Int [Written]
+  | WAlign [Written]
   | WMark String
 
 use Written.*
 
--- `indent` and `group` before parentheses are what they say; anywhere else
+-- `indent`, `group` and `align` before parentheses -- or `indent` and
+-- `group` before a number and parentheses -- are what they say; anywhere else
 -- they are a child's name. The partings are words of their own.
 def partings : [String] = ["tight", "cut", "line", "newline"]
 
@@ -1025,6 +1070,13 @@ fun writing (ts : [TokenTree]) (i : Int) (out : [Written]) : [Written] =
             | _ -> writing ts (i + 1) out))
   | (Just (Word "group" _), Just (Group Paren inner _)) ->
       writing ts (i + 2) (V.pushBack out (WGroup (writtenOf inner)))
+  | (Just (Word "group" at), Just (Num n _)) ->
+      (match V.get ts (i + 2) with
+       | Just (Group Paren inner _) ->
+           writing ts (i + 3) (V.pushBack out (WGroupWithin n (writtenOf inner)))
+       | _ -> writing ts (i + 1) (V.pushBack out (WName "group" at)))
+  | (Just (Word "align" _), Just (Group Paren inner _)) ->
+      writing ts (i + 2) (V.pushBack out (WAlign (writtenOf inner)))
   | (Just (Str s _), _) -> writing ts (i + 1) (V.pushBack out (WTok s))
   | (Just (Word w at), _) ->
       writing ts (i + 1) (V.pushBack out (if V.elem w partings then WMark w else WName w at))
@@ -1141,6 +1193,14 @@ fun elemCode sorts tokenFields rule fs (w : Written) : Result [TokenTree] String
       (match elemsCode sorts tokenFields rule fs inner with
        | Ok code -> Ok "LinguaF.grouped ${code}"
        | Err failed -> Err failed)
+  | WGroupWithin n inner ->
+      (match elemsCode sorts tokenFields rule fs inner with
+       | Ok code -> Ok "LinguaF.groupedWithin ${show n} ${code}"
+       | Err failed -> Err failed)
+  | WAlign inner ->
+      (match elemsCode sorts tokenFields rule fs inner with
+       | Ok code -> Ok "LinguaF.aligned ${code}"
+       | Err failed -> Err failed)
   | WIndent inner ->
       (match elemsCode sorts tokenFields rule fs inner with
        | Ok code -> Ok "LinguaF.indented ${code}"
@@ -1224,6 +1284,10 @@ def lingua${name}_style =
 
 -- The tree's text as `${name}` sets it out: ${if width > 0 then "laid out within ${show width} columns" else "every line set in, and broken where it was"}.
 ${pub}fun format${name} g = LinguaF.${if width > 0 then "layout" else "reindent"} lingua${name}_style g
+
+-- The tree's text as `${name}` sets it out `width` columns wide: laid out, or
+-- -- with a width of 0 -- every line set in, and broken where it was.
+${pub}fun format${name}Within width g = LinguaF.formatWithin lingua${name}_style width g
 
 -- What the line after an unfinished entry opens with.
 ${pub}fun indent${name} g = LinguaF.continuation lingua${name}_style g
