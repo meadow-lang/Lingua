@@ -20,6 +20,8 @@ use Std.Test (assertEq)
   | @token("with") With
   | @token("if") If
   | @token("call") Call
+  | @token("<") Lt
+  | @token(">") Gt
   | @token("\\") Lam
   | @token("then") Then
   | @token("else") Else
@@ -46,6 +48,8 @@ syntax! {
     "with" = With,
     "if" = If,
     "call" = Call,
+    "<" = Lt,
+    ">" = Gt,
     "\\" = Lam,
     "then" = Then,
     "else" = Else,
@@ -65,7 +69,10 @@ syntax! {
     File = items:Expr*
     Expr = first:Term rest:Tail*
     Tail = op:"+" operand:Term
-    Term = List | LetE | MatchE | IfE | Tagged | Call | LamE | Paren | Var
+    Term = List | LetE | MatchE | IfE | Tagged | Call | LamE | Paren | Vec | Var
+    Vec = "<" body:VecBody? ">"
+    VecBody = first:Expr tail:VecItem*
+    VecItem = "," expr:Expr
     Call = "call" head:Var args:Arg*
     Arg = term:Term
     LamE = "\\" param:Var "->" body:Expr
@@ -160,7 +167,10 @@ format! {
   Hugged for Lists
   indent 2
   width 30
-    | Call = "call" head indent(line hug LamE Paren+ List Paren.LamE(args(line)))
+    | Call = "call" head indent(line hug LamE Paren+ List Paren.LamE Vec+ ","(args(line)))
+    | Vec = "<" indent(cut body) cut ">"
+    | VecBody = first tail
+    | VecItem = nogroup tight "," line expr
     | LamE = "\\" tight param "->" indent(line body)
     | List = "[" indent(cut items(tight "," line)) cut "]"
     | Paren = when 1 elems("(" tight elems tight ")")("(" indent(cut elems(tight "," line)) cut ")")
@@ -466,3 +476,26 @@ format! {
     (blocky "@a(b) [x, y]")
     "@a(b) [\n  x,\n  y\n]"
     "and the same list, broken where the rule says so"
+
+@test fun aHugNeedsOnlyItsFirstLineToFit () =
+  assertEq
+    (hugged "call f (\\x -> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)")
+    "call f (\\x ->\n  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
+    "a line after the first too long for any width does not stop it hugging"
+
+@test fun aHugsFirstLineIsMeasuredFromWhereItStarts () =
+  assertEq
+    (hugged "call fffffffffffffffffffffff (\\x -> b)")
+    "call fffffffffffffffffffffff\n  (\\x -> b)"
+    "after a long head its first line would not fit, so it goes on a line of its own"
+
+@test fun aBracketsSeparatorsAreFoundInWhatItHolds () =
+  let a =
+    assertEq
+      (hugged "call f a <bbbbbbbbbb, cccccccccc, dddddddddd>")
+      "call f a <\n  bbbbbbbbbb,\n  cccccccccc,\n  dddddddddd\n>"
+      "its commas each in a node of its own, and it hugs"
+  in assertEq
+       (hugged "call f aaaaaaaaaaaaaa <bbbbbbbbbbbbbbbbb>")
+       "call f\n  aaaaaaaaaaaaaa\n  <bbbbbbbbbbbbbbbbb>"
+       "with none, it does not, though its first line would fit"

@@ -1012,13 +1012,26 @@ fun hugged (st : Style k) (items : [Item]) (normal : Doc ()) : Doc () =
             | Parting s at -> Parting s (max 0 (at - level))
             | other -> other)
           (V.drop items (m + 1))
-      in PP.union
-           (PP.append
-              (PP.append
-                 (PP.group (PP.append (assemble st head) (PP.flatAlt PP.fail PP.nil)))
-                 (if parting >= spacing then PP.space else PP.nil))
-              (assemble st shifted))
-           normal
+      in
+      let headDoc = assemble st head in
+      let sep = if parting >= spacing then " " else "" in
+      let lastDoc = assemble st shifted in
+      -- It hugs where what is before it goes on one line, and the first line
+      -- of it, laid out from the end of that, fits: as meadow-fmt has it, a
+      -- line after its first too long for any width does not stop it.
+      PP.column (\start ->
+        match PP.render 1000000 (PP.group headDoc) with
+        | Ok flat ->
+            if S.contains "\n" flat then normal
+            else
+              let at = start + stringByteLength flat + stringByteLength sep in
+              (match PP.render (widthOf st) (PP.append (PP.text (S.repeat " " at)) lastDoc) with
+               | Ok out ->
+                   if stringByteLength (V.getOr "" (S.split "\n" out) 0) <= widthOf st then
+                     PP.append (PP.append (PP.group headDoc) (PP.text sep)) lastDoc
+                   else normal
+               | Err _ -> normal)
+        | Err _ -> normal)
 
 -- What a group that must break holds: nothing, broken, and on one line, a
 -- failure -- so neither it nor any group around it goes on one line.
@@ -1143,9 +1156,24 @@ fun hugs (st : Style k) (kinds : [(String, Int, String)]) (c : Syntax k) : Bool 
                    and (match V.get nodes 0 with
                     | Just x -> kindName st (inmost st x) == inside
                     | None -> False)
-               else if how == 2 then V.any (\x -> R.isTokenOf x) inner
+               else if how == 2 then
+                 (if S.isEmpty inside then V.any (\x -> R.isTokenOf x) inner
+                  else V.any (\x -> separatorIn st (S.split " " inside) x) inner)
                else True))
       kinds
+
+-- Whether `x` is, or holds, one of the separators `texts` -- held at any
+-- depth, but not inside a node that begins and ends with a token, as a
+-- bracket inside the one asked about does.
+fun separatorIn (st : Style k) (texts : [String]) (x : Syntax k) : Bool =
+  if R.isTokenOf x then V.elem (R.text x) texts
+  else
+    let held = kidsOf st x in
+    let bracketed =
+      (match (V.get held 0, V.last held) with
+       | (Just a, Just b) -> V.len held > 1 and R.isTokenOf a and R.isTokenOf b
+       | _ -> False)
+    in not bracketed and V.any (\y -> separatorIn st texts y) held
 
 -- The `breaks` of `es` that are its own group's -- not those of a group
 -- inside it.
@@ -1995,7 +2023,15 @@ fun writing (ts : [TokenTree]) (i : Int) (out : [Written]) : [Written] =
                  (match V.get ts (j + 2) with
                   | Just (Word l _) -> kindsFrom (j + 3) (V.pushBack acc ((k, 1, l), kat))
                   | _ -> (acc, j))
-               else if after "+" then kindsFrom (j + 2) (V.pushBack acc ((k, 2, ""), kat))
+               else if after "+" then
+                 -- The separators it has, if they are named: `BrackE+ "," ";"`.
+                 (let seps =
+                    V.map
+                      (\t -> match t with | Str s _ -> s | _ -> "")
+                      (V.takeWhile
+                         (\t -> match t with | Str _ _ -> True | _ -> False)
+                         (V.drop ts (j + 2)))
+                  in kindsFrom (j + 2 + V.len seps) (V.pushBack acc ((k, 2, S.join " " seps), kat)))
                else kindsFrom (j + 1) (V.pushBack acc ((k, 0, ""), kat))
         | _ -> (acc, j)
       in (match kindsFrom (i + 1) [] with
@@ -2212,7 +2248,7 @@ fun elemCode sorts tokenFields rule fs (names : [String]) (w : Written)
                       | Err failed -> Err failed
                       | Ok code ->
                           Ok
-                            "LinguaF.hugging [${S.join ", " (V.map (\k -> match k with | ((kind, how, want), _) -> "(${quote "Node${kind}"}, ${show how}, ${quote (if how == 1 then "Node${want}" else "")})") kinds)}] (${code})")
+                            "LinguaF.hugging [${S.join ", " (V.map (\k -> match k with | ((kind, how, want), _) -> "(${quote "Node${kind}"}, ${show how}, ${quote (if how == 1 then "Node${want}" else want)})") kinds)}] (${code})")
                  | _ ->
                      Err [Fail "`hug` is of one child that is many, written in its parentheses" at])
      | WBroken n at ->
