@@ -1041,3 +1041,28 @@ format! {
       "(\n  x,\n  (\n    aaaaaaaa\n      + bbbbbbbb,\n    c\n  )\n)"
     ]
     "on one line if it fits; and if not, a comma a line, and a part that does not fit at its `+`s"
+
+@test fun aNodeThatBeginsWithAGluedTokenHasItBeforeTheComments () =
+  assertEq
+    (V.map (\x -> formatHugged (fst (parseLists x))) [
+       "<aaaaaaaaaa, bbbbbbbbbb\n-- c\n, cccccccccc>",
+       "<aaaaaaaaaa, bbbbbbbbbb -- c\n, cccccccccc>"
+     ])
+    [
+      "<\n  aaaaaaaaaa,\n  bbbbbbbbbb,\n  -- c\n  cccccccccc\n>",
+      "<\n  aaaaaaaaaa,\n  bbbbbbbbbb, -- c\n  cccccccccc\n>"
+    ]
+    "`VecItem = tight \",\" line expr`: its comma on the item before, the comment after it"
+
+@test fun nothingHugsThatHasACommentBeforeIt () =
+  assertEq
+    (formatHugged (fst (parseLists "call f\n-- c\n[aaaaaaaaaa, bbbbbbbbbb, cccccccccc]")))
+    "call f\n  -- c\n  [\n    aaaaaaaaaa,\n    bbbbbbbbbb,\n    cccccccccc\n  ]"
+    "the comment on its line, and the list under it, a step in"
+
+@test fun aBracketHugsOnlyWhereEveryLineOfItFits () =
+  assertEq
+    (bodied
+       "mac {\nhead x {aaaaaaaaaa = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nc = d}\nf = g\n}")
+    "mac {\n  head\n    x\n    {\n      aaaaaaaaaa =\n        bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n      c = d\n    }\n  f = g\n}"
+    "a word too long for any line in it: the bracket a line of its own"

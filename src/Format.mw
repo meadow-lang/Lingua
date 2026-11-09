@@ -1832,9 +1832,13 @@ fun entryDocAs
                         | None -> False)
                 | None -> False)
            in
-           -- An entry with such a word in it is no application -- `if x then
-           -- y` -- and its things are as the text spaced them.
-           let worded = V.any keyword (V.range from (b + 1)) in
+           -- An entry with a run of things that begins with such a word is no
+           -- application -- `if x then y` -- and its things are as the text
+           -- spaced them. A word inside a run is a word: `with Members` in a
+           -- macro's own language.
+           let worded =
+             V.any (\j -> keyword j and (j == from or isOp (j - 1))) (V.range from (b + 1))
+           in
            -- One more thing in a run of them: `d` so far, and whether it is
            -- an application already made, with what it ends with hugged.
            let onto =
@@ -1868,10 +1872,23 @@ fun entryDocAs
                          (match PP.render 1000000 flat with
                           | Ok s -> V.len (S.chars s)
                           | Err _ -> 1000000)
+                       in
+                       let hugging = PP.concat [flat, PP.space, docAt j] in
+                       -- Hugged, every line of it fits: a line in the bracket
+                       -- that does not fit however it breaks -- a string too
+                       -- long -- leaves it a line of its own.
+                       let allFit =
+                         \c i ->
+                           (match PP.render
+                              (widthOf st)
+                              (PP.append (PP.text (S.repeat " " c)) (PP.nest i hugging)) with
+                            | Ok s -> V.all (\l -> S.charLength l <= widthOf st) (S.split "\n" s)
+                            | Err _ -> False)
                        in (
                             PP.column (\c ->
-                              if c + wide + 2 <= widthOf st then PP.concat [flat, PP.space, docAt j]
-                              else applied (PP.append d (PP.append PP.line (docAt j)))),
+                              PP.nesting (\i ->
+                                if c + wide + 2 <= widthOf st and allFit c i then hugging
+                                else applied (PP.append d (PP.append PP.line (docAt j))))),
                             True,
                             True
                           ))
@@ -2682,9 +2699,22 @@ fun itemsOf
                               | _ -> V.range (fst r) (snd r + 1))
                            in
                            let last = V.getOr (0 - 1) nodes (V.len nodes - 1) in
+                           -- No node hugs that has a comment before it: the
+                           -- comment is on a line of its own, and the node goes
+                           -- on under it.
+                           let commentBefore =
+                             \j ->
+                               not
+                                 (V.isEmpty
+                                    (commentsIn
+                                       all
+                                       (if j == 0 then 0 else V.getOr 0 places (j - 1) + 1)
+                                       (V.getOr 0 places j)))
+                           in
                            let marked =
                              \j ->
                                if j == last
+                                 and not (commentBefore j)
                                  and (match V.get kids j with
                                   | Just c -> hugs st kinds c
                                   | None -> False) then [HugMark level]
@@ -3115,17 +3145,67 @@ fun kidItemAs
   -- Comments on lines of their own begin a line, whatever parting comes
   -- before them -- where anything does, in its node.
   let ownLine = if V.isEmpty comments or j == 0 then [] else [Parting freshing level] in
+  let afterIt = if V.isEmpty comments then [] else V.append [Parting freshing level] onlyComments in
   match V.get kids j with
   | Just c ->
       if glued and R.isTokenOf c and not (S.isEmpty (R.text c)) and not (V.isEmpty found) then
-        V.concat [
-          placed,
-          [Written level (PP.text (R.text c)) none none],
-          atEnd,
-          (if V.isEmpty comments then [] else V.append [Parting freshing level] onlyComments)
-        ]
-      else V.concat [atEnd, ownLine, placed, own]
-  | None -> V.concat [atEnd, ownLine, placed, own]
+        V.concat [placed, [Written level (PP.text (R.text c)) none none], atEnd, afterIt]
+      else if R.isTokenOf c or V.isEmpty found then V.concat [atEnd, ownLine, placed, own]
+      else
+        -- A node its rule sets `tight` to what is before it, beginning with
+        -- a token -- `CommaItem = tight "," line expr` -- has that token
+        -- glued as a separator is: before the comments, and the rest of it
+        -- after them.
+        match ruleOf st c with
+        | Just elems ->
+            (match ruledParts st c elems with
+             | (lead, Just (d, opens, closes), trail) ->
+                 if lead != tightly then V.concat [atEnd, ownLine, placed, own]
+                 else
+                   (match firstText d with
+                    | Just (tok, rest) ->
+                        V.concat [
+                          [Parting tightly level],
+                          placed,
+                          [Written level (PP.text tok) none none],
+                          atEnd,
+                          afterIt,
+                          [Written level (droppedLeadingBreak rest) none closes],
+                          (if trail >= 0 then [Parting trail level] else [])
+                        ]
+                    | None -> V.concat [atEnd, ownLine, placed, own])
+             | _ -> V.concat [atEnd, ownLine, placed, own])
+        | None -> V.concat [atEnd, ownLine, placed, own]
+        | None -> V.concat [atEnd, ownLine, placed, own]
+
+-- The text `d` begins with, and `d` without it -- where what it begins with
+-- is text, and not a choice or a break.
+fun firstText (d : Doc ()) : Maybe (String, Doc ()) =
+  match d with
+  | Doc.Text s -> Just (s, PP.nil)
+  | Doc.RenderLen _ s -> Just (s, PP.nil)
+  | Doc.Append a b ->
+      (match firstText a with
+       | Just (s, rest) -> Just (s, PP.append rest b)
+       | None -> (match a with | Doc.Empty -> firstText b | _ -> None))
+  | Doc.Nest n inner -> M.map (\p -> (fst p, PP.nest n (snd p))) (firstText inner)
+  | Doc.Group inner -> M.map (\p -> (fst p, PP.group (snd p))) (firstText inner)
+  | _ -> None
+
+-- `d` without a break it begins with: what parted what was taken from before
+-- it from the rest, which comments now part.
+fun droppedLeadingBreak (d : Doc ()) : Doc () =
+  match d with
+  | Doc.FlatAlt _ _ -> PP.nil
+  | Doc.Hardline -> PP.nil
+  | Doc.Text s -> if S.isEmpty (S.trim s) then PP.nil else d
+  | Doc.Append a b ->
+      (match a with
+       | Doc.Empty -> droppedLeadingBreak b
+       | _ -> PP.append (droppedLeadingBreak a) b)
+  | Doc.Nest n inner -> PP.nest n (droppedLeadingBreak inner)
+  | Doc.Group inner -> PP.group (droppedLeadingBreak inner)
+  | other -> other
 
 -- The trivia from child `from` up to `to` that is not blank: comments.
 fun commentsIn (all : [Syntax k]) (from : Int) (to : Int) : [String] =
