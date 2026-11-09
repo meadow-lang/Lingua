@@ -616,3 +616,9 @@ format! {
     (chained "let a = [bbbbbbbbbb, cccccccccc, dddddddddd] in\n-- note\na")
     "let a =\n  [bbbbbbbbbb, cccccccccc, dddddddddd]\nin\n-- note\na"
     "though the parting before it is a space"
+
+@test fun aCommentsBreakIsOneWithABreakBesideIt () =
+  assertEq
+    (chained "let a = x in\nlet b = y in\n-- note\nb")
+    "let a = x in\nlet b = y in\n-- note\nb"
+    "the step's `line` broke, and the comment's break is that one, not another"

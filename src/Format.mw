@@ -174,15 +174,17 @@ use Cond.*
 
 -- How two things are parted, weakest first: by nothing; by nothing, or a
 -- break where the group breaks; by a space, always; by a space, or a break
--- where it breaks; by a break, always; by a blank line, which is kept where
--- the text had one.
+-- before what does not fit whole; by a space, or a break where the group
+-- breaks; by a break, unless the line is one nothing is on yet; by a break,
+-- always; by a blank line, which is kept where the text had one.
 def tightly : Int = 0
 def cutting : Int = 1
 def spacing : Int = 2
 def filling : Int = 3
 def lining : Int = 4
-def breaking : Int = 5
-def blanking : Int = 6
+def freshing : Int = 5
+def breaking : Int = 6
+def blanking : Int = 7
 
 -- The same, as functions: what `format!` writes a rule with.
 @pub fun tok (t : String) : Elem = Tok t
@@ -1989,7 +1991,7 @@ fun kidItem
   in
   -- Comments on lines of their own begin a line, whatever parting comes
   -- before them -- where anything does, in its node.
-  let ownLine = if V.isEmpty comments or j == 0 then [] else [Parting breaking level] in
+  let ownLine = if V.isEmpty comments or j == 0 then [] else [Parting freshing level] in
   V.concat [atEnd, ownLine, placed, own]
 
 -- The trivia from child `from` up to `to` that is not blank: comments.
@@ -2085,6 +2087,10 @@ fun partingDoc (strength : Int) : Doc () =
   else if strength == cutting then PP.line_
   else if strength == spacing then PP.space
   else if strength == filling then PP.softline
+  -- A break, unless the line it would end has nothing on it yet -- a break
+  -- just written, in a group's own parting that a rule's items cannot see.
+  else if strength == freshing then
+    PP.column (\c -> PP.nesting (\i -> if c <= i then PP.nil else PP.hardline))
   else if strength == lining then PP.line
   else if strength == breaking then PP.hardline
   else PP.append PP.hardline PP.hardline
