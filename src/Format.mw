@@ -883,7 +883,11 @@ use Item.*
   let t = G.text g in
   let st = reading style t in
   match PP.render (widthOf st) (docOf st (R.root g)) with
-  | Ok out ->
+  -- A text with the mark a break before a comment is written after in it
+  -- already is not one whose marks can be told from the text's.
+  | Ok _ if S.contains fresh t -> t
+  | Ok written ->
+      let out = freshened written in
       -- A line of nothing but its indent is an empty one, and no line ends
       -- with blank space -- a space put before what then broke -- unless a
       -- token of the text has blank space at the end of a line in it, a
@@ -897,6 +901,33 @@ use Item.*
       in S.trimEnd (S.join "\n" lines)
            ++ (if S.endsWith "\n" t and not (S.isEmpty (S.trim out)) then "\n" else "")
   | Err _ -> t
+
+-- The mark a `freshing` break is written after: a character of no one's.
+def fresh : String = "\u{e000}"
+
+-- What was written with each `freshing` break made what it should be: a
+-- break where its mark has something before it on its line, and nothing
+-- where its line had nothing on it yet -- what follows the break goes on that
+-- line, where it was begun.
+fun freshened (out : String) : String =
+  if not (S.contains fresh out) then out
+  else
+    let done =
+      V.foldl
+        (\acc l ->
+          match acc with
+          | (kept, carry) ->
+              let line = (match carry with | Just p -> p ++ S.trimStart l | None -> l) in
+              if S.endsWith fresh line then
+                (let before = stringSlice line 0 (stringByteLength line - stringByteLength fresh) in
+                 if S.isEmpty (S.trim before) then (kept, Just before)
+                 else (V.pushBack kept before, None))
+              else (V.pushBack kept line, None))
+        ([], None)
+        (S.split "\n" out)
+    in match done with
+       | (kept, Just p) -> S.join "\n" (V.pushBack kept p)
+       | (kept, None) -> S.join "\n" kept
 
 -- `t` without its blank space.
 fun unblank (t : String) : String =
@@ -2789,10 +2820,12 @@ fun partingDoc (strength : Int) : Doc () =
   else if strength == filling then PP.softline
   -- A break, unless the line it would end has nothing on it yet -- a break
   -- just written, in a group's own parting that a rule's items cannot see.
-  -- A line just begun is where the indent is: one further in than where it
-  -- ends, after a pattern that broke, is no line just begun.
-  else if strength == freshing then
-    PP.column (\c -> PP.nesting (\i -> if c == i then PP.nil else PP.hardline))
+  -- Where a line is cannot say that: a line just begun is where the indent
+  -- is, and so is one with `) ->` on it, when the indent is as wide. So the
+  -- break is written, after a mark that takes no room, and once the whole
+  -- is written the mark says whether there was anything before it
+  -- (`freshened`).
+  else if strength == freshing then PP.append (Doc.RenderLen 0 fresh) PP.hardline
   else if strength == lining then PP.line
   else if strength == breaking then PP.hardline
   else PP.append PP.hardline PP.hardline

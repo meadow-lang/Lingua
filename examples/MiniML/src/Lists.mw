@@ -842,3 +842,17 @@ format! {
     (formatDeep (fst (parseLists "@a(b)\n-- c\n[x]")))
     "@a(b)\n        -- c\n        [x]"
     "a line of its own, though the line before ends short of where it is set in"
+
+-- What follows an attribute set in as far as the attribute ends.
+format! {
+  Level for Lists
+  indent 2
+  width 40
+    | Tagged = attr indent 5(expr)
+}
+
+@test fun aCommentNeverTouchesWhatEndsWhereItIsSetIn () =
+  assertEq
+    (LinguaF.layoutUnchecked linguaLevel_style (fst (parseLists "@a(b)\n-- c\n[x]")))
+    "@a(b)\n     -- c\n     [x]"
+    "a line of its own, though the line before ends where a line just begun would"
