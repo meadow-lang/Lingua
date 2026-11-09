@@ -460,6 +460,21 @@ format! {
   let a = assertEq (formatSkipsPlain (fst (parseSkips src))) src "with no rule" in
   assertEq (formatSkipsFiled (fst (parseSkips src))) src "and with a rule for the file"
 
+@test fun twoThingsTheTextKeptApartStayApartWhereTheParserStopped () =
+  -- Each has a `[` the parser could not close where it thought to: the
+  -- list is left open, with the run of blank space after its last name in
+  -- it, and what follows that name is no child of the list.
+  assertEq
+    (V.map (\x -> formatSkipsPlain (fst (parseSkips x))) [
+       "[x y] z",
+       "@a [x y",
+       "[x y z]",
+       "@a [x, y z] w",
+       "[x [y z] w]"
+     ])
+    ["[x y] z", "@a [x y", "[x y z]", "@a [x, y z] w", "[x [y z] w]"]
+    "the space between them kept, though the list holds it and the name after it does not"
+
 @test fun aPartingAfterNothingWrittenPartsNothing () =
   let src = "-- top\n--\n-- more\n\n[x]\n@a\n[y]\n@b @c [z]\n" in
   assertEq

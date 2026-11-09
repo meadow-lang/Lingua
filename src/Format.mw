@@ -1036,7 +1036,8 @@ fun writtenAsIs (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
              col = 0 - 1,
              cur = 0,
              shown = False,
-             begun = False
+             begun = False,
+             upto = 0 - 1
            }
          in
          -- `d` written next, which begins with `opens` breaks of its own. A
@@ -1088,11 +1089,12 @@ fun writtenAsIs (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
                }
          in
          let step =
-           \w i ->
+           \before i ->
              match V.get all i with
-             | None -> w
+             | None -> before
              | Just c ->
                  if (triviaOf st) (R.kindOf c) then
+                   let w = before in
                    let t = R.text c in
                    if not (S.isEmpty (S.trim t)) then
                      -- A comment on a line of its own between two items is
@@ -1107,32 +1109,52 @@ fun writtenAsIs (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
                           let after = put { ahead | begun = False } 0 (PP.text body) in
                           blankSpace { after | asked = ahead.asked, begun = w.begun } tail)
                    else blankSpace w t
-                 else if R.isTokenOf c then
-                   (if S.isEmpty (R.text c) then w else put w 0 (PP.text (R.text c)))
                  else
-                   match ruleOf st c with
-                   | None ->
-                       (match writtenParts st c with
-                        | (d, n, a) -> (let after = put w 0 d in { after | owed = n, asked = a }))
-                   | Just elems ->
-                       (match ruledParts st c elems with
-                        | (lead, body, trail) ->
-                            let led =
-                              if breaksOf lead > 0 then
-                                { w | owed = max w.owed (breaksOf lead), asked = True }
-                              else w
-                            in (match body with
-                                | Just (d, opens, closes) ->
-                                    let after = put led (breaksOf opens) d in
-                                    {
-                                      after | owed = breaksOf trail,
-                                      asked = breaksOf trail > 0 or breaksOf closes > 0,
-                                      broke = breaksOf closes
-                                    }
-                                | None ->
-                                    if breaksOf trail > 0 then
-                                      { led | owed = max led.owed (breaksOf trail), asked = True }
-                                    else led))
+                   -- The blank space before `c` that no blank child holds: a
+                   -- node left open by the parser ends with the space after
+                   -- it, and what follows it touched it no more than in the
+                   -- text.
+                   let r = solidRange st c in
+                   let between =
+                     if before.upto < 0 then "" else stringSlice (sourceOf st) before.upto (fst r)
+                   in
+                   let w =
+                     if not (S.isEmpty between) and S.isEmpty (S.trim between) then
+                       blankSpace before between
+                     else before
+                   in
+                   let done =
+                     (if R.isTokenOf c then
+                        (if S.isEmpty (R.text c) then w else put w 0 (PP.text (R.text c)))
+                      else
+                        match ruleOf st c with
+                        | None ->
+                            (match writtenParts st c with
+                             | (d, n, a) ->
+                                 (let after = put w 0 d in { after | owed = n, asked = a }))
+                        | Just elems ->
+                            (match ruledParts st c elems with
+                             | (lead, body, trail) ->
+                                 let led =
+                                   if breaksOf lead > 0 then
+                                     { w | owed = max w.owed (breaksOf lead), asked = True }
+                                   else w
+                                 in (match body with
+                                     | Just (d, opens, closes) ->
+                                         let after = put led (breaksOf opens) d in
+                                         {
+                                           after | owed = breaksOf trail,
+                                           asked = breaksOf trail > 0 or breaksOf closes > 0,
+                                           broke = breaksOf closes
+                                         }
+                                     | None ->
+                                         if breaksOf trail > 0 then
+                                           {
+                                             led | owed = max led.owed (breaksOf trail),
+                                             asked = True
+                                           }
+                                         else led)))
+                   in { done | upto = snd r }
          in
          let w = V.foldl step start (V.range first (last + 1)) in
          let n = max 0 (w.owed - w.broke) in
@@ -1335,7 +1357,8 @@ fun solidRange (st : Style k) (c : Syntax k) : (Int, Int) =
   (solidEnd st (\held -> V.get held 0) fst c, solidEnd st V.last snd c)
 
 -- One end of where `c` is: the end `side` takes of the token `toward` leads
--- down to.
+-- down to. Blank space is passed by, trivia or not: a lexer that skips it
+-- leaves it as a run of what it skipped, and a node left open ends with it.
 fun solidEnd
     (st : Style k)
     (toward : [Syntax k] -> Maybe (Syntax k))
@@ -1344,7 +1367,7 @@ fun solidEnd
     : Int =
   if R.isTokenOf c then side (R.textRange c)
   else
-    match toward (kidsOf st c) with
+    match toward (V.filter (\k -> not (S.isEmpty (S.trim (R.text k)))) (kidsOf st c)) with
     | Just kid -> solidEnd st toward side kid
     | None -> side (R.textRange c)
 
