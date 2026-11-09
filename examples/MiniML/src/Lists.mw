@@ -950,3 +950,57 @@ format! {
       "mac {\n  head\n    xxxxxxxxxx\n    yyyyyyyyyy\n    zzzzzzzzzz\n    {\n      aaaaaaaaaa = b\n      cccccccccc = d\n    }\n  f = g\n}"
     ]
     "each thing a line a step in where they do not fit; a bracket last on the line before it where that has room"
+
+-- Items that run on, a `?name` one token however many it holds.
+format! {
+  FilledAs for Lists
+  indent 2
+  width 30
+    | List =
+        when
+          1
+          items("[" items "]")(when
+             7+
+             items("[" indent(cut items(tight "," fill 1 as Hole)) cut "]")("["
+                indent(cut items(tight "," line))
+                cut
+                "]"))
+    | VecBody = first filled 2 tail as Hole
+}
+
+-- Items that run on while each is three tokens at most, and no bracket.
+format! {
+  FilledThree for Lists
+  indent 2
+  width 30
+    | List =
+        when
+          1
+          items("[" items "]")(when
+             7+
+             items("[" indent(cut items(tight "," fill 3)) cut "]")("["
+                indent(cut items(tight "," line))
+                cut
+                "]"))
+}
+
+@test fun aNodeOfAKindSaidIsOneTokenAndABracketIsNoSmallItem () =
+  let src = "[aaaa, ?bbbb, cccc, dddd, eeee, ffff, gggg, hhhh]" in
+  let a =
+    assertEq
+      (V.map (\f -> f (fst (parseLists src))) [formatFilledAs, formatFilled])
+      [
+        "[\n  aaaa, ?bbbb, cccc, dddd,\n  eeee, ffff, gggg, hhhh\n]",
+        "[\n  aaaa,\n  ?bbbb,\n  cccc,\n  dddd,\n  eeee,\n  ffff,\n  gggg,\n  hhhh\n]"
+      ]
+      "`?bbbb` one token with `as Hole`, and two without"
+  in assertEq
+       (V.map (\x -> formatFilledThree (fst (parseLists x))) [
+          "[aaaa, bbbb, cccc, dddd, eeee, ffff, ?gg]",
+          "[aaaa, bbbb, cccc, dddd, eeee, ffff, (gg)]"
+        ])
+       [
+         "[\n  aaaa, bbbb, cccc, dddd,\n  eeee, ffff, ?gg\n]",
+         "[\n  aaaa,\n  bbbb,\n  cccc,\n  dddd,\n  eeee,\n  ffff,\n  (gg)\n]"
+       ]
+       "three tokens run on, and three with a bracket do not"

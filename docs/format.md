@@ -94,9 +94,9 @@ Its formatter rule names the same things in the same order:
 | `chained x` | child `x` is no group of its own: its rule breaks with this group |
 | `broken x`  | child `x`'s rule breaks, however short it is |
 | `wide x`    | child `x`'s `group N(…)`s are plain groups: on one line as far as the width |
-| `filled N xs` | where each node of `xs` is N tokens at most with no comment, a `line` in each node's own rule is a `fill` |
+| `filled N xs` | where each node of `xs` is N tokens at most with no comment and no bracket, a `line` in each node's own rule is a `fill`; `as K` counts a node of kind K one token |
 | `hug K…(xs)` | the last node of `xs`, where it is a `K`, may start on the line of what is before it and break inside itself before `xs` breaks |
-| `fill N`    | between a separated child's nodes: a space, or a break before a node that does not fit whole; only where each node is N tokens at most (0 for any) and there are no comments, and `line` otherwise |
+| `fill N`    | between a separated child's nodes: a space, or a break before a node that does not fit whole; only where each node is N tokens at most (0 for any), with no bracket, and there are no comments, and `line` otherwise; `as K` counts a node of kind K one token |
 | `kept`      | `line` where the text had blank space between the two things, `tight` where it had none |
 | `aswritten` | as the text had it: `newline` where it had a break (a blank line where it had one), a space where it had blank space on one line, nothing where the two touched |
 | (nothing)   | as the text had it: nothing where the two things touched, a space where they did not |
@@ -302,7 +302,8 @@ else zzzz
 ```
 
 **`fill N`** runs a separated child's nodes on, as many to a line as fit,
-where every node is N tokens at most and none has a comment:
+where every node is N tokens at most, none has a comment, and none holds a
+bracket (`(`, `[` or `{`):
 
 ```meadow
 | List = when 7+ items("[" indent(cut items(tight "," fill 1)) cut "]")("[" indent(cut items(tight "," line)) cut "]")
@@ -358,9 +359,14 @@ own rules, as `CommaItem = "," expr` has its comma:
 | VecItem = nogroup tight "," line expr
 ```
 
-Where every node of `tail` is N tokens at most and none has a comment, the
-`line` in each node's rule is a `fill`, so the nodes run on, as many to a line
-as fit. Otherwise the rules are as written.
+Where every node of `tail` is N tokens at most, none has a comment and none
+holds a bracket, the `line` in each node's rule is a `fill`, so the nodes run
+on, as many to a line as fit. Otherwise the rules are as written.
+
+**`as`** after either counts a node of the kinds it names as one token,
+however many it holds: `fill 3 as InterpE`, or `filled 4 items as (InterpE
+CharE)`. A string with holes is one token to a lexer that reads it whole, and
+many to one that splits it at its holes.
 
 **A parting before what a node lacks.** A parting with nothing after it in the
 node, where the rule names something after it that the node does not have,
