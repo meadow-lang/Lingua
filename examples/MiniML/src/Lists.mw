@@ -20,6 +20,9 @@ use Std.Test (assertEq)
   | @token("with") With
   | @token("if") If
   | @token("call") Call
+  | @token("mac") Mac
+  | @token("{") LBrace
+  | @token("}") RBrace
   | @token("<") Lt
   | @token(">") Gt
   | @token("\\") Lam
@@ -50,6 +53,9 @@ syntax! {
     "with" = With,
     "if" = If,
     "call" = Call,
+    "mac" = Mac,
+    "{" = LBrace,
+    "}" = RBrace,
     "<" = Lt,
     ">" = Gt,
     "\\" = Lam,
@@ -73,11 +79,15 @@ syntax! {
     File = items:Expr*
     Expr = first:Term rest:Tail*
     Tail = op:("+" | "*" | "==") operand:Term
-    Term = List | LetE | MatchE | IfE | Tagged | Call | LamE | Paren | Vec | Var
+    Term = List | LetE | MatchE | IfE | Tagged | Call | LamE | Paren | Vec | Mac | Var
     Vec = "<" body:VecBody? ">"
     VecBody = first:Expr tail:VecItem*
     VecItem = "," expr:Expr?
     Call = "call" head:Var args:Arg*
+    Mac = "mac" body:Brace
+    Brace = "{" trees:Tree* "}"
+    Tree = Brace | Leaf
+    Leaf = word:("name" | "|" | "->" | "," | "=" | "+")
     Arg = term:Term
     LamE = "\\" param:Var "->" body:Expr
     Paren = "(" elems:(Expr ("," Expr)*)? ")"
@@ -250,6 +260,17 @@ format! {
 }
 
 fun tiered (src : String) : String = formatTiered (fst (parseLists src))
+
+-- A macro's body an entry a line, its `|` entries under a heading a level in,
+-- each entry split at its operators -- an arm's body four in from its `|`.
+format! {
+  Macro for Lists
+  indent 2
+  width 40
+    | Brace = "{" entries own Mac 4("|"; "=" trailing; "->" trailing; "+")(tight trees tight) "}"
+}
+
+fun bodied (src : String) : String = formatMacro (fst (parseLists src))
 
 fun tieredAfter (src : String) : String = formatTieredAfter (fst (parseLists src))
 
@@ -687,3 +708,48 @@ format! {
   -- Unchecked: the check `format<Name>` makes would hide a comment lost.
   let laid = LinguaF.layoutUnchecked linguaTiered_style (fst (parseLists src)) in
   assertEq (squeezed laid) (squeezed src) "every token, the comment too, still there"
+
+@test fun aMacroBodyIsAnEntryALine () =
+  let a =
+    assertEq
+      (bodied "mac {\na = b\nc = d\n}")
+      "mac {\n  a = b\n  c = d\n}"
+      "each entry a line, two in"
+  in
+  let b =
+    assertEq
+      (bodied "mac {\na = b\n\n\nc = d\n}")
+      "mac {\n  a = b\n\n  c = d\n}"
+      "a blank line between two kept, one"
+  in assertEq
+       (bodied "mac {\na = b\n+ c\nd = e\n}")
+       "mac {\n  a = b + c\n  d = e\n}"
+       "and a line that starts with an operator goes on with the entry before, at its column too"
+
+@test fun aBarEntryUnderAHeadingIsALevelIn () =
+  let a =
+    assertEq
+      (bodied "mac {\nhead x\n| a -> b\n| c -> d\n}")
+      "mac {\n  head x\n    | a -> b\n    | c -> d\n}"
+      "after a heading"
+  in assertEq
+       (bodied "mac {\n| a -> b\n| c -> d\n}")
+       "mac {\n  | a -> b\n  | c -> d\n}"
+       "and at the body's level before one"
+
+@test fun anEntryTooLongBreaksAtItsOperators () =
+  let a =
+    assertEq
+      (bodied "mac {\naaaaaaaaaaaa = bbbbbbbbbbbb + cccccccccccc\ne = f\n}")
+      "mac {\n  aaaaaaaaaaaa =\n    bbbbbbbbbbbb + cccccccccccc\n  e = f\n}"
+      "at its loosest, a level in"
+  in assertEq
+       (bodied "mac {\n| aaaaaaaaaaaaaaaa -> bbbbbbbbbbbbbbbbbbbbbb\n| c -> d\n}")
+       "mac {\n  | aaaaaaaaaaaaaaaa ->\n      bbbbbbbbbbbbbbbbbbbbbb\n  | c -> d\n}"
+       "and an arm's body four in from its `|`"
+
+@test fun aBodyThatIsNoEntriesIsLaidOutAsItsBracketSays () =
+  assertEq
+    (bodied "mac {\nx {\na,\nb\n}\ny\n}")
+    "mac {\n  x {a, b}\n  y\n}"
+    "a bracket within, with commas and no `|`, is a list"
