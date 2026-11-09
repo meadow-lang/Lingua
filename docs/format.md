@@ -21,6 +21,7 @@ For a formatter `Style` of a grammar `Mini` this writes:
 | function                              | answers                                              |
 | ------------------------------------- | ---------------------------------------------------- |
 | `formatStyle : Green Mini -> String`  | the tree's text, set out                             |
+| `formatStyleWithin : Int -> Green Mini -> String` | the same, a width given: 0 only indents |
 | `indentStyle : Green Mini -> String`  | what the line after an unfinished entry opens with   |
 
 Both take the lossless tree `parseMini` makes, so both work on a program with
@@ -71,6 +72,8 @@ Its formatter rule names the same things in the same order:
 | `indent(…)` | what it encloses is one level in from where the node began                |
 | `indent 3(…)` | what it encloses is 3 columns in; `indent -1(…)` is one column out      |
 | `group(…)`  | what it encloses goes on one line if it fits, and breaks together if not  |
+| `group 60(…)` | the same, but on one line only while that line is 60 columns at most, however wide the width |
+| `align(…)`  | a line it breaks to is set in to the column it started at                 |
 | `line`      | a space, or a line break where its group breaks                           |
 | `cut`       | nothing, or a line break where its group breaks                           |
 | `newline`   | a line break, always; its group and every group around it break           |
@@ -87,9 +90,28 @@ an `indent(…)` at the start or end of a rule: it stays inside, at that
 indentation, but a separator beside it adds only what it asks for beyond
 that. A line break there and a line break beside it make one line break.
 
-`indent` and `group` are layout only when followed by parentheses, or by a
-number and parentheses. Anywhere else they are a child's name, so a grammar
-may label a child `group`.
+`indent`, `group` and `align` are layout only when followed by parentheses,
+or (`indent` and `group`) by a number and parentheses. Anywhere else they are
+a child's name, so a grammar may label a child `group`.
+
+**`group 60(…)`** is for what reads as one line only while it is short, such
+as a `match` with its arms or a `let` with its body. It measures itself: what
+it encloses, flat, from where it starts. So a rule that is short as a whole
+writes its body as `group 60(…)`.
+
+**`align(…)`** sets what it encloses in from the column it starts at, not
+from where the node began: an `if` whose branches go under its condition
+wherever the `if` is.
+
+```meadow
+| If = "if" align(cond line "then" yes line "else" no)
+```
+
+```text
+fun z -> if x < 3
+            then (x)
+            else y
+```
 
 **`nogroup`.** A rule that begins with `nogroup` is not a group of its own.
 Its separators break when the enclosing group breaks. That is what a
@@ -243,8 +265,8 @@ else fun y ->             else fun y ->
 y                           y
 ```
 
-In this mode `line`, `cut`, `newline` and `tight` say nothing, and a `group` is
-just what it encloses. Only `indent(…)` matters, and `indent 3(…)`, which sets
+In this mode `line`, `cut`, `newline` and `tight` say nothing, and a `group`,
+a `group 60(…)` and an `align(…)` are just what they enclose. Only `indent(…)` matters, and `indent 3(…)`, which sets
 a line in by those columns rather than by a level.
 
 **A level is per line, not per node.** A line is set in by one level for each
@@ -367,9 +389,11 @@ one-line functions over it. The same module can be used by hand:
 | function                 | what it does                                   |
 | ------------------------ | ---------------------------------------------- |
 | `style unit width name trivia rules` | a formatter; `width` 0 for indent only |
-| `tok`, `child`, `indented`, `indentedBy n`, `grouped` | the pieces of a rule |
+| `tok`, `child`, `indented`, `indentedBy n`, `grouped`, `groupedWithin n`, `aligned` | the pieces of a rule |
 | `nogroup`                | a rule's first element, for one that is no group |
 | `line`, `cut`, `newline`, `tight`     | the separators                  |
 | `layout st g`            | what `format<Name>` calls when there is a width |
 | `reindent st g`          | what it calls when there is none               |
 | `continuation st g`      | what `indent<Name>` calls                      |
+| `within st width`        | the formatter at another width                 |
+| `formatWithin st width g` | what `format<Name>Within` calls               |
