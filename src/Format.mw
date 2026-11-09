@@ -1195,6 +1195,17 @@ fun hugged (st : Style k) (items : [Item]) (normal : Doc ()) : Doc () =
                  | Err _ -> normal)
           | Err _ -> normal)
 
+-- A node as its rule lays it out without the partings its rule begins and
+-- ends with: those part it from what is around it, and a node read from a
+-- piece of text by itself -- a macro's entry -- has nothing around it.
+fun bareDoc (st : Style k) (s : Syntax k) : Doc () =
+  match ruleOf st s with
+  | Just elems ->
+      (match ruledParts st s elems with
+       | (_, Just (d, _, _), _) -> d
+       | _ -> PP.nil)
+  | None -> docOf st s
+
 -- A chain of operators as `tiers` lays it out: its head, child `head`, and
 -- each of `tails` an operator and what it applies to. An operator that
 -- touches what is beside it is part of what it is beside; the rest are split
@@ -1464,7 +1475,7 @@ fun entryDoc
           | (g, errs) -> if V.isEmpty errs and G.text g == text then Just g else None)
      | None -> None)
   in match tree with
-     | Just g -> docOf (reading st text) (R.root g)
+     | Just g -> bareDoc (reading st text) (R.root g)
      | None ->
          if commented then PP.text text
          else
