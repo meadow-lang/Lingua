@@ -936,3 +936,17 @@ format! {
       "[\n  aaaaaaaaaa,\n  bbbbbbbbbb, -- c\n  cccccccccc,\n  dddddddddd\n]"
     ]
     "the comma on its item's line, before a comment on a line of its own, or one that ends the line"
+
+@test fun anEntryOfThingsSideBySideIsAnApplication () =
+  assertEq
+    (V.map bodied [
+       "mac {\naaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd\nf = g\n}",
+       "mac {\nhead x {aaaaaaaaaa = b\ncccccccccc = d}\nf = g\n}",
+       "mac {\nhead xxxxxxxxxx yyyyyyyyyy zzzzzzzzzz {aaaaaaaaaa = b\ncccccccccc = d}\nf = g\n}"
+     ])
+    [
+      "mac {\n  aaaaaaaaaa\n    bbbbbbbbbb\n    cccccccccc\n    dddddddddd\n  f = g\n}",
+      "mac {\n  head x {\n    aaaaaaaaaa = b\n    cccccccccc = d\n  }\n  f = g\n}",
+      "mac {\n  head\n    xxxxxxxxxx\n    yyyyyyyyyy\n    zzzzzzzzzz\n    {\n      aaaaaaaaaa = b\n      cccccccccc = d\n    }\n  f = g\n}"
+    ]
+    "each thing a line a step in where they do not fit; a bracket last on the line before it where that has room"

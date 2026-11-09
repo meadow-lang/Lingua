@@ -1438,7 +1438,7 @@ fun tieredDoc
                                     | None -> Just (PP.append lead glued, parts))))
          in match V.foldl step (Just (docOf st h, [])) tails with
             | None -> None
-            | Just (lead, parts) -> Just (tiersBuilt tiers indent lead parts)
+            | Just (lead, parts) -> Just (tiersBuilt tiers indent 0 lead parts)
 
 -- `lead` and `parts` split at the loosest tier among them, each part split in
 -- turn, each a group.
@@ -1715,35 +1715,83 @@ fun entryDoc
                         and (styleOf (firstTokenText st c) == 2 or spaced j and spaced (j + 1))
                   | None -> False)
            in
+           -- Two things side by side are an application: on one line if it
+           -- fits, and each thing applied a line of its own, a step in, if
+           -- not -- but a bracket it ends with on the line of what it is
+           -- applied to, broken within, as `link "…" {` and its fields.
+           let applied = \d -> PP.group (PP.nest (unitOf st) d) in
+           let bracket =
+             \j ->
+               (match V.get kids j with
+                | Just c -> not (R.isTokenOf c) and V.elem (firstTokenText st c) ["(", "[", "{"]
+                | None -> False)
+           in
+           -- One more thing in a run of them: `d` so far, and whether it is
+           -- an application already made, with what it ends with hugged.
+           let onto =
+             \run j ->
+               (match run with
+                | (d, made, lined) ->
+                    -- What is on the line the run begins -- what is applied,
+                    -- and what touches it -- is set in from that line as
+                    -- anything on it is, not a step in.
+                    let back = PP.nest (0 - unitOf st) (docAt j) in
+                    if j == from or isOp (j - 1) then (PP.append d back, made, False)
+                    else if not (spaced j) then
+                      (PP.append d (if lined then docAt j else back), made, lined)
+                    else if (j == b or isOp (j + 1)) and bracket j then
+                      -- Hugged where what comes before it is one line that
+                      -- has room for the bracket's opening; and if not, a
+                      -- line of its own like each thing before it.
+                      (let flat = flattened d in
+                       let wide =
+                         (match PP.render 1000000 flat with
+                          | Ok s -> V.len (S.chars s)
+                          | Err _ -> 1000000)
+                       in (
+                            PP.column (\c ->
+                              if c + wide + 2 <= widthOf st then PP.concat [flat, PP.space, docAt j]
+                              else applied (PP.append d (PP.append PP.line (docAt j)))),
+                            True,
+                            True
+                          ))
+                    else (PP.append d (PP.append PP.line (docAt j)), made, True))
+           in
+           let finished =
+             \run ->
+               (match run with
+                | (d, made, _) -> if made then d else applied d)
+           in
            -- The lead, and each operator and what follows it up to the next.
            let built =
              V.foldl
                (\acc j ->
                  match acc with
                  | (lead, parts) ->
-                     if isOp j then (lead, V.pushBack parts (opAt j, tierOf (opAt j), PP.nil))
+                     if isOp j then
+                       (lead, V.pushBack parts (opAt j, tierOf (opAt j), (PP.nil, False, False)))
                      else
-                       let sep =
-                         if j == from or isOp (j - 1) then PP.nil
-                         else if spaced j then PP.space
-                         else PP.nil
-                       in (match V.last parts with
-                           | Just (op, tier, d) ->
-                               (
-                                 lead,
-                                 V.pushBack (V.take parts (V.len parts - 1)) (
-                                   op,
-                                   tier,
-                                   PP.append d (PP.append sep (docAt j))
-                                 )
-                               )
-                           | None -> (PP.append lead (PP.append sep (docAt j)), parts)))
-               (PP.nil, [])
+                       (match V.last parts with
+                        | Just (op, tier, run) ->
+                            (
+                              lead,
+                              V.pushBack (V.take parts (V.len parts - 1)) (op, tier, onto run j)
+                            )
+                        | None -> (onto lead j, parts)))
+               ((PP.nil, False, False), [])
                (V.range from (b + 1))
            in
            let chain =
              (match built with
-              | (lead, parts) -> tiersBuilt tiers (if bar then arm else unitOf st) lead parts)
+              | (lead, parts) ->
+                  tiersBuilt
+                    tiers
+                    (if bar then arm else unitOf st)
+                    (if bar then arm else 0)
+                    (finished lead)
+                    (V.map
+                       (\p -> match p with | (op, tier, run) -> (op, tier, finished run))
+                       parts))
            in if bar then
                 PP.concat [
                   PP.text "|",
@@ -1755,6 +1803,7 @@ fun entryDoc
 fun tiersBuilt
     (tiers : [([String], Int)])
     (indent : Int)
+    (afterSep : Int)
     (lead : Doc ())
     (parts : [(String, Int, Doc ())])
     : Doc () =
@@ -1774,7 +1823,8 @@ fun tiersBuilt
       let runOf = \from to -> V.drop (V.take parts to) from in
       let firstEnd = V.getOr (V.len parts) cuts 0 in
       -- How the tier breaks: before its operators; after them; or, a
-      -- separator's, after it, what follows no further in than what is before.
+      -- separator's, after it, what follows `afterSep` further in than what
+      -- is before -- no further, but in an arm, where it is the arm's body.
       let style =
         (match V.get tiers loosest with
          | Just (_, s) -> s
@@ -1787,7 +1837,7 @@ fun tiersBuilt
             let next = V.getOr (V.len parts) cuts (k + 1) in
             match V.get parts i with
             | Just (op, _, d) ->
-                let rest = tiersBuilt tiers indent d (runOf (i + 1) next) in
+                let rest = tiersBuilt tiers indent afterSep d (runOf (i + 1) next) in
                 if style == 2 then PP.concat [PP.text op, PP.line, rest]
                 else if style == 1 then PP.concat [PP.space, PP.text op, PP.line, rest]
                 else PP.concat [PP.line, PP.text op, PP.space, rest]
@@ -1795,8 +1845,8 @@ fun tiersBuilt
           (V.range 0 (V.len cuts))
       in PP.group
            (PP.append
-              (tiersBuilt tiers indent lead (runOf 0 firstEnd))
-              (PP.nest (if style == 2 then 0 else indent) (PP.concat pieces)))
+              (tiersBuilt tiers indent afterSep lead (runOf 0 firstEnd))
+              (PP.nest (if style == 2 then afterSep else indent) (PP.concat pieces)))
 
 -- `d` on one line: each place it may break as it is where it does not, and
 -- each group in it so too. A break it must have -- a comment's -- it keeps.
