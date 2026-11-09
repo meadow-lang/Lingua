@@ -24,6 +24,7 @@
 --   group 60(…) the same, on one line only while that line is 60 columns
 --               at most, however wide the width
 --   align(…)    a line it breaks to is set in to the column it starts at
+--   flat(…)     on one line whatever the width, every group in it too
 --   line        a space -- or a line's end, where its group breaks
 --   cut         nothing -- or a line's end, where its group breaks
 --   newline     a line's end, always: its group, and every one around it,
@@ -59,7 +60,8 @@
 --               the group this is in breaks once `arms` is 3 or more -- or,
 --               of one child of the rule's own kind, a chain 3 long
 --
--- Two things with none of these between them are a space apart. A rule or a
+-- Two things with none of these between them are as the text had them:
+-- touching where they touched, and a space apart where not. A rule or a
 -- child the grammar does not have is an error where it was named. A rule that
 -- begins `nogroup` is not a group of its own: its partings break with the
 -- group around it -- so a chain of nodes, each holding the next, breaks as
@@ -155,6 +157,7 @@ use Pretty (Doc)
   | Wide Elem
   | Fill Int
   | Hug [(String, Int, String)] Elem
+  | Flat [Elem]
   | NoGroup
 
 use Elem.*
@@ -266,6 +269,10 @@ def blanking : Int = 6
 -- Only where every node is `n` tokens at most and there is no comment among
 -- them -- 0 for any -- and otherwise a `line`.
 @pub fun fillUpTo (n : Int) : Elem = Fill n
+
+-- What is laid out on one line whatever the width, every group in it too:
+-- what is inside a string, its interpolations' holes.
+@pub fun flatly (es : [Elem]) : Elem = Flat es
 
 -- A child that is many whose last node may hug what is before it: start on
 -- that line, everything before it on one line, and break inside itself
@@ -409,6 +416,7 @@ fun leaves (es : [Elem]) : [Elem] =
       | IfBroke _ _ -> []
       | When _ yes no -> eitherLeaves (leaves yes) (leaves no)
       | Fill _ -> []
+      | Flat inner -> leaves inner
       | NoGroup -> []
       | other -> [other])
     es
@@ -537,6 +545,7 @@ fun indentSpans (unit : Int) (es : [Elem]) (from : Int) : [(Int, Int, Int)] =
                  | IfBroke _ _ -> (out, at)
                  | When _ _ no -> through out at no
                  | Fill _ -> (out, at)
+                 | Flat inner -> through out at inner
                  | NoGroup -> (out, at)
                  | _ -> (out, at + 1)))
           ([], from)
@@ -765,6 +774,7 @@ data Item
   | Written Int (Doc ()) Int Int
   | Trailer (Doc ())
   | HugMark Int
+  | Pos Int Int
 
 use Item.*
 
@@ -1051,6 +1061,20 @@ fun hugged (st : Style k) (items : [Item]) (normal : Doc ()) : Doc () =
                    else normal
                | Err _ -> normal)
         | Err _ -> normal)
+
+-- `d` on one line: each place it may break as it is where it does not, and
+-- each group in it so too. A break it must have -- a comment's -- it keeps.
+fun flattened (d : Doc ()) : Doc () =
+  match d with
+  | Doc.FlatAlt _ flat -> flattened flat
+  | Doc.Group inner -> flattened inner
+  | Doc.Append a b -> PP.append (flattened a) (flattened b)
+  | Doc.Nest n inner -> PP.nest n (flattened inner)
+  | Doc.Annotated a inner -> PP.annotate a (flattened inner)
+  | Doc.Union l _ -> flattened l
+  | Doc.Column f -> PP.column (\c -> flattened (f c))
+  | Doc.Nesting f -> PP.nesting (\n -> flattened (f n))
+  | other -> other
 
 -- What a group that must break holds: nothing, broken, and on one line, a
 -- failure -- so neither it nor any group around it goes on one line.
@@ -1350,6 +1374,7 @@ fun itemsOf
                (
                  V.concat [
                    out,
+                   posOf body,
                    [Written
                       level
                       (hugged st body (wrap (assemble st body)))
@@ -1465,6 +1490,7 @@ fun itemsOf
               | GroupWithin n inner ->
                   breakable out at done inner (if wide then PP.group else groupWithin n)
               | Align inner -> wrapped out at done inner PP.align
+              | Flat inner -> wrapped out at done inner flattened
               | _ ->
                   let r = V.getOr absent found at in
                   if not (present r) then (out, at + 1, done)
@@ -1738,21 +1764,25 @@ fun blankBefore (all : [Syntax k]) (places : [Int]) (j : Int) : Bool =
   in V.any (\i -> S.isEmpty (S.trim (V.getOr "x" pieces i))) (V.range 1 upTo)
 
 -- The parting items begin with, of their own -- or -1.
-fun openingOf (items : [Item]) : Int =
+fun openingOf (all : [Item]) : Int =
+  let items = V.filter (\i -> match i with | Pos _ _ -> False | _ -> True) all in
   match V.get items 0 with
   | Just (Parting n _) -> n
   | Just (Written _ _ o _) -> o
   | Just (Trailer _) -> 0 - 1
   | Just (HugMark _) -> 0 - 1
+  | Just (Pos _ _) -> 0 - 1
   | None -> 0 - 1
 
 -- The parting items end with, of their own -- or -1.
-fun closingOf (items : [Item]) : Int =
+fun closingOf (all : [Item]) : Int =
+  let items = V.filter (\i -> match i with | Pos _ _ -> False | _ -> True) all in
   match V.last items with
   | Just (Parting n _) -> n
   | Just (Written _ _ _ c) -> c
   | Just (Trailer _) -> breaking
   | Just (HugMark _) -> 0 - 1
+  | Just (Pos _ _) -> 0 - 1
   | None -> 0 - 1
 
 -- Child `j`, with the comments written before it, each on a line of its own:
@@ -1864,7 +1894,15 @@ fun kidItem
                        | None -> onlyComments),
                       (if trail >= 0 then [Parting trail level] else [])
                     ]))
-  in V.append atEnd own
+  in
+  -- Where it was, for what is written beside it: where it has text.
+  let placed =
+    (match V.get kids j with
+     | Just c ->
+         let r = R.textRange c in
+         if snd r > fst r then [Pos (fst r) (snd r)] else []
+     | None -> [])
+  in V.concat [atEnd, placed, own]
 
 -- The trivia from child `from` up to `to` that is not blank: comments.
 fun commentsIn (all : [Syntax k]) (from : Int) (to : Int) : [String] =
@@ -1892,30 +1930,59 @@ fun assemble (st : Style k) (items : [Item]) : Doc () =
   match V.foldl
     (\acc item ->
       match acc with
-      | (doc, pending, level, closed) ->
+      | (doc, pending, level, closed, last, next) ->
           (match item with
-           | Parting strength at -> (doc, max pending strength, at, closed)
+           | Parting strength at -> (doc, max pending strength, at, closed, last, next)
            | Trailer d ->
-               (PP.append doc (PP.append PP.space d), max pending breaking, level, tightly)
+               (
+                 PP.append doc (PP.append PP.space d),
+                 max pending breaking,
+                 level,
+                 tightly,
+                 (0 - 1, 0 - 1),
+                 next
+               )
            | HugMark _ -> acc
+           -- Where the next thing written was in the text.
+           | Pos from to -> (doc, pending, level, closed, last, (from, to))
            | Written at d opens closes ->
                -- What ended the last written thing is there only if it is a
                -- break: a softer parting at the end of a group writes nothing.
                let beside = max opens (if closed >= breaking then closed else 0 - 1) in
+               -- Where nothing parts two things, they are parted as the text
+               -- had them: touching where they touched, which in a language
+               -- where that means something -- `0XFF`, `x'` -- is what it
+               -- meant; and a space where they did not.
+               let touched = snd last >= 0 and fst next >= 0 and snd last == fst next in
                -- A break is set in as what follows it is, so the two
                -- are nested together.
                let sep =
                  (if pending >= 0 then besides pending beside
-                  else if closed >= 0 or opens >= 0 then PP.nil
+                  else if closed >= 0 or opens >= 0 or touched then PP.nil
                   else PP.space)
-               in (PP.append doc (PP.nest at (PP.append sep d)), 0 - 1, 0, closes)))
-    (PP.nil, 0 - 1, 0, tightly)
+               in (
+                    PP.append doc (PP.nest at (PP.append sep d)),
+                    0 - 1,
+                    0,
+                    closes,
+                    next,
+                    (0 - 1, 0 - 1)
+                  )))
+    (PP.nil, 0 - 1, 0, tightly, (0 - 1, 0 - 1), (0 - 1, 0 - 1))
     items with
   -- A parting with nothing after it parts nothing -- unless it is a
   -- break that was asked for.
-  | (doc, pending, level, closed) ->
+  | (doc, pending, level, closed, _, _) ->
       if pending >= breaking and closed < breaking then PP.append doc (PP.nest level PP.hardline)
       else doc
+
+-- Where in the text `items` were: from the first place one of them was to the
+-- last, or nothing.
+fun posOf (items : [Item]) : [Item] =
+  let places = V.concatMap (\i -> match i with | Pos a b -> [(a, b)] | _ -> []) items in
+  match (V.get places 0, V.last places) with
+  | (Just (a, _), Just (_, b)) -> [Pos a b]
+  | _ -> []
 
 -- A parting, where what is beside it begins or ends with one of its own,
 -- `beside`: only what the parting asks for that that does not.
@@ -1966,6 +2033,7 @@ data Written
   | WGroup [Written]
   | WGroupWithin Int [Written]
   | WAlign [Written]
+  | WFlat [Written]
   | WIfBroke String String Loc
   | WWhen [(String, Loc)] [Written] [Written] Loc
   | WWhenCount Int Bool String Loc [Written] [Written]
@@ -2011,6 +2079,8 @@ fun writing (ts : [TokenTree]) (i : Int) (out : [Written]) : [Written] =
        | Just (Group Paren inner _) ->
            writing ts (i + 3) (V.pushBack out (WGroupWithin n (writtenOf inner)))
        | _ -> writing ts (i + 1) (V.pushBack out (WName "group" at)))
+  | (Just (Word "flat" _), Just (Group Paren inner _)) ->
+      writing ts (i + 2) (V.pushBack out (WFlat (writtenOf inner)))
   | (Just (Word "align" _), Just (Group Paren inner _)) ->
       writing ts (i + 2) (V.pushBack out (WAlign (writtenOf inner)))
   | (Just (Word "ifbroke" at), Just (Group Paren inner _)) ->
@@ -2214,6 +2284,7 @@ fun leafNames (ws : [Written]) : [String] =
       | WGroup inner -> leafNames inner
       | WGroupWithin _ inner -> leafNames inner
       | WAlign inner -> leafNames inner
+      | WFlat inner -> leafNames inner
       | WWhen _ yes _ _ -> leafNames yes
       | WWhenCount _ _ _ _ yes _ -> leafNames yes
       | WChained n _ -> [n]
@@ -2243,6 +2314,7 @@ fun elemCode sorts tokenFields rule fs (names : [String]) (w : Written)
      | WGroup inner -> inside inner (\code -> "LinguaF.grouped ${code}")
      | WGroupWithin n inner -> inside inner (\code -> "LinguaF.groupedWithin ${show n} ${code}")
      | WAlign inner -> inside inner (\code -> "LinguaF.aligned ${code}")
+     | WFlat inner -> inside inner (\code -> "LinguaF.flatly ${code}")
      | WIfBroke broken flat at ->
          (match V.find (\w -> not (V.elem w ["tight", "cut", "space", "line", "newline"])) [
             broken,
