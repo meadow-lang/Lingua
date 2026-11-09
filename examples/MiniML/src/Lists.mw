@@ -19,6 +19,8 @@ use Std.Test (assertEq)
   | @token("match") Match
   | @token("with") With
   | @token("if") If
+  | @token("call") Call
+  | @token("\\") Lam
   | @token("then") Then
   | @token("else") Else
   | @token("|") Bar
@@ -43,6 +45,8 @@ syntax! {
     "match" = Match,
     "with" = With,
     "if" = If,
+    "call" = Call,
+    "\\" = Lam,
     "then" = Then,
     "else" = Else,
     "|" = Bar,
@@ -61,7 +65,11 @@ syntax! {
     File = items:Expr*
     Expr = first:Term rest:Tail*
     Tail = op:"+" operand:Term
-    Term = List | LetE | MatchE | IfE | Tagged | Var
+    Term = List | LetE | MatchE | IfE | Tagged | Call | LamE | Paren | Var
+    Call = "call" head:Var args:Arg*
+    Arg = term:Term
+    LamE = "\\" param:Var "->" body:Expr
+    Paren = "(" elems:(Expr ("," Expr)*)? ")"
     IfE = "if" cond:Expr "then" yes:Expr "else" no:Expr
     Tagged = attr:Attr expr:Expr
     Attr = "@" name:Var "(" arg:Var ")"
@@ -144,6 +152,21 @@ format! {
 }
 
 fun filled (src : String) : String = formatFilled (fst (parseLists src))
+
+-- A call whose last argument hugs it, where that is a lambda, a list, a
+-- tuple, or parentheses around a lambda: it starts on the call's line and
+-- breaks inside itself before the arguments break, an argument a line.
+format! {
+  Hugged for Lists
+  indent 2
+  width 30
+    | Call = "call" head indent(line hug LamE List Paren.LamE Paren+(args(line)))
+    | LamE = "\\" tight param "->" indent(line body)
+    | List = "[" indent(cut items(tight "," line)) cut "]"
+    | Paren = when 1 elems("(" tight elems tight ")")("(" indent(cut elems(tight "," line)) cut ")")
+}
+
+fun hugged (src : String) : String = formatHugged (fst (parseLists src))
 
 format! {
   Plain for Lists
@@ -395,3 +418,32 @@ format! {
        (filled "[aaaa, bbbb, cccc, dddd, eeee, ffff, let a = x in a]")
        "[\n  aaaa,\n  bbbb,\n  cccc,\n  dddd,\n  eeee,\n  ffff,\n  let a = x in a\n]"
        "but an item a line where one is more than a token"
+
+@test fun aLastArgumentHugsTheCall () =
+  let a = assertEq (hugged "call f a b") "call f a b" "what fits, on one line" in
+  let b =
+    assertEq
+      (hugged "call f aaaa (\\x -> bbbbbbbbbbbbbbbbbbbb)")
+      "call f aaaa (\\x ->\n  bbbbbbbbbbbbbbbbbbbb)"
+      "a lambda in parentheses, broken inside, set in from the call's line"
+  in
+  let c =
+    assertEq
+      (hugged "call f a [bbbbbbbbbb, cccccccccc, dddddddddd]")
+      "call f a [\n  bbbbbbbbbb,\n  cccccccccc,\n  dddddddddd\n]"
+      "a list"
+  in assertEq
+       (hugged "call f a (bbbbbbbbbbbb, cccccccccccc, dddd)")
+       "call f a (\n  bbbbbbbbbbbb,\n  cccccccccccc,\n  dddd\n)"
+       "and a tuple"
+
+@test fun whatMayNotHugBreaksTheArgumentsALine () =
+  let a =
+    assertEq
+      (hugged "call f aaaaaaaaaa bbbbbbbbbb cccccccccc")
+      "call f\n  aaaaaaaaaa\n  bbbbbbbbbb\n  cccccccccc"
+      "a name"
+  in assertEq
+       (hugged "call f aaaaaaaa ([bbbbbbbbbb, cccccccccc])")
+       "call f\n  aaaaaaaa\n  ([bbbbbbbbbb, cccccccccc])"
+       "and parentheses around what is not a lambda, though it could break inside"
