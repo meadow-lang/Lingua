@@ -1004,3 +1004,14 @@ format! {
          "[\n  aaaa,\n  bbbb,\n  cccc,\n  dddd,\n  eeee,\n  ffff,\n  (gg)\n]"
        ]
        "three tokens run on, and three with a bracket do not"
+
+@test fun aCommentGoesNoFurtherOnThanTheCodeBeforeIt () =
+  let g = fst (parseSkips "x -- c\ny\n") in
+  assertEq
+    (V.map (LinguaF.keptApart linguaSkipsPlain_style g) [
+       "x -- c\ny\n",
+       "x\ny -- c\n",
+       "-- c\nx\ny\n"
+     ])
+    [True, True, False]
+    "as it was; what was after it before it, as a separator may be; but not what was before it after it"

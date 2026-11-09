@@ -900,7 +900,7 @@ use Item.*
 -- `->--`. A bracket or a comma touches anything. A comment may be written
 -- on the other side of a separator than it was. A line's end, which laying
 -- out trims, is no part of a token here.
-fun keptApart (style : Style k) (g : Green k) (laid : String) : Bool =
+@pub fun keptApart (style : Style k) (g : Green k) (laid : String) : Bool =
   let t = G.text g in
   -- Each line of each token, without the blank space around it, where it
   -- begins, and whether it is trivia: a run a lexer skipped -- comments and
@@ -929,7 +929,7 @@ fun keptApart (style : Style k) (g : Green k) (laid : String) : Bool =
       (V.range 0 (G.slots g))
   in
   let code = V.concatMap (\p -> match p with | (a, x, False) -> [(a, x)] | _ -> []) pieces in
-  let notes = V.concatMap (\p -> match p with | (_, x, True) -> [x] | _ -> []) pieces in
+  let notes = V.concatMap (\p -> match p with | (a, x, True) -> [(a, x)] | _ -> []) pieces in
   let n = stringByteLength laid in
   let blankAt = \at -> V.elem (toInt (stringByteAt laid at)) [32, 9, 10, 13] in
   let rec past (at : Int) : Int = if at < n and blankAt at then past (at + 1) else at in
@@ -952,8 +952,14 @@ fun keptApart (style : Style k) (g : Green k) (laid : String) : Bool =
     if from >= n then ci >= V.len code and ni >= V.len notes
     else
       match V.get notes ni with
-      | Just x if here from x ->
-          if runs at from x then False else go (from + stringByteLength x) ci (ni + 1) (0 - 1)
+      -- A comment goes no further on than it was: none of the code before
+      -- it is after it. A separator may come before it.
+      | Just (na, x) if here from x ->
+          if runs at from x then False
+          else if (match V.get code ci with
+           | Just (ca, _) -> ca < na
+           | None -> False) then False
+          else go (from + stringByteLength x) ci (ni + 1) (0 - 1)
       | _ ->
           match V.get code ci with
           | Just (a, x) if here from x ->
