@@ -25,6 +25,8 @@
 --               at most, however wide the width
 --   align(…)    a line it breaks to is set in to the column it starts at
 --   flat(…)     on one line whatever the width, every group in it too
+--   tiers("=="; "+"; "*")(first rest)
+--               a chain of operators broken at its loosest first
 --   line        a space -- or a line's end, where its group breaks
 --   cut         nothing -- or a line's end, where its group breaks
 --   newline     a line's end, always: its group, and every one around it,
@@ -161,6 +163,7 @@ use Pretty (Doc)
   | Fill Int
   | Hug [(String, Int, String)] Elem
   | Flat [Elem]
+  | Tiers [([String], Bool)] Int Int [Elem]
   | NoGroup
 
 use Elem.*
@@ -285,6 +288,16 @@ def blanking : Int = 7
 -- What is laid out on one line whatever the width, every group in it too:
 -- what is inside a string, its interpolations' holes.
 @pub fun flatly (es : [Elem]) : Elem = Flat es
+
+-- A chain of operators, its head and its tail (`es`, two children, the
+-- second many, each node of it an operator and what it applies to), broken at
+-- its loosest operators first: `tiers`, loosest first, each the operators in
+-- it and whether a break goes after them rather than before; `other`, the
+-- tier of an operator none names; `indent`, how far in what breaks goes -- or
+-- -1, a level. Only an operator with blank space on both sides is one of the
+-- chain; one that touches what is beside it is part of what it is beside.
+@pub fun tiered (tiers : [([String], Bool)]) (other : Int) (indent : Int) (es : [Elem]) : Elem =
+  Tiers tiers other indent es
 
 -- A child that is many whose last node may hug what is before it: start on
 -- that line, everything before it on one line, and break inside itself
@@ -436,6 +449,7 @@ fun leaves (es : [Elem]) : [Elem] =
       | When _ yes no -> eitherLeaves (leaves yes) (leaves no)
       | Fill _ -> []
       | Flat inner -> leaves inner
+      | Tiers _ _ _ inner -> leaves inner
       | NoGroup -> []
       | other -> [other])
     es
@@ -566,6 +580,7 @@ fun indentSpans (unit : Int) (es : [Elem]) (from : Int) : [(Int, Int, Int)] =
                  | When _ _ no -> through out at no
                  | Fill _ -> (out, at)
                  | Flat inner -> through out at inner
+                 | Tiers _ _ _ inner -> through out at inner
                  | NoGroup -> (out, at)
                  | _ -> (out, at + 1)))
           ([], from)
@@ -1123,6 +1138,124 @@ fun hugged (st : Style k) (items : [Item]) (normal : Doc ()) : Doc () =
                | Err _ -> normal)
         | Err _ -> normal)
 
+-- A chain of operators as `tiers` lays it out: its head, child `head`, and
+-- each of `tails` an operator and what it applies to. An operator that
+-- touches what is beside it is part of what it is beside; the rest are split
+-- at the loosest tier there is, each part split in turn at the next, each a
+-- group: `head`, and a level in, the operators and the parts after them --
+-- the break before an operator, or after one whose tier says so. Nothing,
+-- where a tail is not what it should be.
+fun tieredDoc
+    (st : Style k)
+    (kids : [Syntax k])
+    (head : Int)
+    (tails : [Int])
+    (tiers : [([String], Bool)])
+    (other : Int)
+    (indent : Int)
+    : Maybe (Doc ()) =
+  let t = sourceOf st in
+  let blankAt =
+    \i ->
+      i >= 0 and i < stringByteLength t and V.elem (stringSlice t i (i + 1)) [" ", "\n", "\t", "\r"]
+  in
+  let tierOf =
+    \op ->
+      M.unwrapOr
+        other
+        (V.find (\i -> V.elem op (fst (V.getOr ([], False) tiers i))) (V.range 0 (V.len tiers)))
+  in match V.get kids head with
+     | None -> None
+     | Just h ->
+         -- Each tail: its operator, the tier of it, and what it applies to -- or,
+         -- where the operator touches what is beside it, what it and that are,
+         -- as the text had them, to go with what is before it.
+         let step =
+           \acc j ->
+             match acc with
+             | None -> None
+             | Just (lead, parts) ->
+                 (match V.get kids j with
+                  | None -> None
+                  | Just tail ->
+                      let held = kidsOf st tail in
+                      (match V.get held 0 with
+                       | None -> None
+                       | Just opKid ->
+                           let op = S.trim (R.text opKid) in
+                           let r = R.textRange opKid in
+                           let operand =
+                             PP.intersperse (V.map (\c -> docOf st c) (V.drop held 1)) PP.space
+                           in if blankAt (fst r - 1) and blankAt (snd r) then
+                                Just (lead, V.pushBack parts (op, tierOf op, operand))
+                              else
+                                let glued =
+                                  PP.concat [
+                                    (if blankAt (fst r - 1) then PP.space else PP.nil),
+                                    PP.text op,
+                                    (if blankAt (snd r) then PP.space else PP.nil),
+                                    operand
+                                  ]
+                                in (match V.last parts with
+                                    | Just (o, tier, d) ->
+                                        Just (
+                                          lead,
+                                          V.pushBack (V.take parts (V.len parts - 1)) (
+                                            o,
+                                            tier,
+                                            PP.append d glued
+                                          )
+                                        )
+                                    | None -> Just (PP.append lead glued, parts))))
+         in match V.foldl step (Just (docOf st h, [])) tails with
+            | None -> None
+            | Just (lead, parts) -> Just (tiersBuilt tiers indent lead parts)
+
+-- `lead` and `parts` split at the loosest tier among them, each part split in
+-- turn, each a group.
+fun tiersBuilt
+    (tiers : [([String], Bool)])
+    (indent : Int)
+    (lead : Doc ())
+    (parts : [(String, Int, Doc ())])
+    : Doc () =
+  match V.get parts 0 with
+  | None -> lead
+  | Just _ ->
+      let loosest = V.foldl (\m p -> match p with | (_, tier, _) -> min m tier) 1000000 parts in
+      -- Where each run of parts between two of the loosest begins.
+      let cuts =
+        V.filter
+          (\i ->
+            match V.get parts i with
+            | Just (_, tier, _) -> tier == loosest
+            | None -> False)
+          (V.range 0 (V.len parts))
+      in
+      let runOf = \from to -> V.drop (V.take parts to) from in
+      let firstEnd = V.getOr (V.len parts) cuts 0 in
+      let trailing =
+        (match V.get tiers loosest with
+         | Just (_, after) -> after
+         | None -> False)
+      in
+      let pieces =
+        V.map
+          (\k ->
+            let i = V.getOr 0 cuts k in
+            let next = V.getOr (V.len parts) cuts (k + 1) in
+            match V.get parts i with
+            | Just (op, _, d) ->
+                let rest = tiersBuilt tiers indent d (runOf (i + 1) next) in
+                if trailing then PP.concat [PP.space, PP.text op, PP.line, rest]
+                else PP.concat [PP.line, PP.text op, PP.space, rest]
+            | None -> PP.nil)
+          (V.range 0 (V.len cuts))
+      in PP.group
+           (PP.append
+              (tiersBuilt tiers indent lead (runOf 0 firstEnd))
+              (PP.nest indent (PP.concat pieces)))
+
 -- `d` on one line: each place it may break as it is where it does not, and
 -- each group in it so too. A break it must have -- a comment's -- it keeps.
 fun flattened (d : Doc ()) : Doc () =
@@ -1569,6 +1702,74 @@ fun itemsOf
                   breakable out at done inner (if V.elem 2 here then PP.group else groupWithin n)
               | Align inner -> wrapped out at done inner PP.align
               | Flat inner -> wrapped out at done inner flattened
+              -- A chain of operators, broken by tier where it can be; and
+              -- where it cannot -- a comment in it, something the parser
+              -- could not place -- as its rule's own layout.
+              | Tiers tiers other indent inner ->
+                  let plain =
+                    \u ->
+                      (match itemsOf
+                         st
+                         all
+                         places
+                         kids
+                         found
+                         holds
+                         counts
+                         here
+                         out
+                         inner
+                         level
+                         at
+                         done with
+                       | (items, at2, done2) -> (items, at2, done2))
+                  in
+                  let rh = V.getOr absent found at in
+                  let rt = V.getOr absent found (at + 1) in
+                  if not (present rh) or done + 1 < fst rh then plain ()
+                  else
+                    let last = if present rt then snd rt else snd rh in
+                    let from = V.getOr 0 places (fst rh) in
+                    let to = V.getOr 0 places last in
+                    let comment =
+                      V.any
+                        (\i ->
+                          match V.get all i with
+                          | Just c ->
+                              (triviaOf st) (R.kindOf c) and not (S.isEmpty (S.trim (R.text c)))
+                          | None -> False)
+                        (V.range from (to + 1))
+                    in
+                    let deepComment =
+                      V.any
+                        (\j ->
+                          match V.get kids j with
+                          | Just c -> (match tokensOfNode st c with | (_, has) -> has)
+                          | None -> False)
+                        (V.range (fst rh) (last + 1))
+                    in if comment or deepComment then plain ()
+                       else
+                         let tails = if present rt then V.range (fst rt) (snd rt + 1) else [] in
+                         (match tieredDoc
+                            st
+                            kids
+                            (fst rh)
+                            tails
+                            tiers
+                            other
+                            (if indent < 0 then unitOf st else indent) with
+                          | None -> plain ()
+                          | Just d ->
+                              let place =
+                                (match (V.get kids (fst rh), V.get kids last) with
+                                 | (Just a, Just b) ->
+                                     [Pos (fst (R.textRange a)) (snd (R.textRange b))]
+                                 | _ -> [])
+                              in (
+                                   V.concat [out, place, [Written level d (0 - 1) (0 - 1)]],
+                                   at + V.len (leaves inner),
+                                   last
+                                 ))
               | _ ->
                   let r = V.getOr absent found at in
                   if not (present r) then (out, at + 1, done)
@@ -2149,6 +2350,7 @@ data Written
   | WGroupWithin Int [Written]
   | WAlign [Written]
   | WFlat [Written]
+  | WTiers [([String], Bool)] Int Int [Written] Loc
   | WIfBroke String String Loc
   | WWhen [(String, Loc)] [Written] [Written] Loc
   | WWhenCount Int Bool String Loc [Written] [Written]
@@ -2195,6 +2397,19 @@ fun writing (ts : [TokenTree]) (i : Int) (out : [Written]) : [Written] =
        | Just (Group Paren inner _) ->
            writing ts (i + 3) (V.pushBack out (WGroupWithin n (writtenOf inner)))
        | _ -> writing ts (i + 1) (V.pushBack out (WName "group" at)))
+  | (Just (Word "tiers" at), Just next) ->
+      -- `tiers`, a level's width if one is given, the tiers, and the chain.
+      let indent = (match next with | Num n _ -> n | _ -> 0 - 1) in
+      let j = if indent >= 0 then i + 2 else i + 1 in
+      (match (V.get ts j, V.get ts (j + 1)) with
+       | (Just (Group Paren table _), Just (Group Paren inner _)) ->
+           (match tiersOf table with
+            | (tiers, other) ->
+                writing
+                  ts
+                  (j + 2)
+                  (V.pushBack out (WTiers tiers other indent (writtenOf inner) at)))
+       | _ -> writing ts (i + 1) (V.pushBack out (WName "tiers" at)))
   | (Just (Word "flat" _), Just (Group Paren inner _)) ->
       writing ts (i + 2) (V.pushBack out (WFlat (writtenOf inner)))
   | (Just (Word "align" _), Just (Group Paren inner _)) ->
@@ -2390,6 +2605,33 @@ fun isEnumProd sorts p =
         and V.len fs == 1
         and V.any (\f -> match f with | Field _ (TSort m) _ _ -> m == n | _ -> False) fs
 
+-- A table of tiers as written: its tiers, loosest first, parted by `;`, each
+-- operators in quotes, `trailing` where the break goes after them; and which
+-- of them is `other`, where an operator no tier names goes -- the last, where
+-- none says.
+fun tiersOf (ts : [TokenTree]) : ([([String], Bool)], Int) =
+  let step =
+    \acc t ->
+      match acc with
+      | (done, (ops, after, isOther), other) ->
+          (match t with
+           | Str s _ -> (done, (V.pushBack ops s, after, isOther), other)
+           | Word "trailing" _ -> (done, (ops, True, isOther), other)
+           | Word "other" _ -> (done, (ops, after, True), other)
+           | p ->
+               if isPunct ";" p then
+                 (
+                   V.pushBack done (ops, after),
+                   ([], False, False),
+                   if isOther then V.len done else other
+                 )
+               else acc)
+  in match V.foldl step ([], ([], False, False), 0 - 1) ts with
+     | (done, (ops, after, isOther), other) ->
+         let all = if V.isEmpty ops and not isOther then done else V.pushBack done (ops, after) in
+         let o = if isOther then V.len done else other in
+         (all, if o < 0 then V.len all else o)
+
 -- The leaves a rule names, in order, as `leaves` has them: a token's as
 -- nothing, a child's by its name.
 fun leafNames (ws : [Written]) : [String] =
@@ -2405,6 +2647,7 @@ fun leafNames (ws : [Written]) : [String] =
       | WGroupWithin _ inner -> leafNames inner
       | WAlign inner -> leafNames inner
       | WFlat inner -> leafNames inner
+      | WTiers _ _ _ inner _ -> leafNames inner
       | WWhen _ yes _ _ -> leafNames yes
       | WWhenCount _ _ _ _ yes _ -> leafNames yes
       | WChained n _ -> [n]
@@ -2436,6 +2679,15 @@ fun elemCode sorts tokenFields rule fs (names : [String]) (w : Written)
      | WGroupWithin n inner -> inside inner (\code -> "LinguaF.groupedWithin ${show n} ${code}")
      | WAlign inner -> inside inner (\code -> "LinguaF.aligned ${code}")
      | WFlat inner -> inside inner (\code -> "LinguaF.flatly ${code}")
+     | WTiers tiers other indent inner at ->
+         if V.len (leafNames inner) != 2 then
+           Err
+             [Fail
+                "`tiers` is of a chain's head and its tail, two children: `tiers(…)(first rest)`"
+                at]
+         else
+           inside inner (\code ->
+             "LinguaF.tiered [${S.join ", " (V.map (\t -> "([${S.join ", " (V.map quote (fst t))}], ${if snd t then "True" else "False"})") tiers)}] ${show other} (0 + ${if indent < 0 then "(0 - 1)" else show indent}) ${code}")
      | WIfBroke broken flat at ->
          (match V.find (\w -> not (V.elem w ["tight", "cut", "space", "line", "newline"])) [
             broken,

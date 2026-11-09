@@ -32,6 +32,8 @@ use Std.Test (assertEq)
   | @token("]") Close
   | @token(",") Comma
   | @token("+") Plus
+  | @token("*") Star
+  | @token("==") EqEq
   | @token("@") At
   | @token("(") LParen
   | @token(")") RParen
@@ -60,6 +62,8 @@ syntax! {
     "]" = Close,
     "," = Comma,
     "+" = Plus,
+    "*" = Star,
+    "==" = EqEq,
     "@" = At,
     "(" = LParen,
     ")" = RParen,
@@ -68,7 +72,7 @@ syntax! {
   grammar {
     File = items:Expr*
     Expr = first:Term rest:Tail*
-    Tail = op:"+" operand:Term
+    Tail = op:("+" | "*" | "==") operand:Term
     Term = List | LetE | MatchE | IfE | Tagged | Call | LamE | Paren | Vec | Var
     Vec = "<" body:VecBody? ">"
     VecBody = first:Expr tail:VecItem*
@@ -228,6 +232,26 @@ format! {
 }
 
 fun runs (src : String) : String = formatRuns (fst (parseLists src))
+
+-- A chain of operators broken at its loosest first: `==`, then `+`, and `*`
+-- the tightest -- and, in the other, the break after `==` rather than before.
+format! {
+  Tiered for Lists
+  indent 2
+  width 30
+    | Expr = tiers("=="; "+"; "*")(first rest)
+}
+
+format! {
+  TieredAfter for Lists
+  indent 2
+  width 30
+    | Expr = tiers("==" trailing; "+"; other)(first rest)
+}
+
+fun tiered (src : String) : String = formatTiered (fst (parseLists src))
+
+fun tieredAfter (src : String) : String = formatTieredAfter (fst (parseLists src))
 
 format! {
   Plain for Lists
@@ -632,3 +656,34 @@ format! {
   -- What formatting gives back as it was, when it would have lost text, is
   -- not laid out: so laid out, nothing was lost on the way.
   assertEq (chained src == src) False "and laid out, not given back as it was"
+
+@test fun aChainBreaksAtItsLoosestOperatorsFirst () =
+  let a = assertEq (tiered "a + b * c == d") "a + b * c == d" "on one line, as it fits" in
+  let b =
+    assertEq
+      (tiered "aaaaaaaaaa + bbbbbbbbbb == cccccccccc * dddddddddd")
+      "aaaaaaaaaa + bbbbbbbbbb\n  == cccccccccc * dddddddddd"
+      "at the `==`, each side of it whole"
+  in assertEq
+       (tiered "aaaaaaaaaa + bbbbbbbbbb + cccccccccc + dddddddddd")
+       "aaaaaaaaaa\n  + bbbbbbbbbb\n  + cccccccccc\n  + dddddddddd"
+       "and at every `+` of a chain of them"
+
+@test fun anOperatorThatTouchesIsPartOfWhatItTouches () =
+  assertEq
+    (tiered "aaaaaaaaaa+bbbbbbbbbb + cccccccccc + dddddddddd")
+    "aaaaaaaaaa+bbbbbbbbbb\n  + cccccccccc\n  + dddddddddd"
+    "not broken at, and no tier of the chain"
+
+@test fun aTierMayBreakAfterItsOperators () =
+  assertEq
+    (tieredAfter "aaaaaaaaaa + bbbbbbbbbb == cccccccccc * dddddddddd")
+    "aaaaaaaaaa + bbbbbbbbbb ==\n  cccccccccc * dddddddddd"
+    "the break after the `==`, and `*`, which no tier names, the tightest"
+
+@test fun aChainWithACommentInItIsLaidOutAsItsRuleSays () =
+  let src = "aaaaaaaaaa + -- note\nbbbbbbbbbb + cccccccccc + dddddddddd" in
+  let squeezed = \x -> S.join "" (S.split " " (S.join "" (S.split "\n" x))) in
+  -- Unchecked: the check `format<Name>` makes would hide a comment lost.
+  let laid = LinguaF.layoutUnchecked linguaTiered_style (fst (parseLists src)) in
+  assertEq (squeezed laid) (squeezed src) "every token, the comment too, still there"
