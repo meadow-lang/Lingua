@@ -604,3 +604,15 @@ format! {
     (V.map runs ["<a, b,>", "<a, b, c>"])
     ["<a, b,>", "<a, b, c>"]
     "a comma with nothing after it, in an item, is not followed by a space"
+
+@test fun aCommentsLineIsNoBlankLine () =
+  assertEq
+    (V.map listed ["@a(b)\n-- c\n[x]", "@a(b)\n\n-- c\n[x]"])
+    ["@a(b)\n-- c\n[x]", "@a(b)\n\n-- c\n[x]"]
+    "a break and a comment's line are a break; a line of nothing is a blank one"
+
+@test fun aCommentOnALineOfItsOwnKeepsIt () =
+  assertEq
+    (chained "let a = [bbbbbbbbbb, cccccccccc, dddddddddd] in\n-- note\na")
+    "let a =\n  [bbbbbbbbbb, cccccccccc, dddddddddd]\nin\n-- note\na"
+    "though the parting before it is a space"
