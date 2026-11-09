@@ -1984,14 +1984,19 @@ fun writing (ts : [TokenTree]) (i : Int) (out : [Written]) : [Written] =
       let rec kindsFrom j acc =
         match V.get ts j with
         | Just (Word k kat) ->
-            (match (V.get ts (j + 1), V.get ts (j + 2)) with
-             | (Just dot, Just (Word l _)) ->
-                 if isPunct "." dot then kindsFrom (j + 3) (V.pushBack acc ((k, 1, l), kat))
-                 else kindsFrom (j + 1) (V.pushBack acc ((k, 0, ""), kat))
-             | (Just plus, _) ->
-                 if isPunct "+" plus then kindsFrom (j + 2) (V.pushBack acc ((k, 2, ""), kat))
-                 else kindsFrom (j + 1) (V.pushBack acc ((k, 0, ""), kat))
-             | _ -> kindsFrom (j + 1) (V.pushBack acc ((k, 0, ""), kat)))
+            -- What follows the kind says which it is: `.` and a kind, `+`,
+            -- or neither -- and the next kind may follow any of them.
+            let after =
+              \p ->
+                (match V.get ts (j + 1) with
+                 | Just t -> isPunct p t
+                 | None -> False)
+            in if after "." then
+                 (match V.get ts (j + 2) with
+                  | Just (Word l _) -> kindsFrom (j + 3) (V.pushBack acc ((k, 1, l), kat))
+                  | _ -> (acc, j))
+               else if after "+" then kindsFrom (j + 2) (V.pushBack acc ((k, 2, ""), kat))
+               else kindsFrom (j + 1) (V.pushBack acc ((k, 0, ""), kat))
         | _ -> (acc, j)
       in (match kindsFrom (i + 1) [] with
           | (kinds, j) ->

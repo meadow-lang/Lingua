@@ -160,7 +160,7 @@ format! {
   Hugged for Lists
   indent 2
   width 30
-    | Call = "call" head indent(line hug LamE List Paren.LamE Paren+(args(line)))
+    | Call = "call" head indent(line hug LamE Paren+ List Paren.LamE(args(line)))
     | LamE = "\\" tight param "->" indent(line body)
     | List = "[" indent(cut items(tight "," line)) cut "]"
     | Paren = when 1 elems("(" tight elems tight ")")("(" indent(cut elems(tight "," line)) cut ")")
