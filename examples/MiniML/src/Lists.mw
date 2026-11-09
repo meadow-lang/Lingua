@@ -1,7 +1,8 @@
 -- A grammar in the shapes Meadow's own has, for what `format!` does with
 -- them: a list whose commas are tokens between its items, with one after
 -- the last or not; a `match` with arms; and a `let` whose body is a level of
--- precedence -- a node holding one node -- above the `let` it may be.
+-- precedence -- a node holding one node -- above the `let` it may be; an
+-- operator; and an attribute on what follows it.
 
 use Scythe (lexer!)
 use Lingua (syntax!, format!)
@@ -23,6 +24,10 @@ use Std.Test (assertEq)
   | @token("[") Open
   | @token("]") Close
   | @token(",") Comma
+  | @token("+") Plus
+  | @token("@") At
+  | @token("(") LParen
+  | @token(")") RParen
   | @regex("[a-z0-9]+") Name String
 
 syntax! {
@@ -40,12 +45,19 @@ syntax! {
     "[" = Open,
     "]" = Close,
     "," = Comma,
+    "+" = Plus,
+    "@" = At,
+    "(" = LParen,
+    ")" = RParen,
     "name" = Name _
   }
   grammar {
     File = expr:Expr
-    Expr = first:Term
-    Term = List | LetE | MatchE | Var
+    Expr = first:Term rest:Tail*
+    Tail = op:"+" operand:Term
+    Term = List | LetE | MatchE | Tagged | Var
+    Tagged = attr:Attr expr:Expr
+    Attr = "@" name:Var "(" arg:Var ")"
     List = "[" items:(Expr ("," Expr)* ","?)? "]"
     LetE = "let" name:Var "=" value:Expr "in" body:Expr
     MatchE = "match" scrutinee:Expr "with" arms:(Arm Arm*)
@@ -56,11 +68,15 @@ syntax! {
 
 -- A list's items parted by their commas, which break with it; a `match` and
 -- its arms on one line only while there are two arms at most; and a chain of
--- `let`s a step to a line once it is two steps long.
+-- `let`s a step to a line once it is two steps long. An operator is spaced
+-- as it was written; and what `@fmt(skip)` is on is kept as it was.
 format! {
   Listed for Lists
   indent 2
   width 40
+  skip "@fmt(skip)"
+    | Expr = first rest
+    | Tail = kept op kept operand
     | List = "[" indent(cut items(tight "," line)) cut "]"
     | LetE = "let" name "=" value "in" line body breaks 2 body
     | MatchE = "match" scrutinee "with" indent(arms) breaks 3 arms
@@ -127,3 +143,32 @@ fun listed (src : String) : String = formatListed (fst (parseLists src))
       (V.map squeezed srcs)
       "every token still there, in order"
   in assertEq (V.map (\s -> listed (listed s)) srcs) (V.map listed srcs) "and twice is once"
+
+@test fun anOperatorIsSpacedAsItWasWritten () =
+  assertEq
+    (V.map listed ["a+b", "a + b", "a+ b", "a  +\n   b", "[a+b, c + d]"])
+    ["a+b", "a + b", "a+ b", "a + b", "[a+b, c + d]"]
+    "touching stays touching, apart stays apart, and apart is one space"
+
+@test fun whatAnAttributeKeepsIsAsItWasWritten () =
+  let a =
+    assertEq
+      (listed "[a,@fmt(skip) [b,c  ,d],e]")
+      "[a, @fmt(skip) [b,c  ,d], e]"
+      "what it is on as it was, and what is around it laid out"
+  in
+  let b =
+    assertEq
+      (listed "[a,@other(x) [b,c  ,d],e]")
+      "[a, @other(x) [b, c, d], e]"
+      "another attribute keeps nothing"
+  in
+  let c =
+    assertEq
+      (listed "[aaaaaaaaaa, @fmt(skip) [b,\n    c], dddddddddd, eeeeeeeeee]")
+      "[\n  aaaaaaaaaa,\n  @fmt(skip) [b,\n    c],\n  dddddddddd,\n  eeeeeeeeee\n]"
+      "its lines as they were, wherever it is put"
+  in assertEq
+       (formatListedWithin 0 (fst (parseLists "[a,\n@fmt(skip) [b,\nc],\nd]")))
+       "[a,\n  @fmt(skip) [b,\nc],\n  d]"
+       "and when only indenting, a line that starts inside it is left alone"

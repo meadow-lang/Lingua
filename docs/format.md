@@ -36,8 +36,9 @@ errors in it.
 | `for Mini`   | the grammar, one that `syntax!` declared                         |                 |
 | `indent N`   | how many spaces a level is                                       | 2               |
 | `width N`    | how wide a line may be                                           | none: indent only |
+| `skip "…"`   | a node with a child reading as this, blank space aside, is kept as it was written; may be given more than once | none |
 
-`indent` comes before `width`. Whether there is a `width` decides which of two
+`indent` comes before `width`, and `width` before `skip`. Whether there is a `width` decides which of two
 modes the formatter works in; see [Two modes](#two-modes).
 
 ## Rules
@@ -78,6 +79,7 @@ Its formatter rule names the same things in the same order:
 | `cut`       | nothing, or a line break where its group breaks                           |
 | `newline`   | a line break, always; its group and every group around it break           |
 | `tight`     | nothing: the two things touch                                             |
+| `kept`      | `line` where the text had blank space between the two things, `tight` where it had none |
 | (nothing)   | a single space                                                            |
 
 A rule as a whole is a group. When several separators come in a row the
@@ -192,6 +194,23 @@ b
 
 A group that must break makes every group around it break too. `breaks`
 writes nothing; it is written in the rule only to say which group it breaks.
+
+**`kept`** is for what a language spaces as its writer chose, such as an
+operator that means one thing spaced and another touching: `a+b`, `f -1`,
+`xs.len`. With `| Tail = kept op kept operand`, `a+b` stays `a+b`, `a + b`
+stays `a + b`, and `a  +` followed by a line break becomes `a + b`. Two things
+that touch are never parted, and two apart are never joined. A separator a
+child's rule begins with stands with its parent's, so the parent needs a rule
+too (`| Expr = first rest`); a node with no rule keeps the space the text had
+before each child.
+
+**`skip "@fmt(skip)"`** in the header keeps a node exactly as it was written,
+comments and all, when one of its children reads as that text, blank space
+aside. In a grammar where attributes are a declaration's children, such as
+`Decl = attrs:Attr* item:Item`, that is the declaration the attribute is on,
+whether the attribute shares its line or stands on a line of its own. The
+node's lines stay as they were, wherever it is put. When indenting only, a
+line that starts inside it is left alone.
 
 **Not every rule needs one.** A node with no formatter rule is written as it
 was, with its line breaks where they were, set in by whatever is around it. A
@@ -447,9 +466,10 @@ one-line functions over it. The same module can be used by hand:
 | `style unit width name trivia rules` | a formatter; `width` 0 for indent only |
 | `tok`, `child`, `indented`, `indentedBy n`, `grouped`, `groupedWithin n`, `aligned`, `separated kinds between`, `breaksAt n leaf` | the pieces of a rule |
 | `nogroup`                | a rule's first element, for one that is no group |
-| `line`, `cut`, `newline`, `tight`     | the separators                  |
+| `line`, `cut`, `newline`, `tight`, `kept` | the separators              |
 | `layout st g`            | what `format<Name>` calls when there is a width |
 | `reindent st g`          | what it calls when there is none               |
 | `continuation st g`      | what `indent<Name>` calls                      |
 | `within st width`        | the formatter at another width                 |
+| `skipping st texts`      | the formatter, keeping nodes with such a child as they were |
 | `formatWithin st width g` | what `format<Name>Within` calls               |
