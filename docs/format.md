@@ -86,6 +86,7 @@ Its formatter rule names the same things in the same order:
 | `ifbroke(a, b)` | after a group: parting `a` where that group broke, `b` where it did not |
 | `when K(…)(…)` | a child laid out by the first where it is a `K`, and by the second where it is not |
 | `when 1 xs(…)(…)`, `when 7+ xs(…)(…)` | the first where `xs` is exactly one node and no separators, or seven nodes or more; the second where not |
+| `when + "," ";" x(…)(…)` | the first where child `x` holds one of those separators, at any depth but inside a bracket within it; the second where not |
 | `chained x` | child `x` is no group of its own: its rule breaks with this group |
 | `broken x`  | child `x`'s rule breaks, however short it is |
 | `wide x`    | child `x`'s `group N(…)`s are plain groups: on one line as far as the width |
@@ -312,6 +313,12 @@ where every node is N tokens at most and none has a comment:
 
 A `ifbroke` that a `when` layout begins with sees the group written before
 the `when`.
+
+`when + "," ";" body(a)(b)` asks whether a child holds a separator where it
+is not one node of its own: a list whose commas are in its items' nodes, as
+`CommaItem = "," expr` has them. It looks at any depth, but not inside a node
+that begins and ends with a token, so the comma of a tuple inside the bracket
+does not make the bracket a list.
 
 **`broken x`** breaks child `x`'s own group, however short it is, and the
 groups of the nodes between it and what it holds where they hold nothing but

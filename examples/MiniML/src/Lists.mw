@@ -140,7 +140,7 @@ format! {
              body
              group("let" name "=" indent(line value) line "in")
              when
-             LetE(newline body)(ifbroke(space, line) body))
+             LetE(newline body)(ifbroke(space, line) align(body)))
     | IfE =
         "if"
           cond
@@ -236,7 +236,7 @@ format! {
   Runs for Lists
   indent 2
   width 30
-    | Vec = "<" indent(cut body) cut ">"
+    | Vec = when + "," body("<" indent(cut body) cut ">")("<" tight body tight ">")
     | VecBody = first filled 2 tail
     | VecItem = nogroup tight "," line expr
 }
@@ -753,3 +753,15 @@ format! {
     (bodied "mac {\nx {\na,\nb\n}\ny\n}")
     "mac {\n  x {a, b}\n  y\n}"
     "a bracket within, with commas and no `|`, is a list"
+
+@test fun aCommentThatEndsTheHeadsLineLeavesNothingToHug () =
+  assertEq
+    (hugged "call f -- note\n[bbbbbbbbbb, cccccccccc, dddddddddd]")
+    "call f -- note\n  [\n    bbbbbbbbbb,\n    cccccccccc,\n    dddddddddd\n  ]"
+    "the comment stays where it was, and what was to hug is on the next line, a level in"
+
+@test fun aBracketIsAListWhereItHoldsItsSeparators () =
+  assertEq
+    (V.map runs ["< x >", "<a, b>", "<(aaaaaaaaaa, bbbbbbbbbb, cccccccccc)>"])
+    ["<x>", "<a, b>", "<(aaaaaaaaaa, bbbbbbbbbb, cccccccccc)>"]
+    "one thing against the brackets; a list where commas are in its items, not in a bracket within"
