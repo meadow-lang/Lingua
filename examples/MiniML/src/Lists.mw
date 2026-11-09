@@ -1066,3 +1066,27 @@ format! {
        "mac {\nhead x {aaaaaaaaaa = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nc = d}\nf = g\n}")
     "mac {\n  head x {\n    aaaaaaaaaa =\n      bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n    c = d\n  }\n  f = g\n}"
     "a word too long for any line in it does not keep the brace off the line, as `meadow fmt` has it"
+
+-- Items that run on while each is three tokens at most, an operand after a
+-- break of its own where its item breaks.
+format! {
+  FilledLines for Lists
+  indent 2
+  width 30
+    | List =
+        when
+          1
+          items("[" items "]")(when
+             7+
+             items("[" indent(cut items(tight "," fill 3)) cut "]")("["
+                indent(cut items(tight "," line))
+                cut
+                "]"))
+    | Tail = op indent(line operand)
+}
+
+@test fun anItemRunOnIsPutWhereItFitsWhole () =
+  assertEq
+    (formatFilledLines (fst (parseLists "[aaaa, bbbb, cccc, d + eeeeeeeee, ff, gg, hh]")))
+    "[\n  aaaa, bbbb, cccc,\n  d + eeeeeeeee, ff, gg, hh\n]"
+    "on the next line, and not broken at its own break where the line has room for its start"

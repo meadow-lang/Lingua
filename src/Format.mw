@@ -2846,13 +2846,27 @@ fun separatedItems
            ([], seps)
            between with
          | (out, left) -> V.append out (V.concatMap (\j -> kidItem st all places kids level j) left)
+  in
+  -- Nodes run on are each laid out on one line: a node is put where it fits
+  -- whole, and a break of its own would let a fill measure only up to it.
+  let filled = V.any (\e -> match e with | Fill n ones -> small n ones | _ -> False) between in
+  let flatNode =
+    \items ->
+      if not filled then items
+      else
+        V.map
+          (\it ->
+            match it with
+            | Written at d o c -> Written at (flattened d) o c
+            | other -> other)
+          items
   in V.concat
        (V.map
           (\i ->
             let j = V.getOr 0 nodes i in
             let next = V.getOr (snd r + 1) nodes (i + 1) in
             V.append
-              (V.append (marked j) (keptBlank (fst r) j))
+              (V.append (marked j) (flatNode (keptBlank (fst r) j)))
               (if i + 1 < V.len nodes then parted (j + 1) next False
                else if j < snd r then parted (j + 1) (snd r + 1) True
                else []))
