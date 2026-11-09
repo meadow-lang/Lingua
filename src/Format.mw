@@ -43,6 +43,7 @@
 --               xs(…)(…)` by how many nodes `xs` is
 --   chained no  child `no` is no group of its own: its rule's partings
 --               break with this group, as a chain's
+--   broken xs   child `xs`'s rule breaks, however short it is
 --   fill 3      between a separated child's nodes, as many to a line as
 --               fit, where each is 3 tokens at most
 --   hug LamE Paren.LamE Paren+(args(line))
@@ -149,6 +150,7 @@ use Pretty (Doc)
   | IfBroke Int Int
   | When Cond [Elem] [Elem]
   | Chained Elem
+  | Broken Elem
   | Fill Int
   | Hug [(String, Int, String)] Elem
   | NoGroup
@@ -245,6 +247,12 @@ def blanking : Int = 6
 -- break with the group around it, as one more link of a chain.
 @pub fun chained (e : Elem) : Elem = Chained e
 
+-- A child whose rule's group breaks, however short it is -- and the nodes
+-- between it and what it holds, where they hold nothing but one node: a
+-- block that always has a line for each thing in it here, and goes on one
+-- line elsewhere.
+@pub fun broken (e : Elem) : Elem = Broken e
+
 -- Between the nodes of a separated child, a space, or a break before the
 -- next where it does not fit whole on the line: as many to a line as fit.
 -- Only where every node is `n` tokens at most and there is no comment among
@@ -265,7 +273,15 @@ def blanking : Int = 6
 -- each under the name of its node's kind, the texts that keep a node as it
 -- was written, and -- while it lays a text out -- that text.
 @pub data Style k
-  = Style Int Int (k -> String) (k -> Bool) (HashMap String [Elem]) [String] [(Int, Int)] String
+  = Style
+    Int
+    Int
+    (k -> String)
+    (k -> Bool)
+    (HashMap String [Elem])
+    [String]
+    [((Int, Int), Bool)]
+    String
 
 @pub fun style
     (unit : Int)
@@ -301,7 +317,13 @@ fun reading (st : Style k) (t : String) : Style k =
 -- chain: no group of their own.
 fun linking (st : Style k) (range : (Int, Int)) : Style k =
   match st with
-  | Style u w n tr r k c t -> Style u w n tr r k (V.pushBack c range) t
+  | Style u w n tr r k c t -> Style u w n tr r k (V.pushBack c (range, False)) t
+
+-- The same formatter, laying the nodes that span `range` out broken: their
+-- rules' groups break, however short they are.
+fun breakingAt (st : Style k) (range : (Int, Int)) : Style k =
+  match st with
+  | Style u w n tr r k c t -> Style u w n tr r k (V.pushBack c (range, True)) t
 
 -- The same formatter `width` columns wide -- 0 for one that only indents.
 @pub fun within (st : Style k) (width : Int) : Style k =
@@ -407,6 +429,7 @@ fun matchOne (st : Style k) (kids : [Syntax k]) (e : Elem) (i : Int) : ((Int, In
        | Just j -> ((j, j), j + 1)
        | None -> (absent, i))
   | Chained inner -> matchOne st kids inner i
+  | Broken inner -> matchOne st kids inner i
   | Hug _ inner -> matchOne st kids inner i
   | Child kinds many ->
       let j = pastErrors st kids i in
@@ -1008,9 +1031,11 @@ fun breakingIf (forced : Bool) (d : Doc ()) : Doc () = if forced then PP.append 
 -- one that breaks, where `forced`.
 fun asRule (st : Style k) (s : Syntax k) (elems : [Elem]) (items : [Item]) (forced : Bool)
     : Doc () =
-  let d = hugged st items (breakingIf forced (assemble st items)) in
+  let marks = V.filter (\l -> fst l == R.textRange s) (linksOf st) in
+  let mustBreak = V.any (\l -> snd l) marks in
+  let d = hugged st items (breakingIf (forced or mustBreak) (assemble st items)) in
   if V.any (\e -> match e with | NoGroup -> True | _ -> False) elems
-    or V.elem (R.textRange s) (linksOf st) then d
+    or V.any (\l -> not (snd l)) marks then d
   else PP.group d
 
 -- A node as its rule lays it out: a group of what the rule names, each child
@@ -1096,6 +1121,7 @@ fun unwrapped (e : Elem) : Elem =
   match e with
   | Hug _ inner -> unwrapped inner
   | Chained inner -> unwrapped inner
+  | Broken inner -> unwrapped inner
   | other -> other
 
 -- Whether node `c` may hug: it is, through the nodes that hold nothing but
@@ -1395,6 +1421,23 @@ fun itemsOf
                         (\j -> kidItem st all places kids level j)
                         (V.range (done + 1) (fst r))
                     in
+                    -- Each node of the child, laid out with its place marked as
+                    -- `mark` marks it.
+                    let marked =
+                      \mark ->
+                        V.concatMap
+                          (\j ->
+                            let link =
+                              (match V.get kids j with
+                               | Just c -> mark st (R.textRange c)
+                               | None -> st)
+                            in V.append
+                                 (if j > fst r and blankBefore all places j then
+                                    [Parting blanking level]
+                                  else [])
+                                 (kidItem link all places kids level j))
+                          (V.range (fst r) (snd r + 1))
+                    in
                     let named =
                       (match e with
                        | Separated kinds between ->
@@ -1436,19 +1479,9 @@ fun itemsOf
                                      (V.range (fst r) (snd r + 1)))
                        -- A link of a chain: it, and what it holds where that
                        -- is all it holds, no group of its own.
-                       | Chained _ ->
-                           V.concatMap
-                             (\j ->
-                               let link =
-                                 (match V.get kids j with
-                                  | Just c -> linking st (R.textRange c)
-                                  | None -> st)
-                               in V.append
-                                    (if j > fst r and blankBefore all places j then
-                                       [Parting blanking level]
-                                     else [])
-                                    (kidItem link all places kids level j))
-                             (V.range (fst r) (snd r + 1))
+                       | Chained _ -> marked linking
+                       -- A child that breaks, however short.
+                       | Broken _ -> marked breakingAt
                        | _ -> V.concatMap (\j -> keptBlank (fst r) j) (V.range (fst r) (snd r + 1)))
                     in (V.concat [out, skipped, named], at + 1, snd r)))
        (start, leaf, taken)
@@ -1882,6 +1915,7 @@ data Written
   | WWhen [(String, Loc)] [Written] [Written] Loc
   | WWhenCount Int Bool String Loc [Written] [Written]
   | WChained String Loc
+  | WBroken String Loc
   | WHug [((String, Int, String), Loc)] [Written] Loc
   | WFill Int
   | WSep String Loc [Written]
@@ -1970,6 +2004,9 @@ fun writing (ts : [TokenTree]) (i : Int) (out : [Written]) : [Written] =
                | Just (Group Paren inner _) ->
                    writing ts (j + 1) (V.pushBack out (WHug kinds (writtenOf inner) at))
                | _ -> writing ts (i + 1) (V.pushBack out (WName "hug" at))))
+  | (Just (Word "broken" at), Just (Word w wat)) ->
+      if V.elem w partings then writing ts (i + 1) (V.pushBack out (WName "broken" at))
+      else writing ts (i + 2) (V.pushBack out (WBroken w wat))
   | (Just (Word "chained" at), Just (Word w wat)) ->
       if V.elem w partings then writing ts (i + 1) (V.pushBack out (WName "chained" at))
       else writing ts (i + 2) (V.pushBack out (WChained w wat))
@@ -2113,6 +2150,7 @@ fun leafNames (ws : [Written]) : [String] =
       | WWhen _ yes _ _ -> leafNames yes
       | WWhenCount _ _ _ _ yes _ -> leafNames yes
       | WChained n _ -> [n]
+      | WBroken n _ -> [n]
       | WHug _ inner _ -> leafNames inner
       | _ -> [])
     ws
@@ -2177,6 +2215,12 @@ fun elemCode sorts tokenFields rule fs (names : [String]) (w : Written)
                             "LinguaF.hugging [${S.join ", " (V.map (\k -> match k with | ((kind, how, want), _) -> "(${quote "Node${kind}"}, ${show how}, ${quote (if how == 1 then "Node${want}" else "")})") kinds)}] (${code})")
                  | _ ->
                      Err [Fail "`hug` is of one child that is many, written in its parentheses" at])
+     | WBroken n at ->
+         (match fieldOfRule sorts tokenFields rule fs n at with
+          | Err failed -> Err failed
+          | Ok (kinds, many, _) ->
+              Ok
+                "LinguaF.broken (LinguaF.child [${S.join ", " (V.map quote kinds)}] ${if many then "True" else "False"})")
      | WChained n at ->
          (match fieldOfRule sorts tokenFields rule fs n at with
           | Err failed -> Err failed

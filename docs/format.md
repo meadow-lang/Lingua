@@ -84,6 +84,7 @@ Its formatter rule names the same things in the same order:
 | `when K(…)(…)` | a child laid out by the first where it is a `K`, and by the second where it is not |
 | `when 1 xs(…)(…)`, `when 7+ xs(…)(…)` | the first where `xs` is exactly one node and no separators, or seven nodes or more; the second where not |
 | `chained x` | child `x` is no group of its own: its rule breaks with this group |
+| `broken x`  | child `x`'s rule breaks, however short it is |
 | `hug K…(xs)` | the last node of `xs`, where it is a `K`, may start on the line of what is before it and break inside itself before `xs` breaks |
 | `fill N`    | between a separated child's nodes: a space, or a break before a node that does not fit whole; only where each node is N tokens at most (0 for any) and there are no comments, and `line` otherwise |
 | `kept`      | `line` where the text had blank space between the two things, `tight` where it had none |
@@ -306,6 +307,22 @@ where every node is N tokens at most and none has a comment:
 
 A `ifbroke` that a `when` layout begins with sees the group written before
 the `when`.
+
+**`broken x`** breaks child `x`'s own group, however short it is, and the
+groups of the nodes between it and what it holds where they hold nothing but
+one node. It is for a node laid out one way in one place and another way in
+another. A record's block is a field a line in a declaration, and stays on one
+line where it is a type inline:
+
+```meadow
+| RecordDecl = "record" name params "=" broken fields
+```
+
+```text
+record Person = {
+  name : String
+}
+```
 
 **`hug K…(xs)`** lets the last node of a child that is many hug what comes
 before it, as an application's last argument does when it is a lambda or a
@@ -612,7 +629,7 @@ one-line functions over it. The same module can be used by hand:
 | `nogroup`                | a rule's first element, for one that is no group |
 | `line`, `cut`, `newline`, `tight`, `space`, `kept`, `aswritten` | the separators |
 | `ifBroke broken flat`, `whenKind kinds yes no`, `whenCount n orMore leaf yes no` | a parting by whether a group broke; a layout by a child's kind or count |
-| `chained e`, `fillUpTo n`, `hugging kinds e` | a child that is no group of its own; running on; a last node that hugs |
+| `chained e`, `broken e`, `fillUpTo n`, `hugging kinds e` | a child that is no group of its own; one that always breaks; running on; a last node that hugs |
 | `layout st g`            | what `format<Name>` calls when there is a width |
 | `reindent st g`          | what it calls when there is none               |
 | `continuation st g`      | what `indent<Name>` calls                      |

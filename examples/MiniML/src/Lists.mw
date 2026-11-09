@@ -168,6 +168,18 @@ format! {
 
 fun hugged (src : String) : String = formatHugged (fst (parseLists src))
 
+-- What an attribute is on, broken however short it is -- as a `record`'s
+-- block is a line a field -- and the same list on one line elsewhere.
+format! {
+  Blocky for Lists
+  indent 2
+  width 40
+    | Tagged = attr broken expr
+    | List = "[" indent(cut items(tight "," line)) cut "]"
+}
+
+fun blocky (src : String) : String = formatBlocky (fst (parseLists src))
+
 format! {
   Plain for Lists
   indent 2
@@ -447,3 +459,10 @@ format! {
        (hugged "call f aaaaaaaa ([bbbbbbbbbb, cccccccccc])")
        "call f\n  aaaaaaaa\n  ([bbbbbbbbbb, cccccccccc])"
        "and parentheses around what is not a lambda, though it could break inside"
+
+@test fun aBrokenChildBreaksHoweverShort () =
+  let a = assertEq (blocky "[x, y]") "[x, y]" "a list on one line, where it fits" in
+  assertEq
+    (blocky "@a(b) [x, y]")
+    "@a(b) [\n  x,\n  y\n]"
+    "and the same list, broken where the rule says so"
