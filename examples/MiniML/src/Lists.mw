@@ -1015,3 +1015,29 @@ format! {
      ])
     [True, True, False]
     "as it was; what was after it before it, as a separator may be; but not what was before it after it"
+
+-- A tuple as one chain of operators, through its expressions and their
+-- tails: split at its commas, a line each where it breaks, and each part
+-- at its `+`s.
+format! {
+  Chainy for Lists
+  indent 2
+  width 20
+    | Paren = "(" indent(cut chain("," sep; "+")(elems) through(Expr Tail)) cut ")"
+}
+
+@test fun aChainGoesThroughTheNodesItNamesToItsOperators () =
+  assertEq
+    (V.map (\x -> formatChainy (fst (parseLists x))) [
+       "(a + b, c)",
+       "(aaaaaaaaaaaa, bbbbbbbbbbbb)",
+       "(aaaaaaaa + bbbbbbbb + cccccccc, dd)",
+       "(x, (aaaaaaaa + bbbbbbbb, c))"
+     ])
+    [
+      "(a + b, c)",
+      "(\n  aaaaaaaaaaaa,\n  bbbbbbbbbbbb\n)",
+      "(\n  aaaaaaaa\n    + bbbbbbbb\n    + cccccccc,\n  dd\n)",
+      "(\n  x,\n  (\n    aaaaaaaa\n      + bbbbbbbb,\n    c\n  )\n)"
+    ]
+    "on one line if it fits; and if not, a comma a line, and a part that does not fit at its `+`s"

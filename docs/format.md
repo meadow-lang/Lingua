@@ -483,6 +483,35 @@ an entry a line:
   chain("," sep)(trees)) cut` breaks a list in a body an item a line. The body of a `|`
   entry is `N` columns in from its `|` (two levels, where `N` is not given).
   An entry with a comment among its trees is written as it was.
+- **Things side by side** in an entry that does not read as the language are
+  an application: on one line if it fits, and each a line a step in if not,
+  with a bracket it ends with on the line before it where that line has room
+  for its opening. An entry with a word the language spells out in it
+  (`if`, `then`) is as the text spaced it.
+- **`chain(TABLE)(a b) through(K L)`** is a chain over the language's own
+  nodes: children `a` and `b` and what lies between them, and inside any node
+  of kind `K` or `L` -- at any depth -- what that node holds. The operators
+  found so are split by the table, and every other node is laid out by its
+  own rule. A child that is many is found across the table's operators
+  between its nodes. Its loosest tier breaks with what holds the chain, so a
+  brace's commas go a line each where the brace breaks:
+
+  ```meadow
+  | BraceE =
+      "{"
+      indent(line chain("," ";" sep; "|"; "=" trailing)(items tail)
+        through(BraceItem FieldValue BraceTail UpdFields UpdSet UpdField UpdValue))
+      line "}"
+  ```
+
+  ```text
+  {
+    cx
+      | bound =
+        V.foldl step cx.bound r.binds,
+    types = t
+  }
+  ```
 - **As the language, where it reads as the language.** With `reparse "|"
   parseSurfaceArm else parseSurfaceExpr` in the header, an entry is first
   read by one of those: an entry starting with `|` by the first, any other by

@@ -169,7 +169,8 @@ use Pretty (Doc)
   | Flat [Elem]
   | Tiers [([String], Int)] Int Int [Elem]
   | Entries [String] Int [([String], Int)] Int [Elem]
-  | Chain [([String], Int)] Int Elem
+  | Chain [([String], Int)] Int [String] [Elem]
+  | Across [String] [String]
   | NoGroup
 
 use Elem.*
@@ -344,7 +345,16 @@ def blanking : Int = 7
 -- at its operators, by `tiers`, and otherwise as the text had it -- a list in
 -- a bracket, split at its separators.
 @pub fun tokenChain (tiers : [([String], Int)]) (other : Int) (e : Elem) : Elem =
-  Chain tiers other e
+  Chain tiers other [] [e]
+
+-- Children `es` laid out as one chain of operators, as `tokenChain` lays out
+-- token trees: the operators among them, and among what the nodes of the
+-- kinds `through` hold, at any depth -- a `{ r | a = x, b = y }`'s `|`, its
+-- commas and its `=`s, each in a node of its own -- split it by `tiers`, and
+-- every other node is laid out by its own rule.
+@pub fun typedChain (tiers : [([String], Int)]) (other : Int) (through : [String]) (es : [Elem])
+    : Elem =
+  Chain tiers other through es
 
 @pub fun tiered (tiers : [([String], Int)]) (other : Int) (indent : Int) (es : [Elem]) : Elem =
   Tiers tiers other indent es
@@ -514,7 +524,17 @@ fun leaves (es : [Elem]) : [Elem] =
       | Flat inner -> leaves inner
       | Tiers _ _ _ inner -> leaves inner
       | Entries _ _ _ _ fallback -> leaves fallback
-      | Chain _ _ e -> [e]
+      -- A child that is many is found across the chain's own operators
+      -- between its nodes, as a separated child is: a tuple's commas.
+      | Chain tiers _ ways es ->
+          if V.isEmpty ways then es
+          else
+            V.map
+              (\x ->
+                match x with
+                | Child ks True -> Across ks (V.concatMap (\t -> fst t) tiers)
+                | other -> other)
+              es
       | NoGroup -> []
       | other -> [other])
     es
@@ -572,6 +592,10 @@ fun matchOne (st : Style k) (kids : [Syntax k]) (e : Elem) (i : Int) : ((Int, In
         let k = lastSeparated st kinds (tokensOf between) kids j in
         ((j, k), k + 1)
       else (absent, i)
+  | Across kinds ops ->
+      let j = pastErrors st kids i in
+      if fits st kinds kids j then let k = lastAcross st kinds ops kids j in ((j, k), k + 1)
+      else (absent, i)
   | _ -> (absent, i)
 
 fun tokensOf (es : [Elem]) : [String] =
@@ -580,6 +604,17 @@ fun tokensOf (es : [Elem]) : [String] =
 -- The last of a child that is many, from its node `j` on, with `seps` between
 -- two of them: past each node that `seps` and another node follow, and then
 -- past `seps` that end it -- a trailing comma.
+-- The last of a child that is many, from its node `j` on, with any one of
+-- `ops` between two of them: a chain's operators.
+fun lastAcross (st : Style k) (kinds : [String]) (ops : [String]) (kids : [Syntax k]) (j : Int)
+    : Int =
+  match V.get kids (j + 1) with
+  | Just c ->
+      if R.isTokenOf c and V.elem (S.trim (R.text c)) ops and fits st kinds kids (j + 2) then
+        lastAcross st kinds ops kids (j + 2)
+      else j
+  | None -> j
+
 fun lastSeparated (st : Style k) (kinds : [String]) (seps : [String]) (kids : [Syntax k]) (j : Int)
     : Int =
   let m = V.len seps in
@@ -651,6 +686,7 @@ fun indentSpans (unit : Int) (es : [Elem]) (from : Int) : [(Int, Int, Int)] =
                  | Flat inner -> through out at inner
                  | Tiers _ _ _ inner -> through out at inner
                  | Entries _ _ _ _ fallback -> through out at fallback
+                 | Chain _ _ _ es -> (out, at + V.len es)
                  | NoGroup -> (out, at)
                  | _ -> (out, at + 1)))
           ([], from)
@@ -1653,6 +1689,13 @@ fun entriesItems
     -- before it, comments, the bracket's own item writes.
     Just (V.pushBack (fst fold) (Parting breaking level))
 
+-- `c` as the things a typed chain is of: the node itself, or -- where it is
+-- of one of the kinds `ways` -- what it holds, each so in turn.
+fun openedThrough (st : Style k) (ways : [String]) (c : Syntax k) : [Syntax k] =
+  if not (R.isTokenOf c) and V.elem (kindName st c) ways then
+    V.concatMap (openedThrough st ways) (kidsOf st c)
+  else [c]
+
 -- An entry, trees `a` to `b`: `|` and what follows, or the trees, each part
 -- of them as the text had it, split at their spaced operators as `tiers`
 -- splits a chain -- the body of a `|` entry `arm` in. As the text had it,
@@ -1666,6 +1709,22 @@ fun entryDoc
     (arm : Int)
     (tiers : [([String], Int)])
     (other : Int)
+    : Doc () =
+  entryDocAs st kids a b bar arm tiers other True
+
+-- The same, the trees read as the language first only where `reread` --
+-- not where they are the language's nodes already, which break at their
+-- loosest operators with what holds them.
+fun entryDocAs
+    (st : Style k)
+    (kids : [Syntax k])
+    (a : Int)
+    (b : Int)
+    (bar : Bool)
+    (arm : Int)
+    (tiers : [([String], Int)])
+    (other : Int)
+    (reread : Bool)
     : Doc () =
   let t = sourceOf st in
   let range =
@@ -1688,7 +1747,8 @@ fun entryDoc
   -- reads it whole with no error: laid out by the rules, as the same text
   -- anywhere else would be.
   let reader =
-    M.map snd (V.find (\x -> if bar then fst x == "|" else fst x == "") (readersOf st))
+    if not reread then None
+    else M.map snd (V.find (\x -> if bar then fst x == "|" else fst x == "") (readersOf st))
   in
   let tree =
     (match reader with
@@ -1739,6 +1799,42 @@ fun entryDoc
                 | Just c -> not (R.isTokenOf c) and V.elem (firstTokenText st c) ["(", "[", "{"]
                 | None -> False)
            in
+           -- A word the language spells out, which no name is: `if`, `then`.
+           -- Taken, as an editor's colours take it, from a token of letters
+           -- whose kind is no name's.
+           let keyword =
+             \j ->
+               (match V.get kids j with
+                | Just c ->
+                    -- A tree of one token is that token.
+                    let tok =
+                      (if R.isTokenOf c then Just c
+                       else
+                         let held = kidsOf st c in
+                         if V.len held != 1 then None
+                         else
+                           M.andThen
+                             (\one -> if R.isTokenOf one then Just one else None)
+                             (V.get held 0))
+                    in (match tok with
+                        | Just k ->
+                            (let x = S.trim (R.text k) in
+                             not (S.isEmpty x)
+                               and V.all (\ch -> C.isAlpha ch or ch == '_') (S.chars x))
+                              and not
+                                (V.any (\w -> S.contains w (kindName st k)) [
+                                   "Ident",
+                                   "Name",
+                                   "Lower",
+                                   "Upper",
+                                   "Var"
+                                 ])
+                        | None -> False)
+                | None -> False)
+           in
+           -- An entry with such a word in it is no application -- `if x then
+           -- y` -- and its things are as the text spaced them.
+           let worded = V.any keyword (V.range from (b + 1)) in
            -- One more thing in a run of them: `d` so far, and whether it is
            -- an application already made, with what it ends with hugged.
            let onto =
@@ -1749,7 +1845,18 @@ fun entryDoc
                     -- and what touches it -- is set in from that line as
                     -- anything on it is, not a step in.
                     let back = PP.nest (0 - unitOf st) (docAt j) in
-                    if j == from or isOp (j - 1) then (PP.append d back, made, False)
+                    if worded then
+                      (
+                        PP.append
+                          d
+                          (PP.append
+                             (if j == from or isOp (j - 1) or not (spaced j) then PP.nil
+                              else PP.space)
+                             (docAt j)),
+                        True,
+                        False
+                      )
+                    else if j == from or isOp (j - 1) then (PP.append d back, made, False)
                     else if not (spaced j) then
                       (PP.append d (if lined then docAt j else back), made, lined)
                     else if (j == b or isOp (j + 1)) and bracket j then
@@ -1794,7 +1901,7 @@ fun entryDoc
                ((PP.nil, False, False), [])
                (V.range from (b + 1))
            in
-           let chain =
+           let built =
              (match built with
               | (lead, parts) ->
                   tiersBuilt
@@ -1805,6 +1912,13 @@ fun entryDoc
                     (V.map
                        (\p -> match p with | (op, tier, run) -> (op, tier, finished run))
                        parts))
+           in
+           -- The language's own nodes break at their loosest with what holds
+           -- them: a brace's commas a line each where the brace breaks.
+           let chain =
+             (match built with
+              | Doc.Group inner -> if reread then built else inner
+              | _ -> built)
            in if bar then
                 PP.concat [
                   PP.text "|",
@@ -2362,9 +2476,20 @@ fun itemsOf
               -- A macro's body an entry a line, where it is entries; and
               -- where not, as the bracket's own layout says.
               -- Token trees as one entry.
-              | Chain tiers other _ ->
-                  let r = V.getOr absent found at in
-                  if not (present r) then (out, at + 1, done)
+              | Chain tiers other ways es ->
+                  -- From the first of its children there is to the last.
+                  let rs =
+                    V.filter
+                      present
+                      (V.map (\i -> V.getOr absent found (at + i)) (V.range 0 (V.len es)))
+                  in
+                  let r =
+                    (match (V.get rs 0, V.last rs) with
+                     | (Just first, Just last) -> (fst first, snd last)
+                     | _ -> absent)
+                  in
+                  let n = V.len es in
+                  if not (present r) then (out, at + n, done)
                   else
                     let skipped =
                       V.concatMap
@@ -2382,11 +2507,29 @@ fun itemsOf
                            place,
                            [Written
                               level
-                              (entryDoc st kids (fst r) (snd r) False (unitOf st) tiers other)
+                              (if V.isEmpty ways then
+                                 entryDoc st kids (fst r) (snd r) False (unitOf st) tiers other
+                               else
+                                 -- Its children, and what the nodes it goes through
+                                 -- hold, a thing at a time.
+                                 (let flat =
+                                    V.concatMap
+                                      (openedThrough st ways)
+                                      (V.slice kids (fst r) (snd r + 1))
+                                  in entryDocAs
+                                       st
+                                       flat
+                                       0
+                                       (V.len flat - 1)
+                                       False
+                                       (unitOf st)
+                                       tiers
+                                       other
+                                       False))
                               (0 - 1)
                               (0 - 1)]
                          ],
-                         at + 1,
+                         at + n,
                          snd r
                        )
               | Entries own arm tiers other fallback ->
@@ -3123,7 +3266,7 @@ data Written
   | WAlign [Written]
   | WFlat [Written]
   | WTiers [([String], Int)] Int Int [Written] Loc
-  | WChain [([String], Int)] Int String Loc
+  | WChain [([String], Int)] Int [(String, Loc)] [(String, Loc)] Loc
   | WEntries [String] Int [([String], Int)] Int [Written] Loc
   | WIfBroke String String Loc
   | WWhen [(String, Loc)] [Written] [Written] Loc
@@ -3204,10 +3347,26 @@ fun writing (ts : [TokenTree]) (i : Int) (out : [Written]) : [Written] =
   | (Just (Word "chain" at), Just (Group Paren table _)) ->
       (match V.get ts (i + 2) with
        | Just (Group Paren inner _) ->
-           (match (tiersOf table, V.get inner 0) with
-            | ((tiers, other), Just (Word w wat)) ->
-                writing ts (i + 3) (V.pushBack out (WChain tiers other w wat))
-            | _ -> writing ts (i + 1) (V.pushBack out (WName "chain" at)))
+           -- Its children, and the kinds of node it goes through, if any.
+           let names =
+             V.concatMap (\t -> match t with | Word w wat -> [(w, wat)] | _ -> []) inner
+           in
+           let ways =
+             (match (V.get ts (i + 3), V.get ts (i + 4)) with
+              | (Just (Word "through" _), Just (Group Paren kinds _)) ->
+                  (
+                    V.concatMap (\t -> match t with | Word w wat -> [(w, wat)] | _ -> []) kinds,
+                    i + 5
+                  )
+              | _ -> ([], i + 3))
+           in (match tiersOf table with
+               | (tiers, other) ->
+                   if V.isEmpty names then writing ts (i + 1) (V.pushBack out (WName "chain" at))
+                   else
+                     writing
+                       ts
+                       (snd ways)
+                       (V.pushBack out (WChain tiers other names (fst ways) at)))
        | _ -> writing ts (i + 1) (V.pushBack out (WName "chain" at)))
   | (Just (Word "tiers" at), Just next) ->
       -- `tiers`, a level's width if one is given, the tiers, and the chain.
@@ -3507,7 +3666,7 @@ fun leafNames (ws : [Written]) : [String] =
       | WAlign inner -> leafNames inner
       | WFlat inner -> leafNames inner
       | WTiers _ _ _ inner _ -> leafNames inner
-      | WChain _ _ n _ -> [n]
+      | WChain _ _ ns _ _ -> V.map fst ns
       | WEntries _ _ _ _ fallback _ -> leafNames fallback
       | WWhen _ yes _ _ -> leafNames yes
       | WWhenCount _ _ _ _ yes _ -> leafNames yes
@@ -3558,12 +3717,30 @@ fun elemCode sorts tokenFields rule fs (names : [String]) (w : Written)
          else
            inside fallback (\code ->
              "LinguaF.entried [${S.join ", " (V.map (\k -> quote "Node${k}") own)}] (0 + ${if arm < 0 then "(0 - 1)" else show arm}) [${S.join ", " (V.map (\t -> "([${S.join ", " (V.map quote (fst t))}], ${show (snd t)})") tiers)}] ${show other} ${code}")
-     | WChain tiers other n at ->
-         (match fieldOfRule sorts tokenFields rule fs n at with
-          | Err failed -> Err failed
-          | Ok (kinds, many, _) ->
-              Ok
-                "LinguaF.tokenChain [${S.join ", " (V.map (\t -> "([${S.join ", " (V.map quote (fst t))}], ${show (snd t)})") tiers)}] ${show other} (LinguaF.child [${S.join ", " (V.map quote kinds)}] ${if many then "True" else "False"})")
+     | WChain tiers other names ways at ->
+         let children =
+           V.map
+             (\x ->
+               match x with
+               | (n, nat) ->
+                   (match fieldOfRule sorts tokenFields rule fs n nat with
+                    | Err failed -> Err failed
+                    | Ok (kinds, many, _) ->
+                        Ok
+                          "LinguaF.child [${S.join ", " (V.map quote kinds)}] ${if many then "True" else "False"}"))
+             names
+         in
+         let table =
+           "[${S.join ", " (V.map (\t -> "([${S.join ", " (V.map quote (fst t))}], ${show (snd t)})") tiers)}] ${show other}"
+         in (match (
+               V.find (\c -> match c with | Err _ -> True | Ok _ -> False) children,
+               noRuleAmong sorts ways
+             ) with
+             | (Just (Err failed), _) -> Err failed
+             | (_, Just (k, kat)) -> Err [Fail "no rule of the grammar is called ${k}" kat]
+             | _ ->
+                 Ok
+                   "LinguaF.typedChain ${table} [${S.join ", " (V.map (\w -> quote "Node${fst w}") ways)}] [${S.join ", " (V.concatMap (\c -> match c with | Ok code -> [code] | Err _ -> []) children)}]")
      | WTiers tiers other indent inner at ->
          if V.len (leafNames inner) != 2 then
            Err
