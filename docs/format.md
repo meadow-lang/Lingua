@@ -77,6 +77,7 @@ Its formatter rule names the same things in the same order:
 | `align(…)`  | a line it breaks to is set in to the column it started at                 |
 | `flat(…)`   | on one line whatever the width, every group in it too                     |
 | `tiers(…)(head tail)` | a chain of operators broken at its loosest first, by a table of tiers |
+| `entries own K N(…)(…)` | a macro's body of token trees, an entry a line |
 | `line`      | a space, or a line break where its group breaks                           |
 | `cut`       | nothing, or a line break where its group breaks                           |
 | `newline`   | a line break, always; its group and every group around it break           |
@@ -434,6 +435,30 @@ glued into its operand and is never broken at. `tiers 4(…)(…)` sets what
 breaks four columns in rather than a level. A chain with a comment in it is
 laid out as the rule's children would be without `tiers`, so a comment is
 never moved or lost.
+
+**`entries own K N(TABLE)(ELSE)`** lays out a macro's body, which is token
+trees (`BraceGroup = "{" trees:Tt* "}"`) rather than nodes of the language,
+an entry a line:
+
+```meadow
+| BraceGroup = "{" entries own MacCall 4(…the tiers…)(indent(cut trees(tight "," line)) cut) "}"
+```
+
+- **Where an entry starts:** at the first tree, then at a tree that begins a
+  line and is `|`, or is no further in than the entry before it and none of
+  the table's operators. A line that starts with an operator goes on with
+  the entry before it.
+- **When:** where there is more than one entry, and the body is the own
+  bracket of a `K` (`own MacCall`, a call's), or has no `,` at its top, or
+  an entry that starts with `|`. Otherwise it is laid out as `ELSE` says,
+  which names the same child.
+- **Each entry a line,** a level in from the bracket, a blank line between
+  two kept where the text had one, and the bracket closing on a line of its
+  own. A `|` entry after one that is not is a level further in.
+- **Within an entry,** the trees are split at its spaced operators as `tiers`
+  splits a chain, and are otherwise as the text had them. The body of a `|`
+  entry is `N` columns in from its `|` (two levels, where `N` is not given).
+  An entry with a comment among its trees is written as it was.
 
 **`skip "@fmt(skip)"`** in the header keeps a node exactly as it was written,
 comments and all, when one of its children reads as that text, blank space
