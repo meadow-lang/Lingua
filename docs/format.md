@@ -141,6 +141,58 @@ The line break before `=` is set in to its own column (2 + 1), and the
 value's are set in to 2, so whatever follows `=` and each `->` starts in one
 column.
 
+**Separators.** A child that is many, with tokens between its nodes, such as
+`items:(Expr ("," Expr)* ","?)`, is written with what goes between two of them
+in parentheses after its name:
+
+```meadow
+| List = "[" indent(cut items(tight "," line)) cut "]"
+```
+
+Each token in the parentheses is the separator the tree has there. The
+partings say how it stands: here a comma touches the item before it, and a
+space or a break comes after it. A separator after the last node, a trailing
+comma, is kept as it was: written with what of the parentheses comes before
+it, and none of what comes after. So `[a, b,]` stays `[a, b,]`, and broken it
+is:
+
+```text
+[
+  aaaaaaaaaa,
+  bbbbbbbbbb,
+]
+```
+
+Separators are never added or dropped. A blank line between two nodes is kept,
+as it is for any child that is many. With no tokens in the parentheses,
+`arms(newline)`, it is a child that is many with the partings between its
+nodes.
+
+**`breaks N child`** makes the group it is written in break when `child` is
+long enough, however much room there is:
+
+- For a child that is many, when it has N nodes or more, or a blank line
+  between two. `| Match = "match" scrutinee "with" indent(arms) breaks 3 arms`
+  puts an arm on each line once there are three.
+- For a child of the rule's own kind, such as a `let`'s body that is another
+  `let`, N counts along the chain: `let a = x in let b = y in b` is two.
+  Every `let` in the chain breaks, the inner ones too. The chain is followed
+  through nodes that hold nothing but one node, as a grammar with a node for
+  each level of precedence has between a `let` and its body.
+
+```meadow
+| LetE = "let" name "=" value "in" line body breaks 2 body
+```
+
+```text
+let a = x in
+let b = y in
+b
+```
+
+A group that must break makes every group around it break too. `breaks`
+writes nothing; it is written in the rule only to say which group it breaks.
+
 **Not every rule needs one.** A node with no formatter rule is written as it
 was, with its line breaks where they were, set in by whatever is around it. A
 formatter can be adopted a rule at a time.
@@ -154,6 +206,10 @@ formatter can be adopted a rule at a time.
   node of its own. Write rules for its alternatives instead.
 - `Let has no child called x: it has …`: a child the rule does not have. The
   message lists the ones it does.
+- `` `x` is one thing, not many ``: separators after a child that is not many.
+- `` `breaks` counts `x`, which this rule does not write ``, or ``x is one T``:
+  `breaks` counts a child the rule names, which is many or leads to the rule's
+  own kind.
 
 ## Two modes
 
@@ -389,7 +445,7 @@ one-line functions over it. The same module can be used by hand:
 | function                 | what it does                                   |
 | ------------------------ | ---------------------------------------------- |
 | `style unit width name trivia rules` | a formatter; `width` 0 for indent only |
-| `tok`, `child`, `indented`, `indentedBy n`, `grouped`, `groupedWithin n`, `aligned` | the pieces of a rule |
+| `tok`, `child`, `indented`, `indentedBy n`, `grouped`, `groupedWithin n`, `aligned`, `separated kinds between`, `breaksAt n leaf` | the pieces of a rule |
 | `nogroup`                | a rule's first element, for one that is no group |
 | `line`, `cut`, `newline`, `tight`     | the separators                  |
 | `layout st g`            | what `format<Name>` calls when there is a width |
