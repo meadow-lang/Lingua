@@ -72,7 +72,7 @@ syntax! {
     Term = List | LetE | MatchE | IfE | Tagged | Call | LamE | Paren | Vec | Var
     Vec = "<" body:VecBody? ">"
     VecBody = first:Expr tail:VecItem*
-    VecItem = "," expr:Expr
+    VecItem = "," expr:Expr?
     Call = "call" head:Var args:Arg*
     Arg = term:Term
     LamE = "\\" param:Var "->" body:Expr
@@ -215,6 +215,19 @@ format! {
 }
 
 fun pieces (src : String) : String = formatPieces (fst (parseLists src))
+
+-- A bracket whose commas are in its items, each item's `line` a `fill` where
+-- the items are all small: as many to a line as fit.
+format! {
+  Runs for Lists
+  indent 2
+  width 30
+    | Vec = "<" indent(cut body) cut ">"
+    | VecBody = first filled 2 tail
+    | VecItem = nogroup tight "," line expr
+}
+
+fun runs (src : String) : String = formatRuns (fst (parseLists src))
 
 format! {
   Plain for Lists
@@ -559,3 +572,35 @@ format! {
     (hugged "@a(b) [cccccccccc, dddddddddd, eeeeeeeeee]")
     "@a(b) [\n  cccccccccc,\n  dddddddddd,\n  eeeeeeeeee\n]"
     "a child that is one node hugs as the last of many does"
+
+@test fun itemsWhoseSeparatorsAreTheirOwnRunOn () =
+  let a =
+    assertEq
+      (runs "<aaaa, bbbb, cccc, dddd, eeee, ffff, gggg, hhhh>")
+      "<\n  aaaa, bbbb, cccc, dddd,\n  eeee, ffff, gggg, hhhh\n>"
+      "each item's `line` a `fill`: as many to a line as fit"
+  in assertEq
+       (runs "<aaaa, bbbb, cccc, dddd, [eeee, ffff], gggg>")
+       "<\n  aaaa,\n  bbbb,\n  cccc,\n  dddd,\n  [eeee, ffff],\n  gggg\n>"
+       "and where one is more than two tokens, an item a line"
+
+@test fun noLineEndsWithBlankSpace () =
+  let outs =
+    V.concat [
+      V.map chained [
+        "let a = [bbbbbbbbbb, cccccccccc, dddddddddd] in\n-- note\na",
+        "let a = [bbbbbbbbbb, cccccccccc, dddddddddd] in -- note\na",
+        "if aaaaaaaa then xxxxxxxx -- one\nelse if b then y else z"
+      ],
+      V.map (\x -> formatSkipsFiled (fst (parseSkips x))) ["@a\n-- c\n\n[x, y]\n", "@a -- c\n[x]"]
+    ]
+  in assertEq
+       (V.filter (\o -> V.any (\l -> S.endsWith " " l) (S.split "\n" o)) outs)
+       []
+       "a space put before what then broke is not left at the line's end"
+
+@test fun aPartingBeforeWhatANodeLacksPartsNothing () =
+  assertEq
+    (V.map runs ["<a, b,>", "<a, b, c>"])
+    ["<a, b,>", "<a, b, c>"]
+    "a comma with nothing after it, in an item, is not followed by a space"

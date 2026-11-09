@@ -87,6 +87,7 @@ Its formatter rule names the same things in the same order:
 | `chained x` | child `x` is no group of its own: its rule breaks with this group |
 | `broken x`  | child `x`'s rule breaks, however short it is |
 | `wide x`    | child `x`'s `group N(…)`s are plain groups: on one line as far as the width |
+| `filled N xs` | where each node of `xs` is N tokens at most with no comment, a `line` in each node's own rule is a `fill` |
 | `hug K…(xs)` | the last node of `xs`, where it is a `K`, may start on the line of what is before it and break inside itself before `xs` breaks |
 | `fill N`    | between a separated child's nodes: a space, or a break before a node that does not fit whole; only where each node is N tokens at most (0 for any) and there are no comments, and `line` otherwise |
 | `kept`      | `line` where the text had blank space between the two things, `tight` where it had none |
@@ -336,6 +337,24 @@ as the line where it is alone in parentheses:
 | Paren = "(" tight wide elems tight ")"
 ```
 
+**`filled N xs`** is `fill` for a child whose separators are in its nodes'
+own rules, as `CommaItem = "," expr` has its comma:
+
+```meadow
+| VecBody = first filled 2 tail
+| VecItem = nogroup tight "," line expr
+```
+
+Where every node of `tail` is N tokens at most and none has a comment, the
+`line` in each node's rule is a `fill`, so the nodes run on, as many to a line
+as fit. Otherwise the rules are as written.
+
+**A parting before what a node lacks.** A parting with nothing after it in the
+node, where the rule names something after it that the node does not have,
+parts nothing. `SemiItem = nogroup tight ";" line expr` writes `[2;]`, not
+`[2; ]`, where the expression is missing. A parting that is the rule's own
+last element still parts the node from what follows it.
+
 **`hug K…(xs)`** lets the last node of a child that is many hug what comes
 before it, as an application's last argument does when it is a lambda or a
 bracket. Where everything fits it goes on one line. Otherwise, where the last
@@ -572,7 +591,9 @@ by the tests for both whole and broken programs.
   `Unknown`.
 - **It is idempotent.** Formatting twice gives what formatting once did.
 - **A trailing newline is kept** if the text had one. A line that would be
-  nothing but its indent is left empty.
+  nothing but its indent is left empty, and no line ends with blank space,
+  unless a token of the text has blank space before a line's end in it (a
+  string over several lines), which is left as it was.
 - When laying out, a node with no rule keeps one blank line between two
   things; a longer run of blank lines becomes one. A node with a rule keeps
   one in the same way between two items of a child that is many, such as a

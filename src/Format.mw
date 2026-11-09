@@ -46,6 +46,8 @@
 --               break with this group, as a chain's
 --   broken xs   child `xs`'s rule breaks, however short it is
 --   wide xs     child `xs`'s `group N(…)`s are plain groups
+--   filled 3 xs where each node of `xs` is 3 tokens at most, a `line` in
+--               its own rule is a `fill`
 --   fill 3      between a separated child's nodes, as many to a line as
 --               fit, where each is 3 tokens at most
 --   hug LamE Paren.LamE Paren+(args(line))
@@ -155,6 +157,7 @@ use Pretty (Doc)
   | Chained Elem
   | Broken Elem
   | Wide Elem
+  | Filled Int Elem
   | Fill Int
   | Hug [(String, Int, String)] Elem
   | Flat [Elem]
@@ -264,6 +267,13 @@ def blanking : Int = 6
 -- as the width here, as a `let` alone in parentheses.
 @pub fun wide (e : Elem) : Elem = Wide e
 
+-- A child that is many, each node of which has its separator in its own
+-- rule, written there as a `line`: where every node is `n` tokens at most
+-- and there is no comment among them, each such `line` is a `fill` -- a
+-- space, or a break before what does not fit whole -- so the nodes run on,
+-- as many to a line as fit.
+@pub fun filled (n : Int) (e : Elem) : Elem = Filled n e
+
 -- Between the nodes of a separated child, a space, or a break before the
 -- next where it does not fit whole on the line: as many to a line as fit.
 -- Only where every node is `n` tokens at most and there is no comment among
@@ -346,7 +356,14 @@ fun widening (st : Style k) (range : (Int, Int)) : Style k =
   match st with
   | Style u w n tr r k c t -> Style u w n tr r k (V.pushBack c (range, 2)) t
 
--- Whether node `s` is marked so: 0, a link of a chain; 1, broken; 2, wide.
+-- The same formatter, laying the nodes that span `range` out filled: their
+-- rules' `line`s are `fill`s.
+fun fillingAt (st : Style k) (range : (Int, Int)) : Style k =
+  match st with
+  | Style u w n tr r k c t -> Style u w n tr r k (V.pushBack c (range, 3)) t
+
+-- Whether node `s` is marked so: 0, a link of a chain; 1, broken; 2, wide;
+-- 3, filled.
 fun markedAs (st : Style k) (s : Syntax k) (kind : Int) : Bool =
   V.any (\l -> fst l == R.textRange s and snd l == kind) (linksOf st)
 
@@ -457,6 +474,7 @@ fun matchOne (st : Style k) (kids : [Syntax k]) (e : Elem) (i : Int) : ((Int, In
   | Chained inner -> matchOne st kids inner i
   | Broken inner -> matchOne st kids inner i
   | Wide inner -> matchOne st kids inner i
+  | Filled _ inner -> matchOne st kids inner i
   | Hug _ inner -> matchOne st kids inner i
   | Child kinds many ->
       let j = pastErrors st kids i in
@@ -785,12 +803,32 @@ use Item.*
   let st = reading style t in
   match PP.render (widthOf st) (docOf st (R.root g)) with
   | Ok out ->
-      -- A line of nothing but its indent is an empty one; and the text ends
-      -- with a line's end if it did.
-      let lines = V.map (\l -> if S.isEmpty (S.trim l) then "" else l) (S.split "\n" out) in
-      S.trimEnd (S.join "\n" lines)
-        ++ (if S.endsWith "\n" t and not (S.isEmpty (S.trim out)) then "\n" else "")
+      -- A line of nothing but its indent is an empty one, and no line ends
+      -- with blank space -- a space put before what then broke -- unless a
+      -- token of the text has blank space at the end of a line in it, a
+      -- string over several lines, which is not ours to change. And the text
+      -- ends with a line's end if it did.
+      let keepEnds = blankEndsInATokenOf g in
+      let lines =
+        V.map
+          (\l -> if S.isEmpty (S.trim l) then "" else if keepEnds then l else S.trimEnd l)
+          (S.split "\n" out)
+      in S.trimEnd (S.join "\n" lines)
+           ++ (if S.endsWith "\n" t and not (S.isEmpty (S.trim out)) then "\n" else "")
   | Err _ -> t
+
+-- Whether a token of `g` has blank space before a line's end in it.
+fun blankEndsInATokenOf (g : Green k) : Bool =
+  let t = G.text g in
+  V.any
+    (\i ->
+      G.isTokenAt g i
+        and (let x = stringSlice t (G.startAt g i) (G.endAt g i) in
+         S.contains " \n" x
+           or S.contains "\t\n" x
+           or S.contains " \r\n" x
+           or S.contains "\t\r\n" x))
+    (V.range 0 (G.slots g))
 
 fun docOf (st : Style k) (s : Syntax k) : Doc () =
   if R.isTokenOf s then PP.text (R.text s)
@@ -1134,8 +1172,8 @@ fun ruledItems (st : Style k) (s : Syntax k) (elems : [Elem]) : ([Item], Bool) =
   | (all, places, kids, found) ->
       let holds = \n leaf -> holdsAt st s elems all places kids found n leaf in
       let counts = \leaf -> countAt st elems kids found leaf in
-      let wide = markedAs st s 2 in
-      match itemsOf st all places kids found holds counts wide [] elems 0 0 (0 - 1) with
+      let here = V.map snd (V.filter (\l -> fst l == R.textRange s) (linksOf st)) in
+      match itemsOf st all places kids found holds counts here [] elems 0 0 (0 - 1) with
       | (items, _, taken) ->
           let rest =
             V.concatMap (\j -> kidItem st all places kids 0 j) (V.range (taken + 1) (V.len kids))
@@ -1180,6 +1218,7 @@ fun unwrapped (e : Elem) : Elem =
   | Chained inner -> unwrapped inner
   | Broken inner -> unwrapped inner
   | Wide inner -> unwrapped inner
+  | Filled _ inner -> unwrapped inner
   | other -> other
 
 -- Whether node `c` may hug: it is, through the nodes that hold nothing but
@@ -1339,7 +1378,7 @@ fun itemsOf
     (found : [(Int, Int)])
     (holds : Int -> Int -> Bool)
     (counts : Int -> (Int, Bool))
-    (wide : Bool)
+    (here : [Int])
     (start : [Item])
     (es : [Elem])
     (level : Int)
@@ -1350,7 +1389,7 @@ fun itemsOf
   -- write -- an empty list -- not the partings around that nothing.
   let enclosed =
     \out at done inner columns ->
-      match itemsOf st all places kids found holds counts wide [] inner columns at done with
+      match itemsOf st all places kids found holds counts here [] inner columns at done with
       | (items, at2, done2) ->
           if V.all isParting items then (out, at2, done2) else (V.append out items, at2, done2)
   in
@@ -1358,7 +1397,7 @@ fun itemsOf
   -- ends with part it from what follows.
   let wrapped =
     \out at done inner wrap ->
-      match itemsOf st all places kids found holds counts wide [] inner 0 at done with
+      match itemsOf st all places kids found holds counts here [] inner 0 at done with
       | (items, at2, done2) ->
           let tail = V.len (V.takeWhile isParting (V.reverse items)) in
           let body = V.take items (V.len items - tail) in
@@ -1392,6 +1431,13 @@ fun itemsOf
       let forced = V.any (\b -> holds (fst b) (snd b)) (breaksIn inner) in
       wrapped out at done inner (\d -> wrap (breakingIf forced d))
   in
+  -- Whether the rule names something from leaf `at` on, and the node has none
+  -- of it.
+  let orphan =
+    \from ->
+      let after = V.drop found from in
+      not (V.isEmpty after) and not (V.any present after)
+  in
   -- Child `j`, after a blank line where the text had one between it and the
   -- first of what it is one of, at `from`.
   let keptBlank =
@@ -1404,17 +1450,25 @@ fun itemsOf
          match acc with
          | (out, at, done) ->
              (match e with
-              | Mark strength -> (V.pushBack out (Parting strength level), at, done)
+              -- A parting before what the rule names but this node does not
+              -- have, and nothing after it that it does, parts nothing: a
+              -- `;` with no expression after it is not followed by a space.
+              | Mark strength ->
+                  if orphan at then acc
+                  else
+                    -- In a node its parent fills, a `line` is a `fill`.
+                    let s2 = if strength == lining and V.elem 3 here then filling else strength in
+                    (V.pushBack out (Parting s2 level), at, done)
               -- Read from the text: what parts the last thing written from
               -- the next. After nothing at all -- the rule's own first
               -- element -- it parts the node from what is before it. After
               -- what the rule names but this node does not have, such as
               -- attributes it has none of, it parts nothing.
               | Kept ->
-                  if at > 0 and done < 0 then acc
+                  if at > 0 and done < 0 or orphan at then acc
                   else (V.pushBack out (Parting (keptAt st kids found at done) level), at, done)
               | AsWritten ->
-                  if at > 0 and done < 0 then acc
+                  if at > 0 and done < 0 or orphan at then acc
                   else
                     (V.pushBack out (Parting (asWrittenAt st kids found at done) level), at, done)
               -- The thing written last, as it is where it broke and as it
@@ -1443,7 +1497,7 @@ fun itemsOf
                         found
                         holds
                         counts
-                        wide
+                        here
                         out
                         (if held then yes else no)
                         level
@@ -1474,21 +1528,22 @@ fun itemsOf
                         found
                         holds
                         counts
-                        wide
+                        here
                         out
                         (if V.elem kind kinds then yes else no)
                         level
                         at
                         done with
                       | (items, at2, done2) -> (items, at2, done2))
-              | Fill n -> (V.pushBack out (Parting filling level), at, done)
+              | Fill n ->
+                  if orphan at then acc else (V.pushBack out (Parting filling level), at, done)
               | NoGroup -> acc
               | Breaks _ _ -> acc
               | Indent inner -> enclosed out at done inner (level + unitOf st)
               | IndentBy n inner -> enclosed out at done inner (level + n)
               | Group inner -> breakable out at done inner PP.group
               | GroupWithin n inner ->
-                  breakable out at done inner (if wide then PP.group else groupWithin n)
+                  breakable out at done inner (if V.elem 2 here then PP.group else groupWithin n)
               | Align inner -> wrapped out at done inner PP.align
               | Flat inner -> wrapped out at done inner flattened
               | _ ->
@@ -1563,6 +1618,31 @@ fun itemsOf
                        | Broken _ -> marked breakingAt
                        -- A child whose short groups are as wide as the width.
                        | Wide _ -> marked widening
+                       -- Nodes that run on, where they are all small.
+                       | Filled n _ ->
+                           let nodes = V.range (fst r) (snd r + 1) in
+                           let comment =
+                             V.any
+                               (\i ->
+                                 match V.get all i with
+                                 | Just c ->
+                                     (triviaOf st) (R.kindOf c)
+                                       and not (S.isEmpty (S.trim (R.text c)))
+                                 | None -> False)
+                               (V.range (V.getOr 0 places (fst r)) (V.getOr 0 places (snd r) + 1))
+                           in
+                           let small =
+                             not comment
+                               and V.all
+                                 (\j ->
+                                   match V.get kids j with
+                                   | Just c ->
+                                       (match tokensOfNode st c with
+                                        | (count, hasComment) -> not hasComment and count <= n)
+                                   | None -> True)
+                                 nodes
+                           in if small then marked fillingAt
+                              else V.concatMap (\j -> keptBlank (fst r) j) nodes
                        | _ -> V.concatMap (\j -> keptBlank (fst r) j) (V.range (fst r) (snd r + 1)))
                     in (V.concat [out, skipped, named], at + 1, snd r)))
        (start, leaf, taken)
@@ -2040,6 +2120,7 @@ data Written
   | WChained String Loc
   | WBroken String Loc
   | WWide String Loc
+  | WFilled Int String Loc
   | WHug [((String, Int, String), Loc)] [Written] Loc
   | WFill Int
   | WSep String Loc [Written]
@@ -2138,6 +2219,10 @@ fun writing (ts : [TokenTree]) (i : Int) (out : [Written]) : [Written] =
                | Just (Group Paren inner _) ->
                    writing ts (j + 1) (V.pushBack out (WHug kinds (writtenOf inner) at))
                | _ -> writing ts (i + 1) (V.pushBack out (WName "hug" at))))
+  | (Just (Word "filled" at), Just (Num n _)) ->
+      (match V.get ts (i + 2) with
+       | Just (Word w wat) -> writing ts (i + 3) (V.pushBack out (WFilled n w wat))
+       | _ -> writing ts (i + 1) (V.pushBack out (WName "filled" at)))
   | (Just (Word "wide" at), Just (Word w wat)) ->
       if V.elem w partings then writing ts (i + 1) (V.pushBack out (WName "wide" at))
       else writing ts (i + 2) (V.pushBack out (WWide w wat))
@@ -2290,6 +2375,7 @@ fun leafNames (ws : [Written]) : [String] =
       | WChained n _ -> [n]
       | WBroken n _ -> [n]
       | WWide n _ -> [n]
+      | WFilled _ n _ -> [n]
       | WHug _ inner _ -> leafNames inner
       | _ -> [])
     ws
@@ -2355,6 +2441,12 @@ fun elemCode sorts tokenFields rule fs (names : [String]) (w : Written)
                             "LinguaF.hugging [${S.join ", " (V.map (\k -> match k with | ((kind, how, want), _) -> "(${quote "Node${kind}"}, ${show how}, ${quote (if how == 1 then "Node${want}" else want)})") kinds)}] (${code})")
                  | _ ->
                      Err [Fail "`hug` is of one child that is many, written in its parentheses" at])
+     | WFilled limit n at ->
+         (match fieldOfRule sorts tokenFields rule fs n at with
+          | Err failed -> Err failed
+          | Ok (kinds, many, _) ->
+              Ok
+                "LinguaF.filled ${show limit} (LinguaF.child [${S.join ", " (V.map quote kinds)}] ${if many then "True" else "False"})")
      | WWide n at ->
          (match fieldOfRule sorts tokenFields rule fs n at with
           | Err failed -> Err failed
