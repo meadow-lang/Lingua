@@ -80,6 +80,7 @@ Its formatter rule names the same things in the same order:
 | `newline`   | a line break, always; its group and every group around it break           |
 | `tight`     | nothing: the two things touch                                             |
 | `kept`      | `line` where the text had blank space between the two things, `tight` where it had none |
+| `aswritten` | as the text had it: `newline` where it had a break (a blank line where it had one), a space where it had blank space on one line, nothing where the two touched |
 | (nothing)   | a single space                                                            |
 
 A rule as a whole is a group. When several separators come in a row the
@@ -203,6 +204,18 @@ that touch are never parted, and two apart are never joined. A separator a
 child's rule begins with stands with its parent's, so the parent needs a rule
 too (`| Expr = first rest`); a node with no rule keeps the space the text had
 before each child.
+
+**`aswritten`** is for what the writer lays out and the formatter should
+not: an attribute on a line of its own before what it is on, or beside it.
+`| Decl = attrs(aswritten) aswritten item` keeps
+
+```text
+@derive(Debug, Display)
+@pub data Maybe a = Nothing | Just a
+```
+
+on two lines and `@pub fun f x = x` on one. The space it keeps is a space,
+not a place to break, so a break elsewhere in the group does not move it.
 
 **`skip "@fmt(skip)"`** in the header keeps a node exactly as it was written,
 comments and all, when one of its children reads as that text, blank space
@@ -373,7 +386,15 @@ by the tests for both whole and broken programs.
 - **Comments keep a line of their own** before what they were written before.
   A comment inside a node breaks whatever group holds it. A comment written at
   the end of a line, after the token before it, stays at the end of that
-  line, with a line break after it.
+  line, with a line break after it, whatever separator the rule puts before
+  what follows. A blank line before or after a comment is kept, one at most.
+- **Skipped text kept as runs.** A grammar whose lexer skips blank space and
+  comments (`@skip`), rather than declaring them `trivia`, has them in the
+  tree as runs: a comment and the line breaks around it in one piece. Such a
+  run's breaks are kept as if they were pieces of their own, so a comment
+  never takes in the line after it. Declaring `trivia` is still better: two
+  comments in one run are written as one piece, the lines after the first as
+  they were.
 - **An `indent(…)` with nothing in it** writes nothing, including the
   separators inside it. So `indent(newline entries)` with no entries adds no
   line break.
@@ -391,7 +412,9 @@ by the tests for both whole and broken programs.
 - **A node with no rule keeps how far in each of its lines was.** A line the
   text breaks to, and no rule asked for, continues the line before. It is set
   in by as much as it was further in than the line the node began on, and by
-  at least one level, on top of whatever sets in the node. In a layout
+  at least one level, on top of whatever sets in the node. The root is the
+  exception: a line at its column is one of its items, so a file with no rule
+  keeps its lines where they were. In a layout
   language a line at the node's own column would be a new item, never a
   continuation. A line a rule broke to (a layout `;`, say, or a child whose
   rule begins with a break) is set in as the rules say. That holds after a
