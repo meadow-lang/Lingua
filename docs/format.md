@@ -328,8 +328,10 @@ record Person = {
 before it, as an application's last argument does when it is a lambda or a
 bracket. Where everything fits it goes on one line. Otherwise, where the last
 node may hug, everything before it goes on one line and the node is laid out
-from the end of that line, set in from that line. Where that does not fit
-either, the rule's own layout breaks as usual.
+from the end of that line, set in from that line. It hugs where that goes on
+one line and the first line of the node fits after it; a later line of the
+node too long for any width does not stop it. Where it does not hug, the
+rule's own layout breaks as usual.
 
 ```meadow
 | Call = "call" head indent(line hug LamE List Paren.LamE Paren+(args(line)))
@@ -351,6 +353,7 @@ more after its first piece (`xs.f(…)`) hugs nothing. A kind is written:
 | `K`      | a `K`                                                      |
 | `K.L`    | a `K` holding one node that is, through such nodes, an `L`: parentheses around a lambda |
 | `K+`     | a `K` with separators among what it holds: a tuple         |
+| `K+ "," ";"` | a `K` holding one of those separators at any depth, but not inside a node that begins and ends with a token (a bracket within it): a list whose commas are in nodes of their own |
 
 A node that holds no node, such as an empty bracket, never hugs. Since it
 cannot break, hugging it would lay it out the same anyway.
