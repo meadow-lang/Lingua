@@ -358,6 +358,7 @@ def blanking : Int = 7
     (HashMap String [Elem])
     [String]
     [((Int, Int), Int)]
+    [(String, String -> (Green k, [(Int, String)]))]
     String
 
 @pub fun style
@@ -375,44 +376,46 @@ def blanking : Int = 7
     (V.foldl (\m r -> HashMap.insert (fst r) (snd r) m) HashMap.empty rules)
     []
     []
+    []
     ""
 
-fun unitOf st = match st with | Style u _ _ _ _ _ _ _ -> u
-fun widthOf st = match st with | Style _ w _ _ _ _ _ _ -> w
-fun nameOf st = match st with | Style _ _ n _ _ _ _ _ -> n
-fun triviaOf st = match st with | Style _ _ _ t _ _ _ _ -> t
-fun rulesOf st = match st with | Style _ _ _ _ r _ _ _ -> r
-fun skipsOf st = match st with | Style _ _ _ _ _ k _ _ -> k
-fun linksOf st = match st with | Style _ _ _ _ _ _ c _ -> c
-fun sourceOf st = match st with | Style _ _ _ _ _ _ _ t -> t
+fun unitOf st = match st with | Style u _ _ _ _ _ _ _ _ -> u
+fun widthOf st = match st with | Style _ w _ _ _ _ _ _ _ -> w
+fun nameOf st = match st with | Style _ _ n _ _ _ _ _ _ -> n
+fun triviaOf st = match st with | Style _ _ _ t _ _ _ _ _ -> t
+fun rulesOf st = match st with | Style _ _ _ _ r _ _ _ _ -> r
+fun skipsOf st = match st with | Style _ _ _ _ _ k _ _ _ -> k
+fun linksOf st = match st with | Style _ _ _ _ _ _ c _ _ -> c
+fun readersOf st = match st with | Style _ _ _ _ _ _ _ p _ -> p
+fun sourceOf st = match st with | Style _ _ _ _ _ _ _ _ t -> t
 
 fun reading (st : Style k) (t : String) : Style k =
   match st with
-  | Style u w n tr r k c _ -> Style u w n tr r k c t
+  | Style u w n tr r k c p _ -> Style u w n tr r k c p t
 
 -- The same formatter, laying the nodes that span `range` out as links of a
 -- chain: no group of their own.
 fun linking (st : Style k) (range : (Int, Int)) : Style k =
   match st with
-  | Style u w n tr r k c t -> Style u w n tr r k (V.pushBack c (range, 0)) t
+  | Style u w n tr r k c p t -> Style u w n tr r k (V.pushBack c (range, 0)) p t
 
 -- The same formatter, laying the nodes that span `range` out broken: their
 -- rules' groups break, however short they are.
 fun breakingAt (st : Style k) (range : (Int, Int)) : Style k =
   match st with
-  | Style u w n tr r k c t -> Style u w n tr r k (V.pushBack c (range, 1)) t
+  | Style u w n tr r k c p t -> Style u w n tr r k (V.pushBack c (range, 1)) p t
 
 -- The same formatter, laying the nodes that span `range` out wide: their
 -- rules' `group N(…)`s are plain groups.
 fun widening (st : Style k) (range : (Int, Int)) : Style k =
   match st with
-  | Style u w n tr r k c t -> Style u w n tr r k (V.pushBack c (range, 2)) t
+  | Style u w n tr r k c p t -> Style u w n tr r k (V.pushBack c (range, 2)) p t
 
 -- The same formatter, laying the nodes that span `range` out filled: their
 -- rules' `line`s are `fill`s.
 fun fillingAt (st : Style k) (range : (Int, Int)) : Style k =
   match st with
-  | Style u w n tr r k c t -> Style u w n tr r k (V.pushBack c (range, 3)) t
+  | Style u w n tr r k c p t -> Style u w n tr r k (V.pushBack c (range, 3)) p t
 
 -- Whether node `s` is marked so: 0, a link of a chain; 1, broken; 2, wide;
 -- 3, filled.
@@ -422,14 +425,24 @@ fun markedAs (st : Style k) (s : Syntax k) (kind : Int) : Bool =
 -- The same formatter `width` columns wide -- 0 for one that only indents.
 @pub fun within (st : Style k) (width : Int) : Style k =
   match st with
-  | Style u _ n tr r k c t -> Style u (max 0 width) n tr r k c t
+  | Style u _ n tr r k c p t -> Style u (max 0 width) n tr r k c p t
 
 -- The same formatter, keeping as it was written any node that has a child
 -- reading as one of `texts`, blank space aside: an attribute such as
 -- `@fmt(skip)`, on the declaration it is written before.
 @pub fun skipping (st : Style k) (texts : [String]) : Style k =
   match st with
-  | Style u w n tr r k c t -> Style u w n tr r (V.append k (V.map squeezed texts)) c t
+  | Style u w n tr r k c p t -> Style u w n tr r (V.append k (V.map squeezed texts)) c p t
+
+-- The same formatter, reading a macro's entry as a tree of the language where
+-- it can: each `(start, parse)`, `parse` a reader of the grammar's from one
+-- of its rules, for an entry that starts with `start` -- or, `""`, any other.
+-- Where an entry reads with no error, it is laid out by the rules as that
+-- tree; where not, by its tokens.
+@pub fun reparsing (st : Style k) (readers : [(String, String -> (Green k, [(Int, String)]))])
+    : Style k =
+  match st with
+  | Style u w n tr r k c p t -> Style u w n tr r k c (V.append p readers) t
 
 -- `t` without its blank space.
 fun squeezed (t : String) : String =
@@ -1437,67 +1450,87 @@ fun entryDoc
         (V.find (\i -> V.elem op (fst (V.getOr ([], 0) tiers i))) (V.range 0 (V.len tiers)))
   in
   let commented = V.any (\j -> not (S.isEmpty (S.trim (gap j)))) (V.range (a + 1) (b + 1)) in
-  if commented then PP.text (stringSlice t (fst (range a)) (snd (range b)))
-  else
-    let opAt =
-      \j ->
-        (match V.get kids j with
-         | Just c -> firstTokenText st c
-         | None -> "")
-    in
-    let docAt =
-      \j ->
-        (match V.get kids j with
-         | Just c -> docOf st c
-         | None -> PP.nil)
-    in
-    let from = if bar then a + 1 else a in
-    let spaced = \j -> not (S.isEmpty (gap j)) in
-    let styleOf = \op -> snd (V.getOr ([], 0) tiers (tierOf op)) in
-    -- An operator spaced on both sides -- or a separator, however spaced.
-    let isOp =
-      \j ->
-        j > from
-          and j < b
-          and (match V.get kids j with
-           | Just c ->
-               (R.isTokenOf c or V.len (kidsOf st c) == 1)
-                 and V.elem (firstTokenText st c) operators
-                 and (styleOf (firstTokenText st c) == 2 or spaced j and spaced (j + 1))
-           | None -> False)
-    in
-    -- The lead, and each operator and what follows it up to the next.
-    let built =
-      V.foldl
-        (\acc j ->
-          match acc with
-          | (lead, parts) ->
-              if isOp j then (lead, V.pushBack parts (opAt j, tierOf (opAt j), PP.nil))
-              else
-                let sep =
-                  if j == from or isOp (j - 1) then PP.nil
-                  else if spaced j then PP.space
-                  else PP.nil
-                in (match V.last parts with
-                    | Just (op, tier, d) ->
-                        (
-                          lead,
-                          V.pushBack (V.take parts (V.len parts - 1)) (
-                            op,
-                            tier,
-                            PP.append d (PP.append sep (docAt j))
-                          )
-                        )
-                    | None -> (PP.append lead (PP.append sep (docAt j)), parts)))
-        (PP.nil, [])
-        (V.range from (b + 1))
-    in
-    let chain =
-      (match built with
-       | (lead, parts) -> tiersBuilt tiers (if bar then arm else unitOf st) lead parts)
-    in if bar then
-         PP.concat [PP.text "|", (if from <= b and spaced from then PP.space else PP.nil), chain]
-       else chain
+  let text = stringSlice t (fst (range a)) (snd (range b)) in
+  -- The entry as a tree of the language, where a reader of the formatter's
+  -- reads it whole with no error: laid out by the rules, as the same text
+  -- anywhere else would be.
+  let reader =
+    M.map snd (V.find (\x -> if bar then fst x == "|" else fst x == "") (readersOf st))
+  in
+  let tree =
+    (match reader with
+     | Just read ->
+         (match read text with
+          | (g, errs) -> if V.isEmpty errs and G.text g == text then Just g else None)
+     | None -> None)
+  in match tree with
+     | Just g -> docOf (reading st text) (R.root g)
+     | None ->
+         if commented then PP.text text
+         else
+           let opAt =
+             \j ->
+               (match V.get kids j with
+                | Just c -> firstTokenText st c
+                | None -> "")
+           in
+           let docAt =
+             \j ->
+               (match V.get kids j with
+                | Just c -> docOf st c
+                | None -> PP.nil)
+           in
+           let from = if bar then a + 1 else a in
+           let spaced = \j -> not (S.isEmpty (gap j)) in
+           let styleOf = \op -> snd (V.getOr ([], 0) tiers (tierOf op)) in
+           -- An operator spaced on both sides -- or a separator, however spaced.
+           let isOp =
+             \j ->
+               j > from
+                 and j < b
+                 and (match V.get kids j with
+                  | Just c ->
+                      (R.isTokenOf c or V.len (kidsOf st c) == 1)
+                        and V.elem (firstTokenText st c) operators
+                        and (styleOf (firstTokenText st c) == 2 or spaced j and spaced (j + 1))
+                  | None -> False)
+           in
+           -- The lead, and each operator and what follows it up to the next.
+           let built =
+             V.foldl
+               (\acc j ->
+                 match acc with
+                 | (lead, parts) ->
+                     if isOp j then (lead, V.pushBack parts (opAt j, tierOf (opAt j), PP.nil))
+                     else
+                       let sep =
+                         if j == from or isOp (j - 1) then PP.nil
+                         else if spaced j then PP.space
+                         else PP.nil
+                       in (match V.last parts with
+                           | Just (op, tier, d) ->
+                               (
+                                 lead,
+                                 V.pushBack (V.take parts (V.len parts - 1)) (
+                                   op,
+                                   tier,
+                                   PP.append d (PP.append sep (docAt j))
+                                 )
+                               )
+                           | None -> (PP.append lead (PP.append sep (docAt j)), parts)))
+               (PP.nil, [])
+               (V.range from (b + 1))
+           in
+           let chain =
+             (match built with
+              | (lead, parts) -> tiersBuilt tiers (if bar then arm else unitOf st) lead parts)
+           in if bar then
+                PP.concat [
+                  PP.text "|",
+                  (if from <= b and spaced from then PP.space else PP.nil),
+                  chain
+                ]
+              else chain
 
 fun tiersBuilt
     (tiers : [([String], Int)])
@@ -2960,11 +2993,28 @@ type FormatRule = ((String, Loc), [TokenTree])
 
 -- A call: whether it is public, its name, the grammar's, how wide a level
 -- and a line are, and the rules.
-type FormatCall = (Bool, String, (String, Loc), Maybe Int, Maybe Int, [String], [FormatRule])
+type FormatCall =
+  (
+    Bool,
+    String,
+    (String, Loc),
+    Maybe Int,
+    Maybe Int,
+    [String],
+    Maybe [(String, String)],
+    [FormatRule]
+  )
+
+-- `reparse "|" parseArm else parseExpr`: each start and the reader of it,
+-- and the reader of any other.
+def reparseClause : Parser Tokens [(String, String)] =
+  P.pure (\some other -> V.append some (match other with | Just f -> [("", f)] | None -> []))
+    |> keep (P.many (P.pure (\s f -> (s, f)) |> keep stringLit |> keep ident))
+    |> keep (P.optional (P.skipThen (keyword "else") ident))
 
 def formatCall : Parser Tokens FormatCall =
-  P.pure (\pub name grammar unit width skips rules ->
-    (M.isSome pub, name, grammar, unit, width, skips, rules))
+  P.pure (\pub name grammar unit width skips readers rules ->
+    (M.isSome pub, name, grammar, unit, width, skips, readers, rules))
     |> keep (P.optional (keyword "pub"))
     |> keep ident
     |> skip (keyword "for")
@@ -2972,13 +3022,14 @@ def formatCall : Parser Tokens FormatCall =
     |> keep (P.optional (P.skipThen (keyword "indent") number))
     |> keep (P.optional (P.skipThen (keyword "width") number))
     |> keep (P.many (P.skipThen (keyword "skip") stringLit))
+    |> keep (P.optional (P.skipThen (keyword "reparse") reparseClause))
     |> keep (P.many formatRule)
 
 @macro
 @pub fun format (ts : [TokenTree]) : [TokenTree] ! { Expand | e } =
   match parseTokens formatCall ts with
   | Err failed -> failed
-  | Ok (pub, name, grammar, unit, width, skips, rules) ->
+  | Ok (pub, name, grammar, unit, width, skips, readers, rules) ->
       match lookupAs (fst grammar) with
       | Err _ ->
           [Fail
@@ -3003,6 +3054,7 @@ def formatCall : Parser Tokens FormatCall =
                          (M.unwrapOr 2 unit)
                          (M.unwrapOr 0 width)
                          skips
+                         (M.unwrapOr [] readers)
                          trivia
                          (V.concatMap (\d -> match d with | Ok c -> [c] | Err _ -> []) done))
 
@@ -3430,6 +3482,7 @@ fun formatCode
     (unit : Int)
     (width : Int)
     (skips : [String])
+    (readers : [(String, String)])
     (trivia : [String])
     (rules : [String])
     : [TokenTree] =
@@ -3442,7 +3495,7 @@ use Std.Collections.Vector as LinguaV
 
 -- `${name}`: how a ${grammar} tree is set out.
 def lingua${name}_style =
-  LinguaF.skipping (LinguaF.style ${show unit} ${show width} (\\k -> show k) (\\k -> match k with${isTrivia} | _ -> False) [${S.join ", " rules}]) [${S.join ", " (V.map quote skips)}]
+  LinguaF.reparsing (LinguaF.skipping (LinguaF.style ${show unit} ${show width} (\\k -> show k) (\\k -> match k with${isTrivia} | _ -> False) [${S.join ", " rules}]) [${S.join ", " (V.map quote skips)}]) [${S.join ", " (V.map (\x -> "(${quote (fst x)}, \\t -> ${snd x} t)") readers)}]
 
 -- The tree's text as `${name}` sets it out: ${if width > 0 then "laid out within ${show width} columns" else "every line set in, and broken where it was"}.
 ${pub}fun format${name} g = LinguaF.${if width > 0 then "layout" else "reindent"} lingua${name}_style g
