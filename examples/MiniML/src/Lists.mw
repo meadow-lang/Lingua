@@ -873,3 +873,11 @@ format! {
     (formatSpelled (fst (parseLists "? x")))
     "?x"
     "`\"name\"` is any name, though no name is spelled `name`"
+
+@test fun aLineAsWrittenKeepsHowFarInItWas () =
+  -- No rule is for a `(...)`: its second line is one further in than its
+  -- first, as it was, and not a whole level.
+  assertEq
+    (LinguaF.layoutUnchecked linguaLevel_style (fst (parseLists "(x,\n y)")))
+    "(x,\n y)"
+    "set in by a column, as written"

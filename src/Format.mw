@@ -1044,9 +1044,9 @@ fun writtenAsIs (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
          -- that begins with a break of its own is set in as what is around it
          -- says. A line only the text broke to is as far in from the node's
          -- first line as it was; and once it has something to go on with,
-         -- further in than that line by a level at least -- at its column, in
-         -- a language whose layout is part of its meaning, it would be a new
-         -- item.
+         -- further in than that line -- at its column, in a language whose
+         -- layout is part of its meaning, it would be a new item -- by a
+         -- level where the text had it no further in.
          let put =
            \w opens d ->
              let n = max 0 (w.owed - w.broke - opens) in
@@ -1054,7 +1054,9 @@ fun writtenAsIs (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
              let set =
                if not fresh then w.cur
                else if opens > 0 or w.asked or w.col < 0 then 0
-               else max (w.col - base) (if w.begun and M.isSome (R.parent s) then unitOf st else 0)
+               else if w.col - base > 0 then w.col - base
+               else if w.begun and M.isSome (R.parent s) then unitOf st
+               else 0
              in
              let lead =
                if fresh then breaksAfter PP.nil n else PP.text (if w.shown then w.gap else "")
