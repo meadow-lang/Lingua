@@ -84,6 +84,7 @@ Its formatter rule names the same things in the same order:
 | `when K(…)(…)` | a child laid out by the first where it is a `K`, and by the second where it is not |
 | `when 1 xs(…)(…)`, `when 7+ xs(…)(…)` | the first where `xs` is exactly one node and no separators, or seven nodes or more; the second where not |
 | `chained x` | child `x` is no group of its own: its rule breaks with this group |
+| `hug K…(xs)` | the last node of `xs`, where it is a `K`, may start on the line of what is before it and break inside itself before `xs` breaks |
 | `fill N`    | between a separated child's nodes: a space, or a break before a node that does not fit whole; only where each node is N tokens at most (0 for any) and there are no comments, and `line` otherwise |
 | `kept`      | `line` where the text had blank space between the two things, `tight` where it had none |
 | `aswritten` | as the text had it: `newline` where it had a break (a blank line where it had one), a space where it had blank space on one line, nothing where the two touched |
@@ -305,6 +306,37 @@ where every node is N tokens at most and none has a comment:
 
 A `ifbroke` that a `when` layout begins with sees the group written before
 the `when`.
+
+**`hug K…(xs)`** lets the last node of a child that is many hug what comes
+before it, as an application's last argument does when it is a lambda or a
+bracket. Where everything fits it goes on one line. Otherwise, where the last
+node may hug, everything before it goes on one line and the node is laid out
+from the end of that line, set in from that line. Where that does not fit
+either, the rule's own layout breaks as usual.
+
+```meadow
+| Call = "call" head indent(line hug LamE List Paren.LamE Paren+(args(line)))
+```
+
+```text
+call f aaaa (\x ->              call f a [
+  bbbbbbbbbbbbbbbbbbbb)           bbbbbbbbbb,
+                                  cccccccccc
+                                ]
+```
+
+Each kind is read through nodes that hold nothing but one node, so an
+argument that is a node around a node is read as what it holds, and one with
+more after its first piece (`xs.f(…)`) hugs nothing. A kind is written:
+
+| written  | hugs where it is                                           |
+| -------- | ---------------------------------------------------------- |
+| `K`      | a `K`                                                      |
+| `K.L`    | a `K` holding one node that is, through such nodes, an `L`: parentheses around a lambda |
+| `K+`     | a `K` with separators among what it holds: a tuple         |
+
+A node that holds no node, such as an empty bracket, never hugs. Since it
+cannot break, hugging it would lay it out the same anyway.
 
 **`skip "@fmt(skip)"`** in the header keeps a node exactly as it was written,
 comments and all, when one of its children reads as that text, blank space
@@ -580,7 +612,7 @@ one-line functions over it. The same module can be used by hand:
 | `nogroup`                | a rule's first element, for one that is no group |
 | `line`, `cut`, `newline`, `tight`, `space`, `kept`, `aswritten` | the separators |
 | `ifBroke broken flat`, `whenKind kinds yes no`, `whenCount n orMore leaf yes no` | a parting by whether a group broke; a layout by a child's kind or count |
-| `chained e`, `fillUpTo n` | a child that is no group of its own; running on |
+| `chained e`, `fillUpTo n`, `hugging kinds e` | a child that is no group of its own; running on; a last node that hugs |
 | `layout st g`            | what `format<Name>` calls when there is a width |
 | `reindent st g`          | what it calls when there is none               |
 | `continuation st g`      | what `indent<Name>` calls                      |

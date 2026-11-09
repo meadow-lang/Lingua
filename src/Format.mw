@@ -45,6 +45,10 @@
 --               break with this group, as a chain's
 --   fill 3      between a separated child's nodes, as many to a line as
 --               fit, where each is 3 tokens at most
+--   hug LamE Paren.LamE Paren+(args(line))
+--               the last of `args`, where it is a `LamE`, parentheses
+--               around one, or a tuple, may start on the line of what is
+--               before it and break inside itself before `args` breaks
 --   items("," line)
 --               a child that is many, with its separators between two of
 --               its nodes -- each token the one the tree has there -- and
@@ -146,6 +150,7 @@ use Pretty (Doc)
   | When Cond [Elem] [Elem]
   | Chained Elem
   | Fill Int
+  | Hug [(String, Int, String)] Elem
   | NoGroup
 
 use Elem.*
@@ -245,6 +250,15 @@ def blanking : Int = 6
 -- Only where every node is `n` tokens at most and there is no comment among
 -- them -- 0 for any -- and otherwise a `line`.
 @pub fun fillUpTo (n : Int) : Elem = Fill n
+
+-- A child that is many whose last node may hug what is before it: start on
+-- that line, everything before it on one line, and break inside itself
+-- before the group around it breaks. Which nodes may: those of the kinds
+-- given -- each `(kind, 0, "")`; or `(kind, 1, held)`, one holding one node,
+-- through nodes that hold nothing but one node, of kind `held`; or `(kind, 2,
+-- "")`, one with separators -- the kind read through the nodes that hold
+-- nothing but one node, and none that holds no node at all.
+@pub fun hugging (kinds : [(String, Int, String)]) (e : Elem) : Elem = Hug kinds e
 
 -- A formatter: how wide a level is, how wide a line may be -- 0 for one that
 -- only indents -- what a kind is called, which kinds are trivia, the rules,
@@ -393,6 +407,7 @@ fun matchOne (st : Style k) (kids : [Syntax k]) (e : Elem) (i : Int) : ((Int, In
        | Just j -> ((j, j), j + 1)
        | None -> (absent, i))
   | Chained inner -> matchOne st kids inner i
+  | Hug _ inner -> matchOne st kids inner i
   | Child kinds many ->
       let j = pastErrors st kids i in
       if fits st kinds kids j then
@@ -707,6 +722,7 @@ data Item
   = Parting Int Int
   | Written Int (Doc ()) Int Int
   | Trailer (Doc ())
+  | HugMark Int
 
 use Item.*
 
@@ -942,6 +958,45 @@ fun eitherBroken (d : Doc ()) (broken : Int) (flat : Int) : Doc () =
     (PP.append (PP.group (PP.append d (PP.flatAlt PP.fail PP.nil))) (partingDoc flat))
     (PP.append d (partingDoc broken))
 
+-- What a group of `items` is, `normal` as it is laid out: where a node may
+-- hug what is before it -- a `HugMark` before it -- that first, everything
+-- before it on one line and it laid out from the end of that, set in from
+-- that line; and where that does not fit, as it is laid out.
+fun hugged (st : Style k) (items : [Item]) (normal : Doc ()) : Doc () =
+  match V.find
+    (\i ->
+      match V.get items i with
+      | Just (HugMark _) -> True
+      | _ -> False)
+    (V.range 0 (V.len items)) with
+  | None -> normal
+  | Just m ->
+      let level = (match V.get items m with | Just (HugMark l) -> l | _ -> 0) in
+      let before = V.take items m in
+      let tail = V.len (V.takeWhile isParting (V.reverse before)) in
+      let parting =
+        V.foldl
+          (\n i -> match i with | Parting s _ -> max n s | _ -> n)
+          (0 - 1)
+          (V.drop before (V.len before - tail))
+      in
+      let head = V.take before (V.len before - tail) in
+      let shifted =
+        V.map
+          (\i ->
+            match i with
+            | Written at d o c -> Written (max 0 (at - level)) d o c
+            | Parting s at -> Parting s (max 0 (at - level))
+            | other -> other)
+          (V.drop items (m + 1))
+      in PP.union
+           (PP.append
+              (PP.append
+                 (PP.group (PP.append (assemble st head) (PP.flatAlt PP.fail PP.nil)))
+                 (if parting >= spacing then PP.space else PP.nil))
+              (assemble st shifted))
+           normal
+
 -- What a group that must break holds: nothing, broken, and on one line, a
 -- failure -- so neither it nor any group around it goes on one line.
 def unflat : Doc () = PP.flatAlt PP.nil PP.fail
@@ -953,7 +1008,7 @@ fun breakingIf (forced : Bool) (d : Doc ()) : Doc () = if forced then PP.append 
 -- one that breaks, where `forced`.
 fun asRule (st : Style k) (s : Syntax k) (elems : [Elem]) (items : [Item]) (forced : Bool)
     : Doc () =
-  let d = breakingIf forced (assemble st items) in
+  let d = hugged st items (breakingIf forced (assemble st items)) in
   if V.any (\e -> match e with | NoGroup -> True | _ -> False) elems
     or V.elem (R.textRange s) (linksOf st) then d
   else PP.group d
@@ -1031,10 +1086,40 @@ fun countAt (st : Style k) (elems : [Elem]) (kids : [Syntax k]) (found : [(Int, 
   else
     let all = V.range (fst r) (snd r + 1) in
     let nodes =
-      (match V.get (leaves elems) leaf with
+      (match M.map unwrapped (V.get (leaves elems) leaf) with
        | Just (Separated kinds _) -> V.filter (\j -> fits st kinds kids j) all
        | _ -> all)
     in (V.len nodes, V.len nodes < V.len all)
+
+-- A leaf, past what it is wrapped in.
+fun unwrapped (e : Elem) : Elem =
+  match e with
+  | Hug _ inner -> unwrapped inner
+  | Chained inner -> unwrapped inner
+  | other -> other
+
+-- Whether node `c` may hug: it is, through the nodes that hold nothing but
+-- one node, of one of `kinds` -- holding what that one says it must -- and
+-- holds some node.
+fun hugs (st : Style k) (kinds : [(String, Int, String)]) (c : Syntax k) : Bool =
+  let d = inmost st c in
+  let held = kidsOf st d in
+  let nodes = V.filter (\x -> not (R.isTokenOf x)) held in
+  let inner = V.drop (V.take held (V.len held - 1)) 1 in
+  not (V.isEmpty nodes)
+    and V.any
+      (\k ->
+        match k with
+        | (kind, how, inside) ->
+            kind == kindName st d
+              and (if how == 1 then
+                 V.len nodes == 1
+                   and (match V.get nodes 0 with
+                    | Just x -> kindName st (inmost st x) == inside
+                    | None -> False)
+               else if how == 2 then V.any (\x -> R.isTokenOf x) inner
+               else True))
+      kinds
 
 -- The `breaks` of `es` that are its own group's -- not those of a group
 -- inside it.
@@ -1068,7 +1153,9 @@ fun holdsAt
   let r = V.getOr absent found leaf in
   if not (present r) then False
   else
-    match V.get (leaves elems) leaf with
+    match M.map
+      (\e -> match e with | Hug _ inner -> inner | other -> other)
+      (V.get (leaves elems) leaf) with
     | Just (Chained (Child _ False)) ->
         (match (chainDown st s elems leaf, chainUp st s elems leaf) with
          | ((down, blankDown), (up, blankUp)) -> 1 + down + up >= n or blankDown or blankUp)
@@ -1187,7 +1274,11 @@ fun itemsOf
                (
                  V.concat [
                    out,
-                   [Written level (wrap (assemble st body)) (openingOf body) (0 - 1)],
+                   [Written
+                      level
+                      (hugged st body (wrap (assemble st body)))
+                      (openingOf body)
+                      (0 - 1)],
                    after
                  ],
                  at2,
@@ -1307,7 +1398,42 @@ fun itemsOf
                     let named =
                       (match e with
                        | Separated kinds between ->
-                           separatedItems st all places kids level kinds between r keptBlank
+                           separatedItems st all places kids level kinds between r keptBlank (\j ->
+                             [])
+                       -- A child whose last node may hug: a mark before that
+                       -- node, where it does.
+                       | Hug kinds inner ->
+                           let nodes =
+                             (match inner with
+                              | Separated ks _ ->
+                                  V.filter (\j -> fits st ks kids j) (V.range (fst r) (snd r + 1))
+                              | _ -> V.range (fst r) (snd r + 1))
+                           in
+                           let last = V.getOr (0 - 1) nodes (V.len nodes - 1) in
+                           let marked =
+                             \j ->
+                               if j == last
+                                 and (match V.get kids j with
+                                  | Just c -> hugs st kinds c
+                                  | None -> False) then [HugMark level]
+                               else []
+                           in (match inner with
+                               | Separated ks between ->
+                                   separatedItems
+                                     st
+                                     all
+                                     places
+                                     kids
+                                     level
+                                     ks
+                                     between
+                                     r
+                                     keptBlank
+                                     marked
+                               | _ ->
+                                   V.concatMap
+                                     (\j -> V.append (marked j) (keptBlank (fst r) j))
+                                     (V.range (fst r) (snd r + 1)))
                        -- A link of a chain: it, and what it holds where that
                        -- is all it holds, no group of its own.
                        | Chained _ ->
@@ -1343,6 +1469,7 @@ fun separatedItems
     (between : [Elem])
     (r : (Int, Int))
     (keptBlank : Int -> Int -> [Item])
+    (marked : Int -> [Item])
     : [Item] =
   let nodes = V.filter (\j -> fits st kinds kids j) (V.range (fst r) (snd r + 1)) in
   -- Whether every node is `n` tokens at most, with no comment among them.
@@ -1411,7 +1538,7 @@ fun separatedItems
             let j = V.getOr 0 nodes i in
             let next = V.getOr (snd r + 1) nodes (i + 1) in
             V.append
-              (keptBlank (fst r) j)
+              (V.append (marked j) (keptBlank (fst r) j))
               (if i + 1 < V.len nodes then parted (j + 1) next False
                else if j < snd r then parted (j + 1) (snd r + 1) True
                else []))
@@ -1528,6 +1655,7 @@ fun openingOf (items : [Item]) : Int =
   | Just (Parting n _) -> n
   | Just (Written _ _ o _) -> o
   | Just (Trailer _) -> 0 - 1
+  | Just (HugMark _) -> 0 - 1
   | None -> 0 - 1
 
 -- The parting items end with, of their own -- or -1.
@@ -1536,6 +1664,7 @@ fun closingOf (items : [Item]) : Int =
   | Just (Parting n _) -> n
   | Just (Written _ _ _ c) -> c
   | Just (Trailer _) -> breaking
+  | Just (HugMark _) -> 0 - 1
   | None -> 0 - 1
 
 -- Child `j`, with the comments written before it, each on a line of its own:
@@ -1680,6 +1809,7 @@ fun assemble (st : Style k) (items : [Item]) : Doc () =
            | Parting strength at -> (doc, max pending strength, at, closed)
            | Trailer d ->
                (PP.append doc (PP.append PP.space d), max pending breaking, level, tightly)
+           | HugMark _ -> acc
            | Written at d opens closes ->
                -- What ended the last written thing is there only if it is a
                -- break: a softer parting at the end of a group writes nothing.
@@ -1752,6 +1882,7 @@ data Written
   | WWhen [(String, Loc)] [Written] [Written] Loc
   | WWhenCount Int Bool String Loc [Written] [Written]
   | WChained String Loc
+  | WHug [((String, Int, String), Loc)] [Written] Loc
   | WFill Int
   | WSep String Loc [Written]
   | WBreaks Int String Loc
@@ -1814,6 +1945,31 @@ fun writing (ts : [TokenTree]) (i : Int) (out : [Written]) : [Written] =
              (at2 + 3)
              (V.pushBack out (WWhenCount n orMore w wat (writtenOf yes) (writtenOf no)))
        | _ -> writing ts (i + 1) (V.pushBack out (WName "when" at)))
+  | (Just (Word "hug" at), Just (Word _ _)) ->
+      -- `hug` and the kinds that may, each `K`, `K.L` or `K+`, then the child.
+      let rec kindsFrom j acc =
+        match V.get ts j with
+        | Just (Word k kat) ->
+            -- What follows the kind says which it is: `.` and a kind, `+`,
+            -- or neither -- and the next kind may follow any of them.
+            let after =
+              \p ->
+                (match V.get ts (j + 1) with
+                 | Just t -> isPunct p t
+                 | None -> False)
+            in if after "." then
+                 (match V.get ts (j + 2) with
+                  | Just (Word l _) -> kindsFrom (j + 3) (V.pushBack acc ((k, 1, l), kat))
+                  | _ -> (acc, j))
+               else if after "+" then kindsFrom (j + 2) (V.pushBack acc ((k, 2, ""), kat))
+               else kindsFrom (j + 1) (V.pushBack acc ((k, 0, ""), kat))
+        | _ -> (acc, j)
+      in (match kindsFrom (i + 1) [] with
+          | (kinds, j) ->
+              (match V.get ts j with
+               | Just (Group Paren inner _) ->
+                   writing ts (j + 1) (V.pushBack out (WHug kinds (writtenOf inner) at))
+               | _ -> writing ts (i + 1) (V.pushBack out (WName "hug" at))))
   | (Just (Word "chained" at), Just (Word w wat)) ->
       if V.elem w partings then writing ts (i + 1) (V.pushBack out (WName "chained" at))
       else writing ts (i + 2) (V.pushBack out (WChained w wat))
@@ -1957,6 +2113,7 @@ fun leafNames (ws : [Written]) : [String] =
       | WWhen _ yes _ _ -> leafNames yes
       | WWhenCount _ _ _ _ yes _ -> leafNames yes
       | WChained n _ -> [n]
+      | WHug _ inner _ -> leafNames inner
       | _ -> [])
     ws
 
@@ -1992,6 +2149,34 @@ fun elemCode sorts tokenFields rule fs (names : [String]) (w : Written)
                    at]
           | None -> Ok "LinguaF.ifBroke LinguaF.${broken} LinguaF.${flat}")
      | WFill n -> Ok "LinguaF.fillUpTo ${show n}"
+     | WHug kinds inner at ->
+         let prodNames =
+           V.concatMap
+             (\s ->
+               match s with
+               | Sort _ ps -> V.map (\p -> match p with | Prod m _ -> m) ps)
+             sorts
+         in (match V.find
+               (\k ->
+                 match k with
+                 | ((kind, how, want), _) ->
+                     not (V.elem kind prodNames) or (how == 1 and not (V.elem want prodNames)))
+               kinds with
+             | Just ((kind, how, want), kat) ->
+                 Err
+                   [Fail
+                      "no rule of the grammar is called ${if V.elem kind prodNames then want else kind}"
+                      kat]
+             | None ->
+                 match (V.len inner, V.get inner 0) with
+                 | (1, Just one) ->
+                     (match elemCode sorts tokenFields rule fs names one with
+                      | Err failed -> Err failed
+                      | Ok code ->
+                          Ok
+                            "LinguaF.hugging [${S.join ", " (V.map (\k -> match k with | ((kind, how, want), _) -> "(${quote "Node${kind}"}, ${show how}, ${quote (if how == 1 then "Node${want}" else "")})") kinds)}] (${code})")
+                 | _ ->
+                     Err [Fail "`hug` is of one child that is many, written in its parentheses" at])
      | WChained n at ->
          (match fieldOfRule sorts tokenFields rule fs n at with
           | Err failed -> Err failed
