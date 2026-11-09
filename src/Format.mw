@@ -879,66 +879,81 @@ use Item.*
 -- The tree's text laid out within the formatter's width: each node with a
 -- rule on one line if it fits, and broken where its rule says if not.
 @pub fun layout (style : Style k) (g : Green k) : String =
-  let t = G.text g in
   let laid = layoutUnchecked style g in
-  -- Laying out changes blank space and nothing else. Where it changed
-  -- anything else -- a fault, which may have lost what was written, or made
-  -- two words one -- the text is given back as it was: better unformatted
-  -- than changed.
-  if unblank laid == unblank t and keptApart g laid then laid else t
+  -- Laying out changes blank space, and where a separator goes among the
+  -- comments beside it, and nothing else. Where it changed anything else --
+  -- a fault, which may have lost what was written, or made two words one --
+  -- the text is given back as it was: better unformatted than changed.
+  if keptApart style g laid then laid else G.text g
 
--- Whether `laid` has each token of `g` that is not blank whole, and blank
--- space between each two that had some between them and would read as one
--- if they touched: the same characters, with no two words joined into one,
--- nor two operators -- `->` and `--` are `->--`. A bracket or a comma
--- touches anything. A line's end, which laying out trims, is no part of a
--- token here.
-fun keptApart (g : Green k) (laid : String) : Bool =
+-- Whether `laid` is the text of `g` and blank space: each token whole, the
+-- tokens that are not trivia in their order and the comments in theirs, and
+-- blank space between each two that had some between them and would read as
+-- one if they touched -- two words, or two operators: `->` and `--` are
+-- `->--`. A bracket or a comma touches anything. A comment may be written
+-- on the other side of a separator than it was. A line's end, which laying
+-- out trims, is no part of a token here.
+fun keptApart (style : Style k) (g : Green k) (laid : String) : Bool =
   let t = G.text g in
-  -- Each line of each token, without the blank space around it, and where it
-  -- begins: a run a lexer skipped -- comments and the lines between them --
-  -- is one token, and laying out sets each of its lines in anew.
-  let tokens =
+  -- Each line of each token, without the blank space around it, where it
+  -- begins, and whether it is trivia: a run a lexer skipped -- comments and
+  -- the lines between them -- is one token, and laying out sets each of its
+  -- lines in anew.
+  let pieces =
     V.concatMap
       (\i ->
         if G.isTokenAt g i then
           (let start = G.startAt g i in
+           let trivia = (triviaOf style) (G.kindAt g i) in
            V.concatMap
              (\piece ->
                match piece with
                | (at, line) ->
                    (let x = S.trim line in
                     if S.isEmpty x then []
-                    else [(at + stringByteLength line - stringByteLength (S.trimStart line), x)]))
+                    else
+                      [(
+                        at + stringByteLength line - stringByteLength (S.trimStart line),
+                        x,
+                        trivia
+                      )]))
              (linesFrom start (stringSlice t start (G.endAt g i))))
         else [])
       (V.range 0 (G.slots g))
   in
+  let code = V.concatMap (\p -> match p with | (a, x, False) -> [(a, x)] | _ -> []) pieces in
+  let notes = V.concatMap (\p -> match p with | (_, x, True) -> [x] | _ -> []) pieces in
   let n = stringByteLength laid in
   let blankAt = \at -> V.elem (toInt (stringByteAt laid at)) [32, 9, 10, 13] in
   let rec past (at : Int) : Int = if at < n and blankAt at then past (at + 1) else at in
-  -- Each token in turn: where `laid` is, where the last token ended in `t`,
-  -- or that something was not kept.
-  let walked =
-    V.foldl
-      (\acc tok ->
-        match (acc, tok) with
-        | (Just (at, prevEnd), (a, x)) ->
-            let from = past at in
-            let len = stringByteLength x in
-            let joined =
-              prevEnd >= 0
-                and a > prevEnd
-                and from == at
-                and from > 0
-                and runsOn (toInt (stringByteAt laid (from - 1))) (toInt (stringByteAt x 0))
-            in if from + len > n or stringSlice laid from (from + len) != x then None
-               else if joined then None
-               else Just (from + len, a + len)
-        | (None, _) -> None)
-      (Just (0, 0 - 1))
-      tokens
-  in M.isSome walked
+  let here =
+    \from x ->
+      from + stringByteLength x <= n and stringSlice laid from (from + stringByteLength x) == x
+  in
+  -- Whether what begins at `from`, `x`, runs on from what is before it.
+  let runs =
+    \at from x ->
+      from == at
+        and from > 0
+        and runsOn (toInt (stringByteAt laid (from - 1))) (toInt (stringByteAt x 0))
+  in
+  -- From `at` in `laid`, the next code piece `ci` and comment `ni`, and where
+  -- the code piece last read ended in `t`: the next comment where it is,
+  -- or else the next code piece.
+  let rec go (at : Int) (ci : Int) (ni : Int) (prevEnd : Int) : Bool =
+    let from = past at in
+    if from >= n then ci >= V.len code and ni >= V.len notes
+    else
+      match V.get notes ni with
+      | Just x if here from x ->
+          if runs at from x then False else go (from + stringByteLength x) ci (ni + 1) (0 - 1)
+      | _ ->
+          match V.get code ci with
+          | Just (a, x) if here from x ->
+              if (prevEnd < 0 or a > prevEnd) and runs at from x then False
+              else go (from + stringByteLength x) (ci + 1) ni (a + stringByteLength x)
+          | _ -> False
+  in go 0 0 0 (0 - 1)
 
 -- Each line of `x`, which begins at byte `start`, and where it begins.
 fun linesFrom (start : Int) (x : String) : [(Int, String)] =
@@ -2559,7 +2574,14 @@ fun separatedItems
                   | Tok _ _ ->
                       (match V.get left 0 with
                        | Just j ->
-                           (V.append out (kidItem st all places kids level j), V.drop left 1)
+                           let glued =
+                             (match V.last out with
+                              | Just (Parting n _) -> n == tightly
+                              | _ -> False)
+                           in (
+                                V.append out (kidItemAs st all places kids level j glued),
+                                V.drop left 1
+                              )
                        | None -> acc)
                   | Mark strength ->
                       if V.isEmpty left and ending then acc
@@ -2732,6 +2754,21 @@ fun kidItem
     (level : Int)
     (j : Int)
     : [Item] =
+  kidItemAs st all places kids level j False
+
+-- The same, for a token `glued` to what is before it -- a separator a rule
+-- sets `tight` -- which goes before the comments the text has before it: on
+-- the line of what it follows, as `x, -- c` and not `x -- c` with the comma
+-- beginning the next line.
+fun kidItemAs
+    (st : Style k)
+    (all : [Syntax k])
+    (places : [Int])
+    (kids : [Syntax k])
+    (level : Int)
+    (j : Int)
+    (glued : Bool)
+    : [Item] =
   let at = V.getOr 0 places j in
   let before = (if j == 0 then 0 else V.getOr 0 places (j - 1) + 1) in
   let textAt = \i -> M.unwrapOr "" (M.map R.text (V.get all i)) in
@@ -2838,7 +2875,17 @@ fun kidItem
   -- Comments on lines of their own begin a line, whatever parting comes
   -- before them -- where anything does, in its node.
   let ownLine = if V.isEmpty comments or j == 0 then [] else [Parting freshing level] in
-  V.concat [atEnd, ownLine, placed, own]
+  match V.get kids j with
+  | Just c ->
+      if glued and R.isTokenOf c and not (S.isEmpty (R.text c)) and not (V.isEmpty found) then
+        V.concat [
+          placed,
+          [Written level (PP.text (R.text c)) none none],
+          atEnd,
+          (if V.isEmpty comments then [] else V.append [Parting freshing level] onlyComments)
+        ]
+      else V.concat [atEnd, ownLine, placed, own]
+  | None -> V.concat [atEnd, ownLine, placed, own]
 
 -- The trivia from child `from` up to `to` that is not blank: comments.
 fun commentsIn (all : [Syntax k]) (from : Int) (to : Int) : [String] =

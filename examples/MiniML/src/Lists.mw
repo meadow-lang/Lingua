@@ -913,3 +913,12 @@ format! {
       "letx = 1 in x"
       "laid out, they are one word"
   in assertEq (formatGlued g) "let x = 1 in x" "so the text is given back as it was"
+
+@test fun aSeparatorStaysWithWhatItFollowsThoughACommentComesFirst () =
+  assertEq
+    (V.map chained ["[a\n-- c\n, b]", "[aaaaaaaaaa, bbbbbbbbbb -- c\n, cccccccccc, dddddddddd]"])
+    [
+      "[\n  a,\n  -- c\n  b\n]",
+      "[\n  aaaaaaaaaa,\n  bbbbbbbbbb, -- c\n  cccccccccc,\n  dddddddddd\n]"
+    ]
+    "the comma on its item's line, before a comment on a line of its own, or one that ends the line"
