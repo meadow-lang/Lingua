@@ -1710,11 +1710,12 @@ fun entryDoc
     (tiers : [([String], Int)])
     (other : Int)
     : Doc () =
-  entryDocAs st kids a b bar arm tiers other True
+  entryDocAs st kids a b bar arm tiers other True False
 
 -- The same, the trees read as the language first only where `reread` --
--- not where they are the language's nodes already, which break at their
--- loosest operators with what holds them.
+-- not where they are the language's nodes already -- and, where `opened`,
+-- broken at their loosest operators with what holds them: a typed chain's
+-- commas a line each where its brace breaks.
 fun entryDocAs
     (st : Style k)
     (kids : [Syntax k])
@@ -1725,6 +1726,7 @@ fun entryDocAs
     (tiers : [([String], Int)])
     (other : Int)
     (reread : Bool)
+    (opened : Bool)
     : Doc () =
   let t = sourceOf st in
   let range =
@@ -1756,9 +1758,42 @@ fun entryDocAs
          (match read text with
           | (g, errs) -> if V.isEmpty errs and G.text g == text then Just g else None)
      | None -> None)
-  in match tree with
-     | Just g -> bareDoc (reading st text) (R.root g)
-     | None ->
+  in
+  -- Where a `|` entry does not read as an arm, what follows its `->` may
+  -- still read as the language -- a `pass!` arm whose pattern says `later`,
+  -- and whose body is an expression like any other. Its pattern is split as
+  -- below, and its body laid out by the rules, `arm` in.
+  let body =
+    if not bar or not reread or M.isSome tree then None
+    else
+      (match V.find
+         (\j ->
+           match V.get kids j with
+           | Just c -> firstTokenText st c == "->"
+           | None -> False)
+         (V.range (a + 1) b) with
+       | Just k ->
+           let bodyText = stringSlice t (fst (range (k + 1))) (snd (range b)) in
+           (match M.map snd (V.find (\x -> fst x == "") (readersOf st)) with
+            | Just read ->
+                (match read bodyText with
+                 | (g, errs) ->
+                     if V.isEmpty errs and G.text g == bodyText then Just (k, g, bodyText)
+                     else None)
+            | None -> None)
+       | None -> None)
+  in match (tree, body) with
+     | (Just g, _) -> bareDoc (reading st text) (R.root g)
+     | (None, Just (k, g, bodyText)) ->
+         PP.group
+           (PP.concat [
+              PP.text "|",
+              PP.space,
+              entryDocAs st kids (a + 1) (k - 1) False arm tiers other False False,
+              PP.text " ->",
+              PP.nest arm (PP.append PP.line (bareDoc (reading st bodyText) (R.root g)))
+            ])
+     | (None, None) ->
          if commented then PP.text text
          else
            let opAt =
@@ -1793,10 +1828,20 @@ fun entryDocAs
            -- not -- but a bracket it ends with on the line of what it is
            -- applied to, broken within, as `link "…" {` and its fields.
            let applied = \d -> PP.group (PP.nest (unitOf st) d) in
+           -- A bracket that may hug, as `meadow fmt` has it: a brace; a bracket
+           -- with commas in it; or one around a function, `(\x -> …)`. Not
+           -- `(f x)`, which is an argument like any other.
            let bracket =
              \j ->
                (match V.get kids j with
-                | Just c -> not (R.isTokenOf c) and V.elem (firstTokenText st c) ["(", "[", "{"]
+                | Just c ->
+                    not (R.isTokenOf c)
+                      and (let opening = firstTokenText st c in
+                       let inner = kidsOf st c in
+                       opening == "{"
+                         or (V.elem opening ["(", "["]
+                            and (V.any (\k -> firstTokenText st k == ",") inner
+                               or M.map (firstTokenText st) (V.get inner 1) == Just "\\")))
                 | None -> False)
            in
            -- A word the language spells out, which no name is: `if`, `then`.
@@ -1872,23 +1917,10 @@ fun entryDocAs
                          (match PP.render 1000000 flat with
                           | Ok s -> V.len (S.chars s)
                           | Err _ -> 1000000)
-                       in
-                       let hugging = PP.concat [flat, PP.space, docAt j] in
-                       -- Hugged, every line of it fits: a line in the bracket
-                       -- that does not fit however it breaks -- a string too
-                       -- long -- leaves it a line of its own.
-                       let allFit =
-                         \c i ->
-                           (match PP.render
-                              (widthOf st)
-                              (PP.append (PP.text (S.repeat " " c)) (PP.nest i hugging)) with
-                            | Ok s -> V.all (\l -> S.charLength l <= widthOf st) (S.split "\n" s)
-                            | Err _ -> False)
                        in (
                             PP.column (\c ->
-                              PP.nesting (\i ->
-                                if c + wide + 2 <= widthOf st and allFit c i then hugging
-                                else applied (PP.append d (PP.append PP.line (docAt j))))),
+                              if c + wide + 2 <= widthOf st then PP.concat [flat, PP.space, docAt j]
+                              else applied (PP.append d (PP.append PP.line (docAt j)))),
                             True,
                             True
                           ))
@@ -1934,7 +1966,7 @@ fun entryDocAs
            -- them: a brace's commas a line each where the brace breaks.
            let chain =
              (match built with
-              | Doc.Group inner -> if reread then built else inner
+              | Doc.Group inner -> if opened then inner else built
               | _ -> built)
            in if bar then
                 PP.concat [
@@ -2542,7 +2574,8 @@ fun itemsOf
                                        (unitOf st)
                                        tiers
                                        other
-                                       False))
+                                       False
+                                       True))
                               (0 - 1)
                               (0 - 1)]
                          ],

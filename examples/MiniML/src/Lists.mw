@@ -1060,9 +1060,9 @@ format! {
     "call f\n  -- c\n  [\n    aaaaaaaaaa,\n    bbbbbbbbbb,\n    cccccccccc\n  ]"
     "the comment on its line, and the list under it, a step in"
 
-@test fun aBracketHugsOnlyWhereEveryLineOfItFits () =
+@test fun aBraceHugsWhereItsFirstLineFits () =
   assertEq
     (bodied
        "mac {\nhead x {aaaaaaaaaa = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nc = d}\nf = g\n}")
-    "mac {\n  head\n    x\n    {\n      aaaaaaaaaa =\n        bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n      c = d\n    }\n  f = g\n}"
-    "a word too long for any line in it: the bracket a line of its own"
+    "mac {\n  head x {\n    aaaaaaaaaa =\n      bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n    c = d\n  }\n  f = g\n}"
+    "a word too long for any line in it does not keep the brace off the line, as `meadow fmt` has it"
