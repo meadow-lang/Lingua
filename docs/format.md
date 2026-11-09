@@ -82,6 +82,9 @@ Its formatter rule names the same things in the same order:
 | `space`     | a space, always: one that does not break when its group does              |
 | `ifbroke(a, b)` | after a group: parting `a` where that group broke, `b` where it did not |
 | `when K(…)(…)` | a child laid out by the first where it is a `K`, and by the second where it is not |
+| `when 1 xs(…)(…)`, `when 7+ xs(…)(…)` | the first where `xs` is exactly one node and no separators, or seven nodes or more; the second where not |
+| `chained x` | child `x` is no group of its own: its rule breaks with this group |
+| `fill N`    | between a separated child's nodes: a space, or a break before a node that does not fit whole; only where each node is N tokens at most (0 for any) and there are no comments, and `line` otherwise |
 | `kept`      | `line` where the text had blank space between the two things, `tight` where it had none |
 | `aswritten` | as the text had it: `newline` where it had a break (a blank line where it had one), a space where it had blank space on one line, nothing where the two touched |
 | (nothing)   | a single space                                                            |
@@ -258,6 +261,50 @@ if aaaaaaaa then xxxxxxxx
 else if bbbbbbbb then yyyyyyyy
 else zzzzzzzz
 ```
+
+**`when` by count.** `when 1 elems(a)(b)` takes `a` where `elems` is one
+node and no separator, and `b` otherwise. Parentheses around one thing are
+then not a tuple:
+
+```meadow
+| Paren = when 1 elems("(" elems ")")("(" indent(cut elems(tight "," line)) cut ")")
+```
+
+`when 7+ items(a)(b)` takes `a` where `items` has seven nodes or more. The
+child counted may be any the rule names. The two layouts read the node's
+children alike: a child separated in either is counted with its separators.
+
+**`chained x`** writes child `x` as no group of its own. Neither are the nodes
+between it and what it holds, where they hold nothing but one node. Its rule's
+partings break with this group, as one more link of a chain. With it, an
+`else if` chain breaks every `else` once one breaks:
+
+```meadow
+| IfE = "if" cond "then" group(indent(line yes)) line "else" when IfE(chained no)(group(indent(line no)))
+```
+
+```text
+if aaaaaaaa then xxxxxxxx
+else if bbbb then yyyy
+else zzzz
+```
+
+**`fill N`** runs a separated child's nodes on, as many to a line as fit,
+where every node is N tokens at most and none has a comment:
+
+```meadow
+| List = when 7+ items("[" indent(cut items(tight "," fill 1)) cut "]")("[" indent(cut items(tight "," line)) cut "]")
+```
+
+```text
+[
+  aaaa, bbbb, cccc, dddd,
+  eeee, ffff, gggg, hhhh
+]
+```
+
+A `ifbroke` that a `when` layout begins with sees the group written before
+the `when`.
 
 **`skip "@fmt(skip)"`** in the header keeps a node exactly as it was written,
 comments and all, when one of its children reads as that text, blank space
@@ -532,7 +579,8 @@ one-line functions over it. The same module can be used by hand:
 | `tok`, `child`, `indented`, `indentedBy n`, `grouped`, `groupedWithin n`, `aligned`, `separated kinds between`, `breaksAt n leaf` | the pieces of a rule |
 | `nogroup`                | a rule's first element, for one that is no group |
 | `line`, `cut`, `newline`, `tight`, `space`, `kept`, `aswritten` | the separators |
-| `ifBroke broken flat`, `whenKind kinds yes no` | a parting by whether a group broke; a child by its kind |
+| `ifBroke broken flat`, `whenKind kinds yes no`, `whenCount n orMore leaf yes no` | a parting by whether a group broke; a layout by a child's kind or count |
+| `chained e`, `fillUpTo n` | a child that is no group of its own; running on |
 | `layout st g`            | what `format<Name>` calls when there is a width |
 | `reindent st g`          | what it calls when there is none               |
 | `continuation st g`      | what `indent<Name>` calls                      |
