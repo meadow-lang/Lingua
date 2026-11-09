@@ -75,6 +75,7 @@ Its formatter rule names the same things in the same order:
 | `group(…)`  | what it encloses goes on one line if it fits, and breaks together if not  |
 | `group 60(…)` | the same, but on one line only while that line is 60 columns at most, however wide the width |
 | `align(…)`  | a line it breaks to is set in to the column it started at                 |
+| `flat(…)`   | on one line whatever the width, every group in it too                     |
 | `line`      | a space, or a line break where its group breaks                           |
 | `cut`       | nothing, or a line break where its group breaks                           |
 | `newline`   | a line break, always; its group and every group around it break           |
@@ -90,7 +91,7 @@ Its formatter rule names the same things in the same order:
 | `fill N`    | between a separated child's nodes: a space, or a break before a node that does not fit whole; only where each node is N tokens at most (0 for any) and there are no comments, and `line` otherwise |
 | `kept`      | `line` where the text had blank space between the two things, `tight` where it had none |
 | `aswritten` | as the text had it: `newline` where it had a break (a blank line where it had one), a space where it had blank space on one line, nothing where the two touched |
-| (nothing)   | a single space                                                            |
+| (nothing)   | as the text had it: nothing where the two things touched, a space where they did not |
 
 A rule as a whole is a group. When several separators come in a row the
 strongest wins, in the order `newline`, `line`, `cut`, `tight`. A separator
@@ -368,6 +369,22 @@ more after its first piece (`xs.f(…)`) hugs nothing. A kind is written:
 
 A node that holds no node, such as an empty bracket, never hugs. Since it
 cannot break, hugging it would lay it out the same anyway.
+
+**Nothing between two things.** Where a rule writes nothing between two
+things, they are parted as the text had them: touching where they touched,
+and a space where they did not. In a language where touching means
+something, such as `0XFF` read as two tokens, or `x'`, formatting keeps what
+it meant. A parting the rule does write (`line`, `cut`, `tight`, `newline`)
+is the rule's to say, so a bracket still breaks after its `[`.
+
+**`flat(…)`** lays out what it encloses on one line whatever the width, every
+group in it too, as nothing inside a string should break:
+
+```meadow
+| InterpE = "interp_start" flat(first mids) "interp_end"
+```
+
+A break it must have, after a comment, it keeps.
 
 **`skip "@fmt(skip)"`** in the header keeps a node exactly as it was written,
 comments and all, when one of its children reads as that text, blank space

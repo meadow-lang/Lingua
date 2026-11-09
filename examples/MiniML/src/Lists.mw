@@ -168,6 +168,7 @@ format! {
   indent 2
   width 30
     | Call = "call" head indent(line hug LamE Paren+ List Paren.LamE Vec+ ","(args(line)))
+    | Tagged = attr indent(line hug List(expr))
     | Vec = "<" indent(cut body) cut ">"
     | VecBody = first tail
     | VecItem = nogroup tight "," line expr
@@ -201,6 +202,19 @@ format! {
 }
 
 fun roomy (src : String) : String = formatRoomy (fst (parseLists src))
+
+-- An attribute with nothing written between its pieces, and a list in
+-- parentheses on one line whatever the width -- as a string's holes are.
+format! {
+  Pieces for Lists
+  indent 2
+  width 20
+    | Attr = "@" name group("(" arg ")")
+    | Paren = "(" tight flat(elems) tight ")"
+    | List = "[" indent(cut items(tight "," line)) cut "]"
+}
+
+fun pieces (src : String) : String = formatPieces (fst (parseLists src))
 
 format! {
   Plain for Lists
@@ -428,8 +442,8 @@ format! {
 @test fun aNodeIsLaidOutByHowManyItHolds () =
   let a =
     assertEq
-      (V.map filled ["[x]", "[x,]", "[a, b]", "[]"])
-      ["[ x ]", "[x,]", "[a, b]", "[]"]
+      (V.map filled ["[ x ]", "[x]", "[ x, ]", "[a, b]", "[]"])
+      ["[ x ]", "[x]", "[x,]", "[a, b]", "[]"]
       "one item and no comma one way; a comma, two, or none the other"
   in assertEq
        (filled "[aaaaaa, bbbbbb, cccccc, dddddd, eeeeee, ffffff]")
@@ -522,3 +536,26 @@ format! {
        (roomy "(let aaaa = xxxxx in aaaa)")
        "(let aaaa = xxxxx in aaaa)"
        "and in parentheses, where its parent makes it wide, on one line"
+
+@test fun whatNothingPartsIsPartedAsTheTextHadIt () =
+  assertEq
+    (V.map pieces ["@a(b) x", "@ a ( b ) x", "@a (b) x"])
+    ["@a(b) x", "@ a ( b ) x", "@a (b) x"]
+    "touching where it touched, which may mean something; a space where it did not"
+
+@test fun whatIsFlatIsOnOneLineWhateverTheWidth () =
+  let a =
+    assertEq
+      (pieces "[aaaaaaaaaa, bbbbbbbbbb, cccccccccc]")
+      "[\n  aaaaaaaaaa,\n  bbbbbbbbbb,\n  cccccccccc\n]"
+      "a list too wide, broken"
+  in assertEq
+       (pieces "([aaaaaaaaaa, bbbbbbbbbb, cccccccccc])")
+       "([aaaaaaaaaa, bbbbbbbbbb, cccccccccc])"
+       "and the same list where it is flat, on one line"
+
+@test fun oneChildHugsAsTheLastOfOne () =
+  assertEq
+    (hugged "@a(b) [cccccccccc, dddddddddd, eeeeeeeeee]")
+    "@a(b) [\n  cccccccccc,\n  dddddddddd,\n  eeeeeeeeee\n]"
+    "a child that is one node hugs as the last of many does"
