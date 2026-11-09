@@ -76,6 +76,7 @@ Its formatter rule names the same things in the same order:
 | `group 60(…)` | the same, but on one line only while that line is 60 columns at most, however wide the width |
 | `align(…)`  | a line it breaks to is set in to the column it started at                 |
 | `flat(…)`   | on one line whatever the width, every group in it too                     |
+| `tiers(…)(head tail)` | a chain of operators broken at its loosest first, by a table of tiers |
 | `line`      | a space, or a line break where its group breaks                           |
 | `cut`       | nothing, or a line break where its group breaks                           |
 | `newline`   | a line break, always; its group and every group around it break           |
@@ -404,6 +405,35 @@ group in it too, as nothing inside a string should break:
 ```
 
 A break it must have, after a comment, it keeps.
+
+**`tiers(…)(head tail)`** lays out a chain of operators that the grammar keeps
+flat, `Ops = first:Operand rest:InfixTail*` with each `InfixTail` an operator
+and its operand, by a fixed table of tiers rather than the program's own
+fixities:
+
+```meadow
+| Ops = tiers("|"; "=" ":=" "<-" trailing; "->" "=>" trailing; "or" "||"; "and" "&&";
+              "==" "!=" "<" ">" "<=" ">="; other; "+" "-"; "*" "/" "%")(first rest)
+```
+
+The tiers are written loosest first and parted by `;`, each a list of
+operators. `trailing` puts a tier's break after its operators instead of
+before them, and `other` is the tier of any operator the table does not
+name (the last tier, where no tier says `other`). The chain is split at the
+loosest tier present, each part split the same way at the next. Each split
+is a group: the first part, then, a level in, each operator and the part
+after it.
+
+```text
+aaaaaaaaaa + bbbbbbbbbb
+  == cccccccccc * dddddddddd
+```
+
+Only an operator with blank space on both sides takes part. `a+b` stays
+glued into its operand and is never broken at. `tiers 4(…)(…)` sets what
+breaks four columns in rather than a level. A chain with a comment in it is
+laid out as the rule's children would be without `tiers`, so a comment is
+never moved or lost.
 
 **`skip "@fmt(skip)"`** in the header keeps a node exactly as it was written,
 comments and all, when one of its children reads as that text, blank space
