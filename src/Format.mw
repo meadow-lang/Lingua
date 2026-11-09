@@ -882,9 +882,88 @@ use Item.*
   let t = G.text g in
   let laid = layoutUnchecked style g in
   -- Laying out changes blank space and nothing else. Where it changed
-  -- anything else -- a fault, which may have lost what was written -- the
-  -- text is given back as it was: better unformatted than changed.
-  if unblank laid == unblank t then laid else t
+  -- anything else -- a fault, which may have lost what was written, or made
+  -- two words one -- the text is given back as it was: better unformatted
+  -- than changed.
+  if unblank laid == unblank t and keptApart g laid then laid else t
+
+-- Whether `laid` has each token of `g` that is not blank whole, and blank
+-- space between each two that had some between them and would read as one
+-- if they touched: the same characters, with no two words joined into one,
+-- nor two operators -- `->` and `--` are `->--`. A bracket or a comma
+-- touches anything. A line's end, which laying out trims, is no part of a
+-- token here.
+fun keptApart (g : Green k) (laid : String) : Bool =
+  let t = G.text g in
+  -- Each line of each token, without the blank space around it, and where it
+  -- begins: a run a lexer skipped -- comments and the lines between them --
+  -- is one token, and laying out sets each of its lines in anew.
+  let tokens =
+    V.concatMap
+      (\i ->
+        if G.isTokenAt g i then
+          (let start = G.startAt g i in
+           V.concatMap
+             (\piece ->
+               match piece with
+               | (at, line) ->
+                   (let x = S.trim line in
+                    if S.isEmpty x then []
+                    else [(at + stringByteLength line - stringByteLength (S.trimStart line), x)]))
+             (linesFrom start (stringSlice t start (G.endAt g i))))
+        else [])
+      (V.range 0 (G.slots g))
+  in
+  let n = stringByteLength laid in
+  let blankAt = \at -> V.elem (toInt (stringByteAt laid at)) [32, 9, 10, 13] in
+  let rec past (at : Int) : Int = if at < n and blankAt at then past (at + 1) else at in
+  -- Each token in turn: where `laid` is, where the last token ended in `t`,
+  -- or that something was not kept.
+  let walked =
+    V.foldl
+      (\acc tok ->
+        match (acc, tok) with
+        | (Just (at, prevEnd), (a, x)) ->
+            let from = past at in
+            let len = stringByteLength x in
+            let joined =
+              prevEnd >= 0
+                and a > prevEnd
+                and from == at
+                and from > 0
+                and runsOn (toInt (stringByteAt laid (from - 1))) (toInt (stringByteAt x 0))
+            in if from + len > n or stringSlice laid from (from + len) != x then None
+               else if joined then None
+               else Just (from + len, a + len)
+        | (None, _) -> None)
+      (Just (0, 0 - 1))
+      tokens
+  in M.isSome walked
+
+-- Each line of `x`, which begins at byte `start`, and where it begins.
+fun linesFrom (start : Int) (x : String) : [(Int, String)] =
+  fst
+    (V.foldl
+       (\acc line ->
+         match acc with
+         | (out, at) -> (V.pushBack out (at, line), at + stringByteLength line + 1))
+       ([], start)
+       (S.split "\n" x))
+
+-- Whether two characters side by side, `a` then `b`, would be read as one
+-- token: two of a word, or two of an operator.
+fun runsOn (a : Int) (b : Int) : Bool =
+  let word =
+    \n ->
+      n >= 128
+        or n == 95
+        or n == 39
+        or (n >= 48 and n <= 57)
+        or (n >= 65 and n <= 90)
+        or (n >= 97 and n <= 122)
+  in
+  let op = \n -> S.contains (S.fromChars [C.fromCode n]) "!#$%&*+-./:<=>?@\\^|~" in
+  (word a and word b) or (op a and op b)
 
 -- The tree's text laid out as `layout` lays it out, but not checked against
 -- the text: what a test of the formatter compares, to find where `layout`

@@ -896,3 +896,20 @@ format! {
     (LinguaF.layoutUnchecked linguaLevel_style (fst (parseLists "(x,\n y)")))
     "(x,\n y)"
     "set in by a column, as written"
+
+-- A rule that would make two words one.
+format! {
+  Glued for Lists
+  indent 2
+  width 40
+    | LetE = "let" tight name "=" value "in" body
+}
+
+@test fun aLayoutThatJoinsTwoWordsIsNotGiven () =
+  let g = fst (parseLists "let x = 1 in x") in
+  let a =
+    assertEq
+      (LinguaF.layoutUnchecked linguaGlued_style g)
+      "letx = 1 in x"
+      "laid out, they are one word"
+  in assertEq (formatGlued g) "let x = 1 in x" "so the text is given back as it was"
