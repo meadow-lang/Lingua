@@ -217,6 +217,11 @@ not: an attribute on a line of its own before what it is on, or beside it.
 on two lines and `@pub fun f x = x` on one. The space it keeps is a space,
 not a place to break, so a break elsewhere in the group does not move it.
 
+`kept` and `aswritten` part the last thing written from the next. As a
+rule's first element they part the node from what comes before it, as in
+`Tail = kept op kept operand`. After children the node does not have, such
+as a declaration's attributes when it has none, they part nothing.
+
 **`skip "@fmt(skip)"`** in the header keeps a node exactly as it was written,
 comments and all, when one of its children reads as that text, blank space
 aside. In a grammar where attributes are a declaration's children, such as

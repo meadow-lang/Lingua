@@ -220,15 +220,18 @@ fun plain (src : String) : String = formatPlain (fst (parseLists src))
   | @token("[") Open
   | @token("]") Close
   | @token(",") Comma
+  | @token("@") At
   | @regex("[a-z0-9]+") Name String
 
 syntax! {
   Skips
   lexer Bare
-  tokens { "[" = Open, "]" = Close, "," = Comma, "name" = Name _ }
+  tokens { "[" = Open, "]" = Close, "," = Comma, "@" = At, "name" = Name _ }
   grammar {
     File = items:Item*
-    Item = List | Var
+    Item = attrs:Attr* thing:Thing
+    Attr = "@" name:Var
+    Thing = List | Var
     List = "[" items:(Var ("," Var)*)? "]"
     Var = "name"
   }
@@ -245,10 +248,26 @@ format! {
   indent 2
   width 40
     | File = items(newline)
-    | List = "[" items(tight "," line) "]"
+    | Item = attrs(aswritten) aswritten thing
+    | List = "[" tight items(tight "," line) tight "]"
 }
 
 @test fun aCommentRunIsWrittenWithItsBreaks () =
   let src = "-- a comment\nx\n\ny -- after\n-- before z\nz\n" in
   let a = assertEq (formatSkipsPlain (fst (parseSkips src))) src "with no rule" in
   assertEq (formatSkipsFiled (fst (parseSkips src))) src "and with a rule for the file"
+
+@test fun aPartingAfterNothingWrittenPartsNothing () =
+  let src = "-- top
+--
+-- more
+
+[x]
+@a
+[y]
+@b @c [z]
+" in
+  assertEq
+    (formatSkipsFiled (fst (parseSkips src)))
+    src
+    "an item with no attributes has no break before it, nor blank line before its comments"
