@@ -55,10 +55,24 @@
 --                                                  Db mode` -- see below
 --   status        db -> Int -> String              what is shown above each
 --                                                  line: a goal and its context
---   start         db -> String -> String           a mode's: what entering it
---                                                  with a text does and says
+--   start         db -> String -> String           what beginning says: a
+--                                                  mode's, given its text; the
+--                                                  prompt's, given none
+--   answer        db -> Int -> [Spoken]            in place of `eval`: what
+--                                                  entering it answers a part
+--                                                  at a time, to standard
+--                                                  output or standard error
+--   unknown       db -> String -> Reply            a line that starts with `:`
+--                                                  and is no command: what it
+--                                                  does -- an `Entry`, say
 --   prompt        what a line starts with; `history`, the file entries are
---                 kept in between runs; `theme`, the one it starts in
+--                 kept in between runs; `theme`, the one it starts in;
+--                 `own`, which of `help quit theme` it has (all three);
+--                 `remember`, `"lines"` to keep commands in the history
+--                 too (`"entries"`); `interrupt`, `"quit"` for Ctrl-C to end
+--                 the prompt (`"drop"`, the entry given up)
+--
+-- An answer that is empty writes nothing, not even a line's end.
 --
 -- **Colour.** A database that has a language server (`lsp!`, declared before
 -- the prompt) is coloured by it: what is typed is given to the server's
@@ -119,7 +133,7 @@ use Std.String as S
 use Std.Char as C
 use Std.Maybe as M
 use Std.Maybe.Maybe.*
-use Std.Console (Console, writeOutput)
+use Std.Console (Console, writeOutput, writeError)
 use Std.Terminal as T
 use Std.Terminal (Key, Event)
 use Std.Terminal.Code.*
@@ -330,32 +344,70 @@ fun sample (theme : Theme) : String =
     ("theme", "[NAME]", "the themes there are, or the one named turned on")
   ]
 
--- A command line's name, without its colon, and the rest of it.
+-- A command line's name, without its colon, and the rest of it: the name
+-- ends at blank space of any kind, a line's end too -- `:t` and an entry on
+-- the lines after it.
 @pub fun commandOf (line : String) : (String, String) =
   let t = S.trim line in
-  let word = V.getOr "" (S.split " " t) 0 in
+  let cs = S.chars t in
+  let ends =
+    M.unwrapOr (V.len cs) (V.find (\i -> C.isSpace (V.getOr ' ' cs i)) (V.range 0 (V.len cs)))
+  in
+  let word = S.fromChars (V.take cs ends) in
   (
     stringSlice word 1 (stringByteLength word),
     S.trim (stringSlice t (stringByteLength word) (stringByteLength t))
   )
 
+-- What entering something answers, a part at a time, in order: what goes to
+-- standard output, and what -- an error -- to standard error. An empty part
+-- writes nothing.
+@derive(Debug, PartialEq)
+@pub data Spoken = ToOut String | ToErr String
+
+-- An `eval` that answers text, as one that answers parts: all of it to
+-- standard output.
+@pub fun saying eval = \t -> [Spoken.ToOut (eval t)]
+
+-- How a prompt goes about what is not an entry: which of its own commands
+-- it has (`own`); what a line that starts with `:` and is no command of its
+-- answers (`unknown`), if not that it is none; whether such lines are kept
+-- in the history as entries are (`remember`); and whether Ctrl-C ends the
+-- prompt rather than giving the entry up (`quitting`).
+@pub def plainManner =
+  { own = ["help", "quit", "theme"], unknown = None, remember = False, quitting = False }
+
 -- Every command a prompt with `commands` has, by name: the language's, then
 -- the prompt's own that the language did not give one of the same name.
-@pub fun commandNames commands : [String] =
+@pub fun commandNames commands : [String] = commandNamesWith commands ["help", "quit", "theme"]
+
+-- The same, of a prompt that has only the commands of its own that are
+-- `own`.
+@pub fun commandNamesWith commands (own : [String]) : [String] =
   let given = V.map (\c -> match c with | (n, _, _, _) -> n) commands in
   V.append
     given
     (V.filter
-       (\n -> not (V.elem n given))
+       (\n -> not (V.elem n given) and V.elem n own)
        (V.map (\c -> match c with | (n, _, _) -> n) ownCommands))
 
 -- What `:help` says: each command, what is written after it, and what it is
 -- for -- the language's first.
-@pub fun helped commands : String =
+@pub fun helped commands : String = helpedWith commands ["help", "quit", "theme"]
+
+-- The same, of a prompt that has only the commands of its own that are
+-- `own`.
+@pub fun helpedWith commands (own : [String]) : String =
   let given = V.map (\c -> match c with | (n, a, about, _) -> (n, a, about)) commands in
   let names = V.map (\c -> match c with | (n, _, _) -> n) given in
   let rows =
-    V.append given (V.filter (\o -> match o with | (n, _, _) -> not (V.elem n names)) ownCommands)
+    V.append
+      given
+      (V.filter
+         (\o ->
+           match o with
+           | (n, _, _) -> not (V.elem n names) and V.elem n own)
+         ownCommands)
   in
   let head =
     \r ->
@@ -866,14 +918,37 @@ fun beginNext pending (text : String) =
 -- are the language's own, each given `db` and the rest of its line; `panes`
 -- the language's panes, those a command opens opened here; `modes` the
 -- prompts a command may enter; and `status` what is shown above each line.
-@pub fun run editorOn (theme : String) (history : String) eval db commands panes modes status =
-  let r = runMode editorOn theme history eval db commands panes modes status in
+-- `eval` answers what is entered a part at a time (`Spoken`; `saying` makes
+-- one of a function that answers text), and `manner` is how the prompt goes
+-- about what is not an entry (`plainManner`).
+@pub fun run
+    editorOn
+    (theme : String)
+    (history : String)
+    eval
+    db
+    commands
+    panes
+    modes
+    status
+    manner =
+  let r = runMode editorOn theme history eval db commands panes modes status manner in
   ()
 
 -- A prompt as `run` runs one, until there are no more entries, or a command
 -- leaves it: what it hands back to the prompt it was entered from, if
 -- anything. What a mode is.
-@pub fun runMode editorOn (theme : String) (history : String) eval db commands panes modes status =
+@pub fun runMode
+    editorOn
+    (theme : String)
+    (history : String)
+    eval
+    db
+    commands
+    panes
+    modes
+    status
+    manner =
   let on = newRef (themeOr theme) in
   let pending = newRef ([], None, "") in
   entering
@@ -888,6 +963,7 @@ fun beginNext pending (text : String) =
       panes,
       modes,
       status,
+      manner,
     }
     (if S.isEmpty history then [] else LE.loadHistory history)
 
@@ -895,10 +971,17 @@ fun beginNext pending (text : String) =
 @pub fun isCommand (text : String) : Bool = S.startsWith ":" (S.trimStart text)
 
 -- An entry evaluated: kept in the history's file, and what `eval` says of
--- it written.
+-- it written, each part where it goes and a line of its own -- an empty
+-- part, nothing at all.
 fun entered (history : String) eval (text : String) =
   let u = if S.isEmpty history then () else LE.saveEntry history text in
-  writeOutput (eval text ++ "\n")
+  V.foldl
+    (\w part ->
+      match part with
+      | Spoken.ToOut s -> if S.isEmpty s then () else writeOutput (s ++ "\n")
+      | Spoken.ToErr s -> if S.isEmpty s then () else writeError (s ++ "\n"))
+    ()
+    (eval text)
 
 -- `p` is the prompt: its editor, the cells it keeps, and what it was given.
 -- What it hands back when it is left, if anything.
@@ -913,7 +996,7 @@ fun entering p (before : [String]) =
      | (first, instead, n) -> (let w = setRef p.pending (first, instead, "") in n))
   in match LE.readEntryFrom p.editor before next with
      | Outcome.Ended -> None
-     | Outcome.Interrupted -> again before
+     | Outcome.Interrupted -> if p.manner.quitting then None else again before
      | Outcome.Entered typed ->
          -- A pane that entered text entered it in place of the line.
          let text =
@@ -921,7 +1004,11 @@ fun entering p (before : [String]) =
             | (first, Just t, n) -> (let w = setRef p.pending (first, None, n) in t)
             | _ -> typed)
          in if S.isEmpty (S.trim text) then again before
-            else if isCommand text then commanded p (V.pushBack before text) text
+            else if isCommand text then
+              (let u =
+                 if p.manner.remember and not (S.isEmpty p.history) then LE.saveEntry p.history text
+                 else ()
+               in commanded p (V.pushBack before text) text)
             else
               -- What the finder's choices on this line bring with them -- a
               -- `use` for a name not in scope -- is run first.
@@ -952,28 +1039,43 @@ fun commanded p (again : [String]) (text : String) =
            | Step.Enter t -> on (entered p.history p.eval t)
            | _ -> on ())
       | None ->
+          let own = p.manner.own in
           match V.find (\c -> match c with | (n, _, _, _) -> n == name) p.commands with
-          | Just (_, _, _, act) ->
-              (match act p.db rest with
-               | Reply.Said said -> on (say said)
-               | Reply.Pages title pages -> on (paged title pages)
-               | Reply.Edit t -> on (beginNext p.pending t)
-               | Reply.Entry entry -> on (entered p.history p.eval entry)
-               | Reply.Leave said -> (let u = say said in None)
-               | Reply.Back t -> Just t
-               | Reply.Mode m arg ->
-                   (match V.find (\x -> fst x == m) p.modes with
-                    | Just (_, enter) ->
-                        (match enter arg with
-                         | Just t -> on (beginNext p.pending t)
-                         | None -> on ())
-                    | None -> on (say "there is no mode `${m}`")))
+          | Just (_, _, _, act) -> replied p again (act p.db rest)
           | None ->
-              if name == "quit" then None
-              else if name == "help" then on (say (helped p.commands))
+              if name == "quit" and V.elem "quit" own then None
+              else if name == "help" and V.elem "help" own then on (say (helpedWith p.commands own))
+              else if name == "theme" and V.elem "theme" own then
+                (match command text (getRef p.on) (commandNamesWith p.commands own) with
+                 | (said, now) -> let u = setRef p.on now in on (say said))
               else
-                match command text (getRef p.on) (commandNames p.commands) with
-                | (said, now) -> let u = setRef p.on now in on (say said)
+                -- No command of the prompt's: the language's to answer, if
+                -- it said it would.
+                match p.manner.unknown with
+                | Just f -> replied p again (f text)
+                | None ->
+                    on
+                      (say
+                         "`:${name}` is not something this prompt does: it has ${S.join ", " (V.map (\n -> "`:${n}`") (commandNamesWith p.commands own))}")
+
+-- What a command answered, done: said, shown, entered, or the prompt left.
+fun replied p (again : [String]) (reply : Reply) =
+  let on = \u -> entering p again in
+  let say = \said -> if S.isEmpty said then () else writeOutput (said ++ "\n") in
+  match reply with
+  | Reply.Said said -> on (say said)
+  | Reply.Pages title pages -> on (paged title pages)
+  | Reply.Edit t -> on (beginNext p.pending t)
+  | Reply.Entry entry -> on (entered p.history p.eval entry)
+  | Reply.Leave said -> (let u = say said in None)
+  | Reply.Back t -> Just t
+  | Reply.Mode m arg ->
+      (match V.find (\x -> fst x == m) p.modes with
+       | Just (_, enter) ->
+           (match enter arg with
+            | Just t -> on (beginNext p.pending t)
+            | None -> on ())
+       | None -> on (say "there is no mode `${m}`"))
 
 -- --- repl! -------------------------------------------------------------------
 
@@ -1013,11 +1115,28 @@ def replCall : Parser Tokens (Bool, String, String, (String, Bool), [ReplFeature
 
 def replFeatures : [String] =
   [
-    "text", "eval", "tree", "errors", "completion", "declarations", "search", "panes", "indent",
-    "commands", "modes", "status", "start", "prompt", "history", "theme"
+    "text", "eval", "answer", "tree", "errors", "completion", "declarations", "search", "panes",
+    "indent", "commands", "unknown", "modes", "status", "start", "prompt", "history", "theme",
+    "own", "remember", "interrupt"
   ]
 
-def replWritten : [String] = ["prompt", "history", "theme"]
+def replWritten : [String] = ["prompt", "history", "theme", "own", "remember", "interrupt"]
+
+-- The prompt's own commands that `own` names: the words of it.
+fun ownNamed (written : String) : [String] =
+  V.filter (\w -> not (S.isEmpty w)) (V.concatMap (S.split " ") (S.split "," written))
+
+-- What is wrong with what a feature written in quotes says, if anything.
+fun writtenWrong (feature : String) (value : String) : Maybe String =
+  if feature == "own" then
+    M.map
+      (\w -> "the prompt has no command `:${w}` of its own: they are `:help`, `:quit` and `:theme`")
+      (V.find (\w -> not (V.elem w ["help", "quit", "theme"])) (ownNamed value))
+  else if feature == "remember" and not (V.elem value ["entries", "lines"]) then
+    Just "`remember` is `\"entries\"`, or `\"lines\"` for commands too"
+  else if feature == "interrupt" and not (V.elem value ["drop", "quit"]) then
+    Just "`interrupt` is `\"drop\"`, what Ctrl-C does to the entry, or `\"quit\"`"
+  else None
 
 @macro
 @pub fun repl (ts : [TokenTree]) : [TokenTree] ! { Expand | e } =
@@ -1037,19 +1156,29 @@ def replWritten : [String] = ["prompt", "history", "theme"]
                   else "`${fst (fst f)}` is text, in quotes")
                  (snd (fst f))]
           | None ->
-              match V.find (\k -> not (V.any (\f -> fst (fst f) == k) fs)) ["text", "eval"] with
-              | Just k ->
-                  [Fail
-                     "a prompt needs `${k}`: ${if k == "text" then "how what is typed is given to the compiler" else "what entering it prints"}"
-                     Nowhere]
+              let has = \k -> V.any (\f -> fst (fst f) == k) fs in
+              match V.find (\f -> M.isSome (writtenWrong (fst (fst f)) (fst (snd f)))) fs with
+              | Just f ->
+                  [Fail (M.unwrapOr "" (writtenWrong (fst (fst f)) (fst (snd f)))) (snd (fst f))]
               | None ->
-                  -- The database's language server, if one is declared: a
-                  -- prompt colours what is typed as it colours a file.
-                  let server =
-                    (match lookupAs (serverOf db) with
-                     | Ok s -> Just s
-                     | Err _ -> None)
-                  in [Code (replCode (if pub then "@pub " else "") name lang db mode server fs)]
+                  if not (has "text") then
+                    [Fail
+                       "a prompt needs `text`: how what is typed is given to the compiler"
+                       Nowhere]
+                  else if not (has "eval" or has "answer") then
+                    [Fail
+                       "a prompt needs `eval`, what entering it prints -- or `answer`, the same a part at a time, to standard output and standard error"
+                       Nowhere]
+                  else if has "eval" and has "answer" then
+                    [Fail "a prompt has `eval` or `answer`, not both: they say the same" Nowhere]
+                  else
+                    -- The database's language server, if one is declared: a
+                    -- prompt colours what is typed as it colours a file.
+                    let server =
+                      (match lookupAs (serverOf db) with
+                       | Ok s -> Just s
+                       | Err _ -> None)
+                    in [Code (replCode (if pub then "@pub " else "") name lang db mode server fs)]
 
 fun replCode pub name lang db (mode : Bool) (server : Maybe String) fs =
   let given = \k -> M.map (\f -> fst (snd f)) (V.find (\f -> fst (fst f) == k) fs) in
@@ -1111,17 +1240,36 @@ fun replCode pub name lang db (mode : Bool) (server : Maybe String) fs =
      | Just f -> "(\\u -> ${f} db 0)"
      | None -> "(\\u -> \"\")")
   in
+  -- How the prompt goes about what is not an entry.
+  let own =
+    "[${S.join ", " (V.map quoted (M.unwrapOr ["help", "quit", "theme"] (M.map ownNamed (given "own"))))}]"
+  in
+  let manner =
+    "{ own = ${own}, unknown = ${match given "unknown" with | Just f -> "Just (\\lingua_l -> ${f} db lingua_l)" | None -> "None"}, remember = ${if given "remember" == Just "lines" then "True" else "False"}, quitting = ${if given "interrupt" == Just "quit" then "True" else "False"} }"
+  in
+  -- What entering an entry answers, a part at a time.
+  let eval =
+    (match given "answer" with
+     | Just f -> "(\\t -> ${setting "t"}${f} db 0))"
+     | None -> "(LinguaRepl.saying (\\t -> ${setting "t"}${fn "eval"} db 0)))")
+  in
   let editorOn =
-    "(\\theme pending -> LinguaRepl.editorFor theme pending ${quoted (M.unwrapOr "> " (given "prompt"))} ${paint} ${tree} ${errors} (\\k -> display k) ${indent} ${completion} ${decls} (LinguaRepl.commandNames ${commands}) ${panes})"
+    "(\\theme pending -> LinguaRepl.editorFor theme pending ${quoted (M.unwrapOr "> " (given "prompt"))} ${paint} ${tree} ${errors} (\\k -> display k) ${indent} ${completion} ${decls} (LinguaRepl.commandNamesWith ${commands} ${own}) ${panes})"
   in
   let rest =
-    "    ${quoted (fn "theme")}\n    ${quoted (fn "history")}\n    (\\t -> ${setting "t"}${fn "eval"} db 0))\n    db\n    ${commands}\n    ${panes}\n    ${modes}\n    ${status}\n"
+    "    ${quoted (fn "theme")}\n    ${quoted (fn "history")}\n    ${eval}\n    db\n    ${commands}\n    ${panes}\n    ${modes}\n    ${status}\n    ${manner}\n"
+  in
+  -- What starting says: a mode's, given its text; the prompt's own, given
+  -- none.
+  let started =
+    \arg ->
+      "  let lingua_said = ${match given "start" with | Just f -> "${f} db ${arg}" | None -> "\"\""} in\n  let lingua_u = if LinguaS.isEmpty lingua_said then () else writeOutput (lingua_said ++ \"\\n\") in\n"
   in
   let body =
     if mode then
-      "-- ${lang}'s mode: a prompt a command enters with a text, until a command of\n-- its own leaves it -- what it hands back, if anything.\n${pub}fun mode${name} db (arg : String) =\n  let lingua_said = ${match given "start" with | Just f -> "${f} db arg" | None -> "\"\""} in\n  let lingua_u = if LinguaS.isEmpty lingua_said then () else writeOutput (lingua_said ++ \"\\n\") in\n  LinguaRepl.runMode\n    ${editorOn}\n${rest}"
+      "-- ${lang}'s mode: a prompt a command enters with a text, until a command of\n-- its own leaves it -- what it hands back, if anything.\n${pub}fun mode${name} db (arg : String) =\n${started "arg"}  LinguaRepl.runMode\n    ${editorOn}\n${rest}"
     else
-      "-- ${lang}'s prompt: entries read and evaluated until there are no more.\n${pub}fun run${name} () =\n  let db = new${db} () in\n  LinguaRepl.run\n    ${editorOn}\n${rest}"
+      "-- ${lang}'s prompt: entries read and evaluated until there are no more.\n${pub}fun run${name} () =\n  let db = new${db} () in\n${started "\"\""}  LinguaRepl.run\n    ${editorOn}\n${rest}"
   in "use Lingua.Repl as LinguaRepl
 use Std.Collections.Vector as LinguaV
 use Std.String as LinguaS
@@ -1439,7 +1587,7 @@ fun library (q : String) : [Hit] =
     snd
       (withOutput (\() ->
          T.withEvents events (\() ->
-           run editorOn "plain" "" (\t -> "ran ${t}") () [] [] [] (\u -> ""))))
+           run editorOn "plain" "" (saying (\t -> "ran ${t}")) () [] [] [] (\u -> "") plainManner)))
   in assertEq
        (S.contains "ran use Std.List as List\nran List.map\n" out)
        True
@@ -1480,7 +1628,17 @@ fun counting (events : [Key]) =
   in snd
        (withOutput (\() ->
           T.withEvents (V.map (\k -> Event.Pressed k) events) (\() ->
-            run editorOn "plain" "" (\t -> "ran ${t}") () [] panes [] (\u -> ""))))
+            run
+              editorOn
+              "plain"
+              ""
+              (saying (\t -> "ran ${t}"))
+              ()
+              []
+              panes
+              []
+              (\u -> "")
+              plainManner)))
 
 @test fun aPaneAKeyOpensPutsWhatItEndsWithOnTheLine () =
   let a =
@@ -1542,7 +1700,17 @@ fun counting (events : [Key]) =
     snd
       (withOutput (\() ->
          T.withEvents events (\() ->
-           run editorOn "plain" "" (\t -> "ran ${t}") () edits [] [] (\u -> ""))))
+           run
+             editorOn
+             "plain"
+             ""
+             (saying (\t -> "ran ${t}"))
+             ()
+             edits
+             []
+             []
+             (\u -> "")
+             plainManner)))
   in assertEq (S.contains "ran 1 + 2 * 3\n" out) True "the text it gave, gone on with and entered"
 
 -- A prompt that is all defaults but its commands, its modes and what it shows
@@ -1577,12 +1745,13 @@ fun counted (arg : String) =
        (plainEditor (commandNames commands))
        "plain"
        ""
-       (\t -> (let u = setRef n (getRef n + 1) in "counted ${t}"))
+       (saying (\t -> (let u = setRef n (getRef n + 1) in "counted ${t}")))
        ()
        commands
        []
        []
        (\u -> "goal: ${arg}, ${show (getRef n)} so far")
+       plainManner
 
 fun inModes (keys : [Key]) =
   let commands = [("count", "GOAL", "count in a mode", \db rest -> Reply.Mode "count" rest)] in
@@ -1594,12 +1763,13 @@ fun inModes (keys : [Key]) =
            (plainEditor (commandNames commands))
            "plain"
            ""
-           (\t -> "ran ${t}")
+           (saying (\t -> "ran ${t}"))
            ()
            commands
            []
            [("count", counted)]
-           (\u -> ""))))
+           (\u -> "")
+           plainManner)))
 
 fun typing (text : String) : [Key] = V.map (\c -> T.key (Character (C.toString c))) (S.chars text)
 
@@ -1757,12 +1927,13 @@ fun irPrompt (keys : [Key]) (lines : [String]) =
         (plainEditor (commandNames irCommands))
         "plain"
         ""
-        (\t -> "ran ${t}")
+        (saying (\t -> "ran ${t}"))
         ()
         irCommands
         []
         []
         (\u -> "")
+        plainManner
   in snd
        (withOutput (\() ->
           if V.isEmpty keys then withoutTerminal lines prompt
@@ -1808,6 +1979,82 @@ fun withoutTerminal (lines : [String]) body =
     (snd
        (withOutput (\() ->
           withoutTerminal [":count", "y"] (\() ->
-            run (plainEditor []) "plain" "" (\t -> "ran ${t}") () [] panes [] (\u -> "")))))
+            run
+              (plainEditor [])
+              "plain"
+              ""
+              (saying (\t -> "ran ${t}"))
+              ()
+              []
+              panes
+              []
+              (\u -> "")
+              plainManner))))
     "ran y\n"
     "and a pane a command opens is not opened at all"
+
+-- A prompt with no terminal, given `lines`, answering each entry `eval`
+-- and going about other lines as `manner` says: what it wrote.
+fun answering (lines : [String]) eval manner =
+  snd
+    (withOutput (\() ->
+       withoutTerminal lines (\() ->
+         run (plainEditor []) "plain" "" eval () [] [] [] (\u -> "") manner)))
+
+@test fun anEmptyAnswerWritesNothing () =
+  assertEq
+    (answering ["use x", "y"] (saying (\t -> if t == "y" then "ran y" else "")) plainManner)
+    "ran y\n"
+    "not even a line's end"
+
+@test fun anAnswersPartsAreWrittenInOrderEachWhereItGoes () =
+  assertEq
+    (answering
+       ["x"]
+       (\t -> [Spoken.ToOut "one", Spoken.ToErr "wrong", Spoken.ToOut "", Spoken.ToOut "two"])
+       plainManner)
+    "one\ntwo\n"
+    "standard output's parts on it, the error on standard error, and the empty part nowhere"
+
+@test fun aLineNoCommandTakesIsTheLanguagesWhereItSaysSo () =
+  let manner =
+    { own = ["quit"], unknown = Just (\l -> Reply.Entry l), remember = False, quitting = False }
+  in
+  let a =
+    assertEq
+      (answering [":x 1", ":theme", ":quit", "after"] (saying (\t -> "ran ${t}")) manner)
+      "ran :x 1\nran :theme\n"
+      "an unknown command and an own one it does not keep, entered; `:quit` kept"
+  in assertEq
+       (answering [":x"] (saying (\t -> "ran ${t}")) plainManner)
+       "`:x` is not something this prompt does: it has `:help`, `:quit`, `:theme`\n"
+       "and where it does not, the line is said to be none"
+
+@test fun ctrlCEndsAPromptThatSaysSo () =
+  let keys = V.concat [typing "1", [T.ctrl "c"], typing "2", [T.key Enter]] in
+  let run =
+    \manner ->
+      snd
+        (withOutput (\() ->
+           T.withEvents (V.map (\k -> Event.Pressed k) keys) (\() ->
+             runMode
+               (plainEditor [])
+               "plain"
+               ""
+               (saying (\t -> "ran ${t}"))
+               ()
+               []
+               []
+               []
+               (\u -> "")
+               manner)))
+  in
+  let a =
+    assertEq (S.contains "ran 2" (run plainManner)) True "the entry given up, and the next entered"
+  in assertEq
+       (S.contains "ran 2" (run { plainManner | quitting = True }))
+       False
+       "or the prompt ended"
+
+@test fun aCommandsNameEndsAtALinesEnd () =
+  assertEq (commandOf ":t\n1 + 2") ("t", "1 + 2") "as at a space"
