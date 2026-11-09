@@ -3156,27 +3156,27 @@ fun kidItemAs
         -- a token -- `CommaItem = tight "," line expr` -- has that token
         -- glued as a separator is: before the comments, and the rest of it
         -- after them.
-        match ruleOf st c with
-        | Just elems ->
-            (match ruledParts st c elems with
-             | (lead, Just (d, opens, closes), trail) ->
-                 if lead != tightly then V.concat [atEnd, ownLine, placed, own]
-                 else
-                   (match firstText d with
-                    | Just (tok, rest) ->
-                        V.concat [
-                          [Parting tightly level],
-                          placed,
-                          [Written level (PP.text tok) none none],
-                          atEnd,
-                          afterIt,
-                          [Written level (droppedLeadingBreak rest) none closes],
-                          (if trail >= 0 then [Parting trail level] else [])
-                        ]
-                    | None -> V.concat [atEnd, ownLine, placed, own])
-             | _ -> V.concat [atEnd, ownLine, placed, own])
-        | None -> V.concat [atEnd, ownLine, placed, own]
-        | None -> V.concat [atEnd, ownLine, placed, own]
+        (match ruleOf st c with
+         | Just elems ->
+             (match ruledParts st c elems with
+              | (lead, Just (d, opens, closes), trail) ->
+                  if lead != tightly then V.concat [atEnd, ownLine, placed, own]
+                  else
+                    (match firstText d with
+                     | Just (tok, rest) ->
+                         V.concat [
+                           [Parting tightly level],
+                           placed,
+                           [Written level (PP.text tok) none none],
+                           atEnd,
+                           afterIt,
+                           [Written level (droppedLeadingBreak rest) none closes],
+                           (if trail >= 0 then [Parting trail level] else [])
+                         ]
+                     | None -> V.concat [atEnd, ownLine, placed, own])
+              | _ -> V.concat [atEnd, ownLine, placed, own])
+         | None -> V.concat [atEnd, ownLine, placed, own])
+  | None -> V.concat [atEnd, ownLine, placed, own]
 
 -- The text `d` begins with, and `d` without it -- where what it begins with
 -- is text, and not a choice or a break.
