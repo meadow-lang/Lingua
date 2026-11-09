@@ -1285,13 +1285,24 @@ fun tieredDoc
 -- Where `c` is in the text, from its first token that is not trivia to its
 -- last: a node left open by the parser keeps the blank space after it, and
 -- what follows does not touch it there.
+-- Each end is walked down to on its own: down both at every node would be
+-- twice the walk a level, and a deep tree too long a walk to finish.
 fun solidRange (st : Style k) (c : Syntax k) : (Int, Int) =
-  if R.isTokenOf c then R.textRange c
+  (solidEnd st (\held -> V.get held 0) fst c, solidEnd st V.last snd c)
+
+-- One end of where `c` is: the end `side` takes of the token `toward` leads
+-- down to.
+fun solidEnd
+    (st : Style k)
+    (toward : [Syntax k] -> Maybe (Syntax k))
+    (side : (Int, Int) -> Int)
+    (c : Syntax k)
+    : Int =
+  if R.isTokenOf c then side (R.textRange c)
   else
-    let held = kidsOf st c in
-    match (V.get held 0, V.last held) with
-    | (Just a, Just b) -> (fst (solidRange st a), snd (solidRange st b))
-    | _ -> R.textRange c
+    match toward (kidsOf st c) with
+    | Just kid -> solidEnd st toward side kid
+    | None -> side (R.textRange c)
 
 -- The text of the first token of `c`, whatever holds it.
 fun firstTokenText (st : Style k) (c : Syntax k) : String =

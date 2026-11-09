@@ -476,6 +476,17 @@ format! {
        "let a = x in\n[bbbbbbbbbb, cccccccccc, dddddddddd]"
        "the binding did not, and the whole does not fit: the body on a line of its own"
 
+@test fun aDeepTreeIsLaidOutInTime () =
+  -- Where each thing is in the text is walked down to at each end. An
+  -- expression is a node around its `let`, and that `let` ends with the
+  -- next: a walk down both ends at every node doubles at each, and forty
+  -- `let`s in each other would never be laid out.
+  let deep = "${S.repeat "let a = x in " 40}a" in
+  assertEq
+    (S.join " " (V.filter (\w -> w != "") (S.split " " (S.join " " (S.split "\n" (chained deep))))))
+    (S.trim deep)
+    "laid out, and the same tokens"
+
 @test fun aChildIsLaidOutAsItsKindSays () =
   let a =
     assertEq
