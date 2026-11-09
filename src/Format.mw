@@ -137,14 +137,16 @@ use Lingua.Red as R
 use Pretty as PP
 use Pretty (Doc)
 
--- What a rule says a node holds: a token, by its text; a child, by the names
+-- What a rule says a node holds: a token, by its text or -- where the
+-- grammar names a kind of token by what it writes in quotes -- its kind; a
+-- child, by the names
 -- of the kinds it may be -- one, or as many as there are; several of those a
 -- level in; several that go on one line or break together -- on one line
 -- only while that line is so many columns at most, for `GroupWithin`;
 -- several whose lines are set in to the column they start at; and, between
 -- them, how they are parted (`Parting`).
 @pub data Elem
-  = Tok String
+  = Tok String [String]
   | Child [String] Bool
   | Indent [Elem]
   | IndentBy Int [Elem]
@@ -197,7 +199,11 @@ def breaking : Int = 6
 def blanking : Int = 7
 
 -- The same, as functions: what `format!` writes a rule with.
-@pub fun tok (t : String) : Elem = Tok t
+@pub fun tok (t : String) : Elem = Tok t []
+
+-- A token the grammar writes as `t`, which the lexer may spell otherwise: any
+-- of `kinds`.
+@pub fun tokOf (t : String) (kinds : [String]) : Elem = Tok t kinds
 
 @pub fun child (kinds : [String]) (many : Bool) : Elem = Child kinds many
 
@@ -517,7 +523,7 @@ fun eitherLeaves (yes : [Elem]) (no : [Elem]) : [Elem] =
       | (_, Just (Separated k b)) -> Separated k b
       | (Just e, _) -> e
       | (None, Just e) -> e
-      | (None, None) -> Tok "")
+      | (None, None) -> Tok "" [])
     (V.range 0 (max (V.len yes) (V.len no)))
 
 -- Each leaf against `kids`, from the first on: which of them it is -- the
@@ -535,8 +541,11 @@ fun matchLeaves (st : Style k) (kids : [Syntax k]) (ls : [Elem]) : [(Int, Int)] 
 
 fun matchOne (st : Style k) (kids : [Syntax k]) (e : Elem) (i : Int) : ((Int, Int), Int) =
   match e with
-  | Tok t ->
-      (match firstFrom (\c -> R.isTokenOf c and R.text c == t) kids i with
+  | Tok t kinds ->
+      (match firstFrom
+         (\c -> R.isTokenOf c and (R.text c == t or V.elem (kindName st c) kinds))
+         kids
+         i with
        | Just j -> ((j, j), j + 1)
        | None -> (absent, i))
   | Chained inner -> matchOne st kids inner i
@@ -558,7 +567,8 @@ fun matchOne (st : Style k) (kids : [Syntax k]) (e : Elem) (i : Int) : ((Int, In
       else (absent, i)
   | _ -> (absent, i)
 
-fun tokensOf (es : [Elem]) : [String] = V.concatMap (\e -> match e with | Tok t -> [t] | _ -> []) es
+fun tokensOf (es : [Elem]) : [String] =
+  V.concatMap (\e -> match e with | Tok t _ -> [t] | _ -> []) es
 
 -- The last of a child that is many, from its node `j` on, with `seps` between
 -- two of them: past each node that `seps` and another node follow, and then
@@ -885,7 +895,7 @@ use Item.*
   match PP.render (widthOf st) (docOf st (R.root g)) with
   -- A text with the mark a break before a comment is written after in it
   -- already is not one whose marks can be told from the text's.
-  | Ok _ if S.contains fresh t -> t
+  | Ok _ if S.contains freshMark t -> t
   | Ok written ->
       let out = freshened written in
       -- A line of nothing but its indent is an empty one, and no line ends
@@ -903,14 +913,14 @@ use Item.*
   | Err _ -> t
 
 -- The mark a `freshing` break is written after: a character of no one's.
-def fresh : String = "\u{e000}"
+def freshMark : String = "\u{e000}"
 
 -- What was written with each `freshing` break made what it should be: a
 -- break where its mark has something before it on its line, and nothing
 -- where its line had nothing on it yet -- what follows the break goes on that
 -- line, where it was begun.
 fun freshened (out : String) : String =
-  if not (S.contains fresh out) then out
+  if not (S.contains freshMark out) then out
   else
     let done =
       V.foldl
@@ -918,10 +928,11 @@ fun freshened (out : String) : String =
           match acc with
           | (kept, carry) ->
               let line = (match carry with | Just p -> p ++ S.trimStart l | None -> l) in
-              if S.endsWith fresh line then
-                (let before = stringSlice line 0 (stringByteLength line - stringByteLength fresh) in
-                 if S.isEmpty (S.trim before) then (kept, Just before)
-                 else (V.pushBack kept before, None))
+              if S.endsWith freshMark line then
+                (let before =
+                   stringSlice line 0 (stringByteLength line - stringByteLength freshMark)
+                 in if S.isEmpty (S.trim before) then (kept, Just before)
+                    else (V.pushBack kept before, None))
               else (V.pushBack kept line, None))
         ([], None)
         (S.split "\n" out)
@@ -2103,7 +2114,7 @@ fun itemsOf
                       (V.find
                          (\i ->
                            match V.get (leaves yes) i with
-                           | Just (Tok _) -> False
+                           | Just (Tok _ _) -> False
                            | _ -> True)
                          (V.range 0 (V.len (leaves yes))))
                   in
@@ -2441,7 +2452,7 @@ fun separatedItems
              match acc with
              | (out, left) ->
                  (match e with
-                  | Tok _ ->
+                  | Tok _ _ ->
                       (match V.get left 0 with
                        | Just j ->
                            (V.append out (kidItem st all places kids level j), V.drop left 1)
@@ -2825,7 +2836,7 @@ fun partingDoc (strength : Int) : Doc () =
   -- break is written, after a mark that takes no room, and once the whole
   -- is written the mark says whether there was anything before it
   -- (`freshened`).
-  else if strength == freshing then PP.append (Doc.RenderLen 0 fresh) PP.hardline
+  else if strength == freshing then PP.append (Doc.RenderLen 0 freshMark) PP.hardline
   else if strength == lining then PP.line
   else if strength == breaking then PP.hardline
   else PP.append PP.hardline PP.hardline
@@ -3128,7 +3139,15 @@ def formatCall : Parser Tokens FormatCall =
               (match keeping with
                | AsTables ->
                    [Fail "${fst grammar} is kept as tables: a formatter is of a tree" (snd grammar)]
-               | AsTrees _ trivia tokenFields ->
+               | AsTrees _ trivia fields spellings ->
+                   -- The grammar's quoted tokens ride with its token fields, as
+                   -- fields of no rule: `"interp_start"`, of kind
+                   -- `TokenInterpStart`.
+                   let tokenFields =
+                     V.append
+                       fields
+                       (V.map (\sp -> TokenField.TokenField "" (fst sp) [snd sp]) spellings)
+                   in
                    let prods = V.concatMap (\s -> match s with | Sort _ ps -> ps) sorts in
                    let done = V.map (\r -> ruleCode sorts prods tokenFields r) rules in
                    match V.find (\d -> match d with | Err _ -> True | Ok _ -> False) done with
@@ -3255,7 +3274,15 @@ fun elemCode sorts tokenFields rule fs (names : [String]) (w : Written)
       | Ok code -> Ok (make code)
       | Err failed -> Err failed
   in match w with
-     | WTok t -> Ok "LinguaF.tok ${quote t}"
+     | WTok t ->
+         -- A token the grammar names a kind of token by, as that kind too: its
+         -- text may be any the lexer reads as one.
+         (match V.find
+            (\tf -> match tf with | TokenField r f _ -> r == "" and f == t)
+            tokenFields with
+          | Just (TokenField _ _ kinds) ->
+              Ok "LinguaF.tokOf ${quote t} [${S.join ", " (V.map quote kinds)}]"
+          | None -> Ok "LinguaF.tok ${quote t}")
      | WMark m -> Ok "LinguaF.${m}"
      | WGroup inner -> inside inner (\code -> "LinguaF.grouped ${code}")
      | WGroupWithin n inner -> inside inner (\code -> "LinguaF.groupedWithin ${show n} ${code}")

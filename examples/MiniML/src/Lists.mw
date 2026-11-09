@@ -41,6 +41,7 @@ use Std.Test (assertEq)
   | @token("@") At
   | @token("(") LParen
   | @token(")") RParen
+  | @token("?") Quest
   | @regex("[a-z0-9]+") Name String
 
 syntax! {
@@ -75,13 +76,15 @@ syntax! {
     "@" = At,
     "(" = LParen,
     ")" = RParen,
+    "?" = Quest,
     "name" = Name _
   }
   grammar {
     File = items:Expr*
     Expr = first:Term rest:Tail*
     Tail = op:("+" | "*" | "==") operand:Term
-    Term = List | LetE | MatchE | IfE | Tagged | Call | LamE | Paren | Vec | Mac | Var
+    Term = List | LetE | MatchE | IfE | Tagged | Call | LamE | Paren | Vec | Mac | Hole | Var
+    Hole = "?" "name"
     Vec = "<" body:VecBody? ">"
     VecBody = first:Expr tail:VecItem*
     VecItem = "," expr:Expr?
@@ -856,3 +859,17 @@ format! {
     (LinguaF.layoutUnchecked linguaLevel_style (fst (parseLists "@a(b)\n-- c\n[x]")))
     "@a(b)\n     -- c\n     [x]"
     "a line of its own, though the line before ends where a line just begun would"
+
+-- A token the grammar names by what it is, not by how it is spelled.
+format! {
+  Spelled for Lists
+  indent 2
+  width 40
+    | Hole = "?" tight "name"
+}
+
+@test fun aTokenTheGrammarNamesIsFoundByItsKind () =
+  assertEq
+    (formatSpelled (fst (parseLists "? x")))
+    "?x"
+    "`\"name\"` is any name, though no name is spelled `name`"

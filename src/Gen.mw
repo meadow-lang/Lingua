@@ -1819,7 +1819,11 @@ fun grammarLang spec : Lang =
        (V.append enumSorts loners)
        spec.name
        []
-       (AsTrees tokenKinds trivia tokenFieldsOf)
+       (AsTrees
+          tokenKinds
+          trivia
+          tokenFieldsOf
+          (V.map (\e -> (tokName e, "Token${entryKind spec e}")) spec.tokens))
        []
 
 -- The production of rule `r`: an enum inside an enum is a production holding

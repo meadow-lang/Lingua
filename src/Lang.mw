@@ -46,11 +46,12 @@ use Keeping.*
 -- How a language's programs are kept: as tables -- a node a row -- or as
 -- trees, a node a node of a lossless tree whose kinds are the language's own.
 -- A tree language knows the kinds of token its trees hold, which of them are
--- trivia, and which a token field reads.
+-- trivia, which a token field reads, and which kind each token the grammar
+-- writes in quotes is: `"(" = LParen`, `"interp_start" = InterpStart _`.
 @derive(Reflect, PartialEq)
 @pub data Keeping
   = AsTables
-  | AsTrees [String] [String] [TokenField]
+  | AsTrees [String] [String] [TokenField] [(String, String)]
 
 -- A language: its name, the sort a whole program is, its sorts, -- when it
 -- was read off a grammar -- which grammar, the type parameters its types take
@@ -84,23 +85,23 @@ use Keeping.*
 -- Whether a language's programs are trees.
 @pub fun isTreeLang (l : Lang) : Bool =
   match langKeeping l with
-  | AsTrees _ _ _ -> True
+  | AsTrees _ _ _ _ -> True
   | AsTables -> False
 
 -- A tree language's kinds of token, its trivia's, and its token fields'.
 @pub fun treeTokens (l : Lang) : [String] =
   match langKeeping l with
-  | AsTrees ts _ _ -> ts
+  | AsTrees ts _ _ _ -> ts
   | AsTables -> []
 
 @pub fun treeTrivia (l : Lang) : [String] =
   match langKeeping l with
-  | AsTrees _ tv _ -> tv
+  | AsTrees _ tv _ _ -> tv
   | AsTables -> []
 
 @pub fun tokenFields (l : Lang) : [TokenField] =
   match langKeeping l with
-  | AsTrees _ _ fs -> fs
+  | AsTrees _ _ fs _ -> fs
   | AsTables -> []
 
 @pub fun sortName (s : Sort) : String = match s with | Sort n _ -> n
@@ -402,7 +403,11 @@ use Std.Test (assertEq)
       [Sort "Expr" [Prod "Lit" [Field "value" (TPrim "String") "" False]]]
       "Core"
       ["s"]
-      (AsTrees ["TokenInt"] ["TokenSpace"] [TokenField.TokenField "Lit" "value" ["TokenInt"]])
+      (AsTrees
+         ["TokenInt"]
+         ["TokenSpace"]
+         [TokenField.TokenField "Lit" "value" ["TokenInt"]]
+         [("int", "TokenInt")])
       ["In"]
   in assertEq (fromDatum (toDatum l)) (Ok l) "the same language back"
 
