@@ -29,6 +29,8 @@
 --   newline     a line's end, always: its group, and every one around it,
 --               breaks
 --   tight       nothing: two things with no space between
+--   kept        `line` where the text had blank space between the two
+--               things, `tight` where it had none
 --   items("," line)
 --               a child that is many, with its separators between two of
 --               its nodes -- each token the one the tree has there -- and
@@ -96,6 +98,7 @@ use Std.Collections.Vector as V
 use Std.Collections.HashMap as HashMap
 use Std.Collections.HashMap (HashMap)
 use Std.String as S
+use Std.Char as C
 use Std.Maybe as M
 use Std.Maybe.Maybe.*
 use Std.Sort (sortOn)
@@ -123,6 +126,7 @@ use Pretty (Doc)
   | Separated [String] [Elem]
   | Breaks Int Int
   | Mark Int
+  | Kept
   | NoGroup
 
 use Elem.*
@@ -172,12 +176,17 @@ def blanking : Int = 4
 
 @pub def newline : Elem = Mark breaking
 
+-- A space, or a break where its group breaks, where the text had blank space
+-- there; nothing where it had none: two things that touch stay touching, and
+-- two apart stay apart.
+@pub def kept : Elem = Kept
+
 -- A formatter: how wide a level is, how wide a line may be -- 0 for one that
 -- only indents -- what a kind is called, which kinds are trivia, the rules,
--- each under the name of its node's kind, and -- while it lays a text out --
--- that text.
+-- each under the name of its node's kind, the texts that keep a node as it
+-- was written, and -- while it lays a text out -- that text.
 @pub data Style k
-  = Style Int Int (k -> String) (k -> Bool) (HashMap String [Elem]) String
+  = Style Int Int (k -> String) (k -> Bool) (HashMap String [Elem]) [String] String
 
 @pub fun style
     (unit : Int)
@@ -192,22 +201,53 @@ def blanking : Int = 4
     name
     trivia
     (V.foldl (\m r -> HashMap.insert (fst r) (snd r) m) HashMap.empty rules)
+    []
     ""
 
-fun unitOf st = match st with | Style u _ _ _ _ _ -> u
-fun widthOf st = match st with | Style _ w _ _ _ _ -> w
-fun nameOf st = match st with | Style _ _ n _ _ _ -> n
-fun triviaOf st = match st with | Style _ _ _ t _ _ -> t
-fun rulesOf st = match st with | Style _ _ _ _ r _ -> r
-fun sourceOf st = match st with | Style _ _ _ _ _ t -> t
+fun unitOf st = match st with | Style u _ _ _ _ _ _ -> u
+fun widthOf st = match st with | Style _ w _ _ _ _ _ -> w
+fun nameOf st = match st with | Style _ _ n _ _ _ _ -> n
+fun triviaOf st = match st with | Style _ _ _ t _ _ _ -> t
+fun rulesOf st = match st with | Style _ _ _ _ r _ _ -> r
+fun skipsOf st = match st with | Style _ _ _ _ _ k _ -> k
+fun sourceOf st = match st with | Style _ _ _ _ _ _ t -> t
 
 fun reading (st : Style k) (t : String) : Style k =
-  match st with | Style u w n tr r _ -> Style u w n tr r t
+  match st with | Style u w n tr r k _ -> Style u w n tr r k t
 
 -- The same formatter `width` columns wide -- 0 for one that only indents.
 @pub fun within (st : Style k) (width : Int) : Style k =
   match st with
-  | Style u _ n tr r t -> Style u (max 0 width) n tr r t
+  | Style u _ n tr r k t -> Style u (max 0 width) n tr r k t
+
+-- The same formatter, keeping as it was written any node that has a child
+-- reading as one of `texts`, blank space aside: an attribute such as
+-- `@fmt(skip)`, on the declaration it is written before.
+@pub fun skipping (st : Style k) (texts : [String]) : Style k =
+  match st with
+  | Style u w n tr r k t -> Style u w n tr r (V.append k (V.map squeezed texts)) t
+
+-- `t` without its blank space.
+fun squeezed (t : String) : String =
+  S.fromChars (V.filter (\c -> not (V.elem (C.code c) [32, 10, 9, 13])) (S.chars t))
+
+-- Whether `s` is kept as it was written: a child of it reads as one of the
+-- formatter's texts that do that. A child much longer than any of them is not
+-- read.
+fun skipped (st : Style k) (s : Syntax k) : Bool =
+  let texts = skipsOf st in
+  if V.isEmpty texts or R.isTokenOf s then False
+  else
+    let longest = V.foldl (\m t -> max m (stringByteLength t)) 0 texts in
+    V.any
+      (\c ->
+        let r = R.textRange c in
+        snd r - fst r <= 4 * longest + 16 and V.elem (squeezed (R.text c)) texts)
+      (kidsOf st s)
+
+-- The rule a node is laid out by: none, for one that is kept as it was.
+fun ruleOf (st : Style k) (s : Syntax k) : Maybe [Elem] =
+  if skipped st s then None else HashMap.lookup (kindName st s) (rulesOf st)
 
 -- The tree's text as `st` sets it out `width` columns wide: laid out, or --
 -- with a width of 0 -- every line set in, and broken where it was.
@@ -236,6 +276,7 @@ fun leaves (es : [Elem]) : [Elem] =
       | Align inner -> leaves inner
       | Breaks _ _ -> []
       | Mark _ -> []
+      | Kept -> []
       | NoGroup -> []
       | other -> [other])
     es
@@ -341,6 +382,7 @@ fun indentSpans (unit : Int) (es : [Elem]) (from : Int) : [(Int, Int, Int)] =
                  | Align inner -> through out at inner
                  | Breaks _ _ -> (out, at)
                  | Mark _ -> (out, at)
+                 | Kept -> (out, at)
                  | NoGroup -> (out, at)
                  | _ -> (out, at + 1)))
           ([], from)
@@ -459,6 +501,19 @@ fun levels (starts : [Int]) (open : [Region]) : Int =
 -- The tree's text, each line set in as the rules say, and broken where it was.
 @pub fun reindent (st : Style k) (g : Green k) : String =
   let t = G.text g in
+  -- Where each node kept as it was is: a line that starts inside one is left
+  -- as it is.
+  let kept =
+    if V.isEmpty (skipsOf st) then []
+    else
+      V.concatMap
+        (\i ->
+          if G.isTokenAt g i then []
+          else
+            let s = R.Syntax g i in
+            if skipped st s then [R.textRange s] else [])
+        (V.range 0 (G.slots g))
+  in
   let starts = lineStarts t in
   let all = regions st g in
   let total = stringByteLength t in
@@ -480,7 +535,8 @@ fun levels (starts : [Int]) (open : [Region]) : Int =
           let open2 = V.append (V.filter (\r -> regionEnd r > at) open) entered in
           let line =
             (if at >= stop then ""
-             else if insideToken g from then stringSlice t from stop
+             else if insideToken g from or V.any (\k -> fst k < from and from < snd k) kept then
+               stringSlice t from stop
              else
                let counted = V.filter (\r -> lineOf starts (regionOwner r) < l) open2 in
                S.repeat " " (levels starts counted) ++ stringSlice t at stop)
@@ -571,7 +627,7 @@ use Item.*
 fun docOf (st : Style k) (s : Syntax k) : Doc () =
   if R.isTokenOf s then PP.text (R.text s)
   else
-    match HashMap.lookup (kindName st s) (rulesOf st) with
+    match ruleOf st s with
     | Just elems -> ruledDoc st s elems
     | None -> writtenDoc st s
 
@@ -604,6 +660,21 @@ fun writtenDoc (st : Style k) (s : Syntax k) : Doc () =
 -- ends with: how many, for what holds it to write as a parting, and whether a
 -- rule asked for them.
 fun writtenParts (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
+  if skipped st s then verbatim st s else writtenAsIs st s
+
+-- A node kept as it was written: its text from its first thing that is not
+-- blank space to its last, each line as it was -- and, if that ends with a
+-- comment, a break after it.
+fun verbatim (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
+  let all = R.children s in
+  let solid = V.filter (\c -> not (S.isEmpty (S.trim (R.text c)))) all in
+  match (V.get solid 0, V.last solid) with
+  | (Just first, Just last) ->
+      let text = stringSlice (sourceOf st) (fst (R.textRange first)) (snd (R.textRange last)) in
+      (PP.text text, (if (triviaOf st) (R.kindOf last) then 1 else 0), False)
+  | _ -> (PP.nil, 0, False)
+
+fun writtenAsIs (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
   let all = R.children s in
   let base = indentOfLine (sourceOf st) (R.offset s) in
   let blank = \c -> (triviaOf st) (R.kindOf c) and S.isEmpty (S.trim (R.text c)) in
@@ -692,7 +763,7 @@ fun writtenParts (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
                  else if R.isTokenOf c then
                    (if S.isEmpty (R.text c) then w else put w 0 (PP.text (R.text c)))
                  else
-                   match HashMap.lookup (kindName st c) (rulesOf st) with
+                   match ruleOf st c with
                    | None ->
                        (match writtenParts st c with
                         | (d, n, a) -> (let after = put w 0 d in { after | owed = n, asked = a }))
@@ -998,6 +1069,7 @@ fun itemsOf
          | (out, at, done) ->
              (match e with
               | Mark strength -> (V.pushBack out (Parting strength level), at, done)
+              | Kept -> (V.pushBack out (Parting (keptAt st kids found at done) level), at, done)
               | NoGroup -> acc
               | Breaks _ _ -> acc
               | Indent inner -> enclosed out at done inner (level + unitOf st)
@@ -1072,6 +1144,27 @@ fun separatedItems
                else if j < snd r then parted (j + 1) (snd r + 1) True
                else []))
           (V.range 0 (V.len nodes)))
+
+-- What `kept` before leaf `at` is: a space, or a break where its group
+-- breaks, if the text had blank space before the next thing the rule names
+-- -- or, with nothing named after it, after the last thing written -- and
+-- nothing if it had none.
+fun keptAt (st : Style k) (kids : [Syntax k]) (found : [(Int, Int)]) (at : Int) (done : Int) : Int =
+  let t = sourceOf st in
+  let blankAt =
+    \i ->
+      i >= 0 and i < stringByteLength t and V.elem (stringSlice t i (i + 1)) [" ", "\n", "\t", "\r"]
+  in
+  let next = V.find (\i -> present (V.getOr absent found i)) (V.range at (V.len found)) in
+  match next with
+  | Just i ->
+      (match V.get kids (fst (V.getOr absent found i)) with
+       | Just c -> if blankAt (fst (R.textRange c) - 1) then lining else tightly
+       | None -> lining)
+  | None ->
+      (match V.get kids done with
+       | Just c -> if blankAt (snd (R.textRange c)) then lining else tightly
+       | None -> lining)
 
 -- Whether the text between child `j` and the one before it has a blank line.
 fun blankBefore (all : [Syntax k]) (places : [Int]) (j : Int) : Bool =
@@ -1155,7 +1248,7 @@ fun kidItem
            (if S.isEmpty (R.text c) then onlyComments
             else [Written level (commented (PP.text (R.text c))) none none])
          else
-           match HashMap.lookup (kindName st c) (rulesOf st) with
+           match ruleOf st c with
            | None ->
                (match writtenParts st c with
                 | (d, n, _) ->
@@ -1243,7 +1336,7 @@ use Std.Macro (TokenTree, Delim, Loc, isPunct, lookupAs)
 use Std.Macro.TokenTree.*
 use Std.Macro.Loc.*
 use Std.Macro.Delim.*
-use Std.Macro.Parse (Tokens, parseTokens, ident, keyword, punct, number, treesUntil)
+use Std.Macro.Parse (Tokens, parseTokens, ident, keyword, punct, number, stringLit, treesUntil)
 use Std.String.Parse as P
 use Std.String.Parse (Parser)
 use Std.String.Parse (keep, skip)
@@ -1278,7 +1371,7 @@ use Written.*
 -- `indent`, `group` and `align` before parentheses -- or `indent` and
 -- `group` before a number and parentheses -- are what they say; anywhere else
 -- they are a child's name. The partings are words of their own.
-def partings : [String] = ["tight", "cut", "line", "newline"]
+def partings : [String] = ["tight", "cut", "line", "newline", "kept"]
 
 fun writtenOf (ts : [TokenTree]) : [Written] = writing ts 0 []
 
@@ -1333,23 +1426,25 @@ type FormatRule = ((String, Loc), [TokenTree])
 
 -- A call: whether it is public, its name, the grammar's, how wide a level
 -- and a line are, and the rules.
-type FormatCall = (Bool, String, (String, Loc), Maybe Int, Maybe Int, [FormatRule])
+type FormatCall = (Bool, String, (String, Loc), Maybe Int, Maybe Int, [String], [FormatRule])
 
 def formatCall : Parser Tokens FormatCall =
-  P.pure (\pub name grammar unit width rules -> (M.isSome pub, name, grammar, unit, width, rules))
+  P.pure (\pub name grammar unit width skips rules ->
+    (M.isSome pub, name, grammar, unit, width, skips, rules))
     |> keep (P.optional (keyword "pub"))
     |> keep ident
     |> skip (keyword "for")
     |> keep named
     |> keep (P.optional (P.skipThen (keyword "indent") number))
     |> keep (P.optional (P.skipThen (keyword "width") number))
+    |> keep (P.many (P.skipThen (keyword "skip") stringLit))
     |> keep (P.many formatRule)
 
 @macro
 @pub fun format (ts : [TokenTree]) : [TokenTree] ! { Expand | e } =
   match parseTokens formatCall ts with
   | Err failed -> failed
-  | Ok (pub, name, grammar, unit, width, rules) ->
+  | Ok (pub, name, grammar, unit, width, skips, rules) ->
       match lookupAs (fst grammar) with
       | Err _ ->
           [Fail
@@ -1373,6 +1468,7 @@ def formatCall : Parser Tokens FormatCall =
                          (fst grammar)
                          (M.unwrapOr 2 unit)
                          (M.unwrapOr 0 width)
+                         skips
                          trivia
                          (V.concatMap (\d -> match d with | Ok c -> [c] | Err _ -> []) done))
 
@@ -1592,7 +1688,15 @@ fun quote (s : String) : String =
          (V.range 0 (stringByteLength s)))
     ++ "\""
 
-fun formatCode pub name grammar (unit : Int) (width : Int) (trivia : [String]) (rules : [String])
+fun formatCode
+    pub
+    name
+    grammar
+    (unit : Int)
+    (width : Int)
+    (skips : [String])
+    (trivia : [String])
+    (rules : [String])
     : [TokenTree] =
   -- What the lexer skipped -- blank space before the first token, say --
   -- the parser keeps as `Unknown`, and trivia.
@@ -1603,7 +1707,7 @@ use Std.Collections.Vector as LinguaV
 
 -- `${name}`: how a ${grammar} tree is set out.
 def lingua${name}_style =
-  LinguaF.style ${show unit} ${show width} (\\k -> show k) (\\k -> match k with${isTrivia} | _ -> False) [${S.join ", " rules}]
+  LinguaF.skipping (LinguaF.style ${show unit} ${show width} (\\k -> show k) (\\k -> match k with${isTrivia} | _ -> False) [${S.join ", " rules}]) [${S.join ", " (V.map quote skips)}]
 
 -- The tree's text as `${name}` sets it out: ${if width > 0 then "laid out within ${show width} columns" else "every line set in, and broken where it was"}.
 ${pub}fun format${name} g = LinguaF.${if width > 0 then "layout" else "reindent"} lingua${name}_style g
