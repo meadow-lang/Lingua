@@ -1844,46 +1844,6 @@ fun entryDocAs
                                or M.map (firstTokenText st) (V.get inner 1) == Just "\\")))
                 | None -> False)
            in
-           -- A word the language spells out, which no name is: `if`, `then`.
-           -- Taken, as an editor's colours take it, from a token of letters
-           -- whose kind is no name's.
-           let keyword =
-             \j ->
-               (match V.get kids j with
-                | Just c ->
-                    -- A tree of one token is that token.
-                    let tok =
-                      (if R.isTokenOf c then Just c
-                       else
-                         let held = kidsOf st c in
-                         if V.len held != 1 then None
-                         else
-                           M.andThen
-                             (\one -> if R.isTokenOf one then Just one else None)
-                             (V.get held 0))
-                    in (match tok with
-                        | Just k ->
-                            (let x = S.trim (R.text k) in
-                             not (S.isEmpty x)
-                               and V.all (\ch -> C.isAlpha ch or ch == '_') (S.chars x))
-                              and not
-                                (V.any (\w -> S.contains w (kindName st k)) [
-                                   "Ident",
-                                   "Name",
-                                   "Lower",
-                                   "Upper",
-                                   "Var"
-                                 ])
-                        | None -> False)
-                | None -> False)
-           in
-           -- An entry with a run of things that begins with such a word is no
-           -- application -- `if x then y` -- and its things are as the text
-           -- spaced them. A word inside a run is a word: `with Members` in a
-           -- macro's own language.
-           let worded =
-             V.any (\j -> keyword j and (j == from or isOp (j - 1))) (V.range from (b + 1))
-           in
            -- One more thing in a run of them: `d` so far, and whether it is
            -- an application already made, with what it ends with hugged.
            let onto =
@@ -1894,18 +1854,7 @@ fun entryDocAs
                     -- and what touches it -- is set in from that line as
                     -- anything on it is, not a step in.
                     let back = PP.nest (0 - unitOf st) (docAt j) in
-                    if worded then
-                      (
-                        PP.append
-                          d
-                          (PP.append
-                             (if j == from or isOp (j - 1) or not (spaced j) then PP.nil
-                              else PP.space)
-                             (docAt j)),
-                        True,
-                        False
-                      )
-                    else if j == from or isOp (j - 1) then (PP.append d back, made, False)
+                    if j == from or isOp (j - 1) then (PP.append d back, made, False)
                     else if not (spaced j) then
                       (PP.append d (if lined then docAt j else back), made, lined)
                     else if (j == b or isOp (j + 1)) and bracket j then
