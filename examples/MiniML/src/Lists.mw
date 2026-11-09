@@ -269,7 +269,7 @@ format! {
   indent 2
   width 40
   reparse "|" parseListsArm else parseListsExpr
-    | Arm = "|" pat "->" indent(line body)
+    | Arm = line "|" pat "->" indent(line body)
     | Expr = first indent(rest)
     | Tail = line op operand
     | Brace =
