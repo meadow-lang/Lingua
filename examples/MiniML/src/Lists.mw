@@ -6,6 +6,7 @@
 
 use Scythe (lexer!)
 use Lingua (syntax!, format!)
+use Lingua.Green as LinguaG
 use Std.Collections.Vector as V
 use Std.String as S
 use Std.Test (assertEq)
@@ -802,3 +803,31 @@ format! {
        (bodied "mac {\nx = y\nz = w\n}")
        "mac {\n  x = y\n  z = w\n}"
        "and what does not read as the language, by its tokens"
+
+-- A file whose items have nothing written between them: as the text had them.
+format! {
+  Joiner for Lists
+  indent 2
+  width 40
+    | File = items
+}
+
+@test fun whatTheTextKeptApartStaysApart () =
+  assertEq
+    (formatJoiner (fst (parseLists "(a, b c)")))
+    "(a, b c)"
+    "a node left open keeps the space after it, which is not where the next thing touches it"
+
+-- What follows an attribute set in further than the attribute ends.
+format! {
+  Deep for Lists
+  indent 2
+  width 40
+    | Tagged = attr indent 8(expr)
+}
+
+@test fun aCommentNeverTouchesWhatIsBeforeIt () =
+  assertEq
+    (formatDeep (fst (parseLists "@a(b)\n-- c\n[x]")))
+    "@a(b)\n        -- c\n        [x]"
+    "a line of its own, though the line before ends short of where it is set in"

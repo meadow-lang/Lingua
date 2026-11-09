@@ -1282,6 +1282,17 @@ fun tieredDoc
 
 -- `lead` and `parts` split at the loosest tier among them, each part split in
 -- turn, each a group.
+-- Where `c` is in the text, from its first token that is not trivia to its
+-- last: a node left open by the parser keeps the blank space after it, and
+-- what follows does not touch it there.
+fun solidRange (st : Style k) (c : Syntax k) : (Int, Int) =
+  if R.isTokenOf c then R.textRange c
+  else
+    let held = kidsOf st c in
+    match (V.get held 0, V.last held) with
+    | (Just a, Just b) -> (fst (solidRange st a), snd (solidRange st b))
+    | _ -> R.textRange c
+
 -- The text of the first token of `c`, whatever holds it.
 fun firstTokenText (st : Style k) (c : Syntax k) : String =
   if R.isTokenOf c then S.trim (R.text c)
@@ -2101,7 +2112,7 @@ fun itemsOf
                     in
                     let place =
                       (match (V.get kids (fst r), V.get kids (snd r)) with
-                       | (Just a, Just b) -> [Pos (fst (R.textRange a)) (snd (R.textRange b))]
+                       | (Just a, Just b) -> [Pos (fst (solidRange st a)) (snd (solidRange st b))]
                        | _ -> [])
                     in (
                          V.concat [
@@ -2200,7 +2211,7 @@ fun itemsOf
                               let place =
                                 (match (V.get kids (fst rh), V.get kids last) with
                                  | (Just a, Just b) ->
-                                     [Pos (fst (R.textRange a)) (snd (R.textRange b))]
+                                     [Pos (fst (solidRange st a)) (snd (solidRange st b))]
                                  | _ -> [])
                               in (
                                    V.concat [out, place, [Written level d (0 - 1) (0 - 1)]],
@@ -2211,11 +2222,30 @@ fun itemsOf
                   let r = V.getOr absent found at in
                   if not (present r) then (out, at + 1, done)
                   else
-                    let skipped =
-                      V.concatMap
-                        (\j -> kidItem st all places kids level j)
-                        (V.range (done + 1) (fst r))
+                    -- What the rule did not name -- what the parser could not
+                    -- place -- is parted from what is before it as the text
+                    -- had them: the partings the rule asked for before this
+                    -- leaf are this leaf's, and go after it. A `tight` meant
+                    -- for a `}` would otherwise join two words the text kept
+                    -- apart, and make one of them.
+                    let unplaced = V.range (done + 1) (fst r) in
+                    let held = V.len (V.takeWhile isParting (V.reverse out)) in
+                    let before =
+                      if V.isEmpty unplaced then out else V.take out (V.len out - held)
                     in
+                    let asked = if V.isEmpty unplaced then [] else V.drop out (V.len out - held) in
+                    let skipped =
+                      V.concat [
+                        V.concatMap
+                          (\j ->
+                            V.append
+                              [Parting (partingOfGap (gapBetween st kids (j - 1) j)) level]
+                              (kidItem st all places kids level j))
+                          unplaced,
+                        asked
+                      ]
+                    in
+                    let out = before in
                     -- Each node of the child, laid out with its place marked as
                     -- `mark` marks it.
                     let marked =
@@ -2644,7 +2674,7 @@ fun kidItem
   let placed =
     (match V.get kids j with
      | Just c ->
-         let r = R.textRange c in
+         let r = solidRange st c in
          if snd r > fst r then [Pos (fst r) (snd r)] else []
      | None -> [])
   in
@@ -2748,8 +2778,10 @@ fun partingDoc (strength : Int) : Doc () =
   else if strength == filling then PP.softline
   -- A break, unless the line it would end has nothing on it yet -- a break
   -- just written, in a group's own parting that a rule's items cannot see.
+  -- A line just begun is where the indent is: one further in than where it
+  -- ends, after a pattern that broke, is no line just begun.
   else if strength == freshing then
-    PP.column (\c -> PP.nesting (\i -> if c <= i then PP.nil else PP.hardline))
+    PP.column (\c -> PP.nesting (\i -> if c == i then PP.nil else PP.hardline))
   else if strength == lining then PP.line
   else if strength == breaking then PP.hardline
   else PP.append PP.hardline PP.hardline
