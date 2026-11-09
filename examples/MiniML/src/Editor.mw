@@ -7,7 +7,7 @@ use Lingua (lsp!, repl!, mcp!)
 use Lingua.Mcp as Mcp
 use Lingua.Green (Green)
 use Lingua.Repl (Reply)
-use Lingua.Lsp (Asked, positionIn, pathOf)
+use Lingua.Lsp (Asked, positionIn, pathOf, newName, requestFailed)
 use Std.Json as J
 use Std.String as S
 use Lingua.Red (Syntax)
@@ -38,6 +38,8 @@ lsp! {
     | format = formattedOf
     | resolved = resolvedOf
     | requests = serverRequests
+    | refuse = refusalOf
+    | notifications = serverNotifications
 }
 
 -- What MiniML's server answers itself: a request of its own, for what the
@@ -49,6 +51,32 @@ def serverRequests =
     ("miniml/place", \db (a : Asked) -> J.jString (answered "" (\() -> sessionPlace db a.file))),
     ("textDocument/inlayHint", hintsOf)
   ]
+
+-- What MiniML's server will not do: make a name what no name can be.
+fun refusalOf db (a : Asked) : Maybe (Int, String) =
+  if a.method != "textDocument/rename" then None
+  else
+    let name = newName a.params in
+    if isName name then None else Just (requestFailed, "`${name}` is not a name")
+
+fun isName (s : String) : Bool =
+  match V.get (S.chars s) 0 with
+  | Just c ->
+      (C.isLower c or c == '_')
+        and V.all (\x -> C.isAlphaNum x or x == '_' or x == '\'') (S.chars s)
+  | None -> False
+
+-- What MiniML's server hears of its own: an extension that moves a file
+-- without closing it says where it is now. What is wrong in a file is not
+-- where it is, so nothing is looked at again.
+def serverNotifications =
+  [(
+    "miniml/placed",
+    \db (a : Asked) ->
+      let p = M.unwrapOr "" (M.andThen J.asString (J.get "place" a.params)) in
+      let u = setSessionPlace db a.file p in
+      False
+  )]
 
 -- Where a file the editor opened is on the disk: what a language whose
 -- files are checked with their package's would read the rest of it from.
@@ -650,6 +678,59 @@ fun opening (uri : String) (text : String) : Json =
        (M.andThen (J.get "result") (V.get said 1))
        (Just (J.jString "c:/work/a.ml"))
        "its path"
+
+@test fun theServerHearsWhereAFileHasMoved () =
+  let said =
+    told
+      [
+        opening "file:///a.ml" "1 + 2\n",
+        message [
+          ("method", J.jString "miniml/placed"),
+          (
+            "params",
+            J.jObject [
+              ("textDocument", J.jObject [("uri", J.jString "file:///a.ml")]),
+              ("place", J.jString "/b.ml")
+            ]
+          )
+        ],
+        asking 1 "miniml/place" (inFile "file:///a.ml")
+      ]
+      serveServerInTurn
+  in
+  let a = assertEq (V.len said) 2 "nothing looked at again, having heard it" in
+  assertEq
+    (M.andThen (J.get "result") (V.last said))
+    (Just (J.jString "/b.ml"))
+    "and where it is now"
+
+fun renaming (id : Int) (to : String) : Json =
+  asking
+    id
+    "textDocument/rename"
+    (J.jObject [
+       ("textDocument", J.jObject [("uri", J.jString "file:///a.ml")]),
+       ("position", J.jObject [("line", J.jInt 0), ("character", J.jInt 4)]),
+       ("newName", J.jString to)
+     ])
+
+@test fun theServerRefusesToRenameToWhatIsNoName () =
+  let said =
+    told
+      [opening "file:///a.ml" "let x = 1 in x\n", renaming 1 "2x", renaming 2 "y"]
+      serveServerInTurn
+  in
+  let a =
+    assertEq
+      (M.andThen (J.get "error") (V.get said 1))
+      (Just (J.jObject [("code", J.jInt (0 - 32803)), ("message", J.jString "`2x` is not a name")]))
+      "why not, as the request's failure"
+  in assertEq
+       (M.map
+          (\j -> V.len (M.unwrapOr [] (J.asArray j)))
+          (M.andThen (J.path ["result", "changes", "file:///a.ml"]) (V.get said 2)))
+       (Just 2)
+       "and a name, made of both places"
 
 -- --- tools for an agent (`mcp!`) ---------------------------------------------
 --

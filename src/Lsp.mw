@@ -60,6 +60,20 @@
 -- (`miniml/type`). One given for a method Lingua does answer is asked in its
 -- place. A request about no open file is asked with file `-1`.
 --
+-- **A request refused** is an error and not an answer: `refuse` is asked of
+-- every request first, and a code and a message it gives are what the editor
+-- is told -- `requestFailed` with why a name cannot be renamed, say, or
+-- `invalidParams`:
+--
+--   refuse        db -> Asked -> Maybe (Int, String)
+--
+-- **Notifications of the language's own** are `notifications`: each a method
+-- the editor tells the server of -- `workspace/didChangeWatchedFiles` -- and
+-- what it does then, saying whether what is wrong in the open files may have
+-- changed, for them to be looked at again:
+--
+--   notifications [(String, db -> Asked -> Bool)]
+--
 -- **Colour** is the tree's tokens, each a class -- a keyword, a name, a
 -- number -- by its kind and its spelling; and, with `resolved`, by what the
 -- compiler knows of that occurrence:
@@ -143,6 +157,18 @@ fun replyError id code message =
 fun notify method params =
   send (J.jObject [("jsonrpc", J.jString "2.0"), ("method", J.jString method), ("params", params)])
 
+-- What a request that is not answered is answered with instead: the codes
+-- the protocol gives for each reason.
+@pub def requestFailed : Int = 0 - 32803
+
+@pub def invalidParams : Int = 0 - 32602
+
+@pub def methodNotFound : Int = 0 - 32601
+
+@pub def invalidRequest : Int = 0 - 32600
+
+@pub def serverNotInitialized : Int = 0 - 32002
+
 -- --- positions ---------------------------------------------------------------
 
 -- Where each line of `t` starts, in bytes.
@@ -200,7 +226,9 @@ fun posJson p = J.jObject [("line", J.jInt (fst p)), ("character", J.jInt (snd p
 
 -- --- the documents open ------------------------------------------------------
 
--- Each open document's file and text, by its URI; and its URI, by its file.
+-- Each document's file, by its URI, and its URI, by its file; and the text of
+-- each that is open. A document closed keeps its number, for when it is
+-- opened again.
 @pub data Docs
   = Docs (HashMap String Int) (HashMap Int String) (HashMap Int String) Int
 
@@ -212,10 +240,21 @@ fun emptyDocs () = Docs HashMap.empty HashMap.empty HashMap.empty 1
 @pub fun textOf (d : Docs) (file : Int) : String =
   match d with | Docs _ _ t _ -> HashMap.getOr "" file t
 
+-- The open document `uri` is.
 @pub fun fileOf (d : Docs) (uri : String) : Maybe Int =
-  match d with | Docs f _ _ _ -> HashMap.lookup uri f
+  match d with
+  | Docs f _ t _ ->
+      M.andThen (\file -> if HashMap.member file t then Just file else None) (HashMap.lookup uri f)
 
-@pub fun openFiles (d : Docs) : [Int] = match d with | Docs _ u _ _ -> HashMap.keys u
+@pub fun openFiles (d : Docs) : [Int] = match d with | Docs _ _ t _ -> HashMap.keys t
+
+fun isOpen (d : Docs) (file : Int) : Bool = match d with | Docs _ _ t _ -> HashMap.member file t
+
+-- `uri` closed: no longer looked at, nor answered about.
+fun closing (d : Docs) (uri : String) : Docs =
+  match (d, fileOf d uri) with
+  | (Docs f u t next, Just file) -> Docs f u (HashMap.delete file t) next
+  | _ -> d
 
 -- `uri` holding `text`: its file, a new one the first time.
 fun withText (d : Docs) (uri : String) (text : String) : (Docs, Int) =
@@ -282,6 +321,51 @@ fun withText (d : Docs) (uri : String) (text : String) : (Docs, Int) =
 @pub fun answered requests db (a : Asked) =
   M.map (\r -> match r with | (_, act) -> act db a) (V.find (\r -> fst r == a.method) requests)
 
+-- What a message with these parameters asks: of the open file its
+-- `textDocument` names, if it names one.
+fun askedOf (docs : Docs) (method : String) (params : Json) : Asked =
+  let uri = M.unwrapOr "" (M.andThen J.asString (J.path ["textDocument", "uri"] params)) in
+  let file = M.unwrapOr (0 - 1) (fileOf docs uri) in
+  let t = textOf docs file in
+  asked docs method file t (offsetIn t params) params
+
+-- A request's answer: an error, if `refusal` is one, and otherwise what
+-- `answer` makes of it -- nothing, for a method nobody answers.
+@pub fun answerOr (refusal : Maybe (Int, String)) (answer : () -> Maybe Json ! e)
+    : Maybe (Result (Int, String) Json) ! e =
+  match refusal with
+  | Just r -> Just (Err r)
+  | None -> M.map (\j -> Ok j) (answer ())
+
+-- What a language does when it hears a notification of its own: whether
+-- what is wrong may have changed.
+@pub fun heard notifications db (a : Asked) =
+  match V.find (\n -> fst n == a.method) notifications with
+  | Just (_, act) -> act db a
+  | None -> False
+
+-- The methods Lingua answers of a server with these features.
+fun answeredBy (features : [String]) : [String] =
+  let when = \f methods -> if V.elem f features then methods else [] in
+  V.concat [
+    when "tree" [
+      "textDocument/semanticTokens/full",
+      "textDocument/foldingRange",
+      "textDocument/selectionRange"
+    ],
+    when "hover" ["textDocument/hover"],
+    when "definition" ["textDocument/definition"],
+    when "references" [
+      "textDocument/references",
+      "textDocument/documentHighlight",
+      "textDocument/prepareRename",
+      "textDocument/rename"
+    ],
+    when "completion" ["textDocument/completion"],
+    when "symbols" ["textDocument/documentSymbol"],
+    when "format" ["textDocument/formatting"]
+  ]
+
 -- --- serving -----------------------------------------------------------------
 
 -- A language server, until the editor says `exit`: `opened` told of each
@@ -289,11 +373,54 @@ fun withText (d : Docs) (uri : String) (text : String) : (Docs, Int) =
 -- `setText` of every edit, `diagnose` asked what is wrong in each open file
 -- after it, and `answer` given every other request -- its method, the file
 -- it is about, the file's text and the byte it points at -- answering `None`
--- for one it cannot. `own` are the methods the language answers itself,
--- which may be about no file, and `extra` what else it says the server can
--- do.
-@pub fun serve name features (own : [String]) extra opened setText diagnose answer =
-  loop (name, features, own, extra) (edited opened setText) diagnose answer (emptyDocs ())
+-- for one nobody answers, and an error for one refused. `own` are the
+-- methods the language answers itself, which may be about no file, and
+-- `extra` what else it says the server can do; `hears` are the
+-- notifications the language hears, and `heard` what it does at one, saying
+-- whether what is wrong may have changed.
+@pub fun serve
+    name
+    features
+    (own : [String])
+    (hears : [String])
+    extra
+    opened
+    setText
+    diagnose
+    answer
+    heard =
+  looping
+    (name, features, own, extra)
+    hears
+    (edited opened setText)
+    diagnose
+    answer
+    heard
+    (emptyDocs ())
+    Stage.Starting
+
+-- Where a server is: before the editor has said `initialized`, serving, or
+-- after `shutdown`.
+data Stage = Starting | Serving | Ending
+
+-- What a request is answered with when the server is in no state to answer
+-- it.
+fun unready (stage : Stage) (method : String) : Maybe (Int, String) =
+  match stage with
+  | Stage.Starting ->
+      if method == "initialize" then None
+      else Just (serverNotInitialized, "the server is not yet initialized")
+  | Stage.Serving -> None
+  | Stage.Ending -> Just (invalidRequest, "the server is shutting down")
+
+fun begun (stage : Stage) : Stage = match stage with | Stage.Starting -> Stage.Serving | s -> s
+
+-- Whether a request was turned away, as one the server is in no state to
+-- answer.
+fun turnedAway (stage : Stage) (method : String) (id : Maybe Json) =
+  match (id, unready stage method) with
+  | (Just i, Just (code, message)) -> (let u = replyError i code message in True)
+  | _ -> False
 
 -- What a server does with a file's text: told first where the file is, if
 -- the editor has just opened it.
@@ -356,69 +483,71 @@ fun utf8 (bytes : [Int]) : [Char] =
       else go (i + 1) (V.pushBack out (C.fromCode x))
   in go 0 []
 
-fun loop about setText diagnose answer docs =
+fun looping about hears setText diagnose answer heard docs (stage : Stage) =
+  let again = \d s -> looping about hears setText diagnose answer heard d s in
   match about with
-  | (name, features, own, extra) -> looping about name own setText diagnose answer docs
+  | (name, features, own, extra) ->
+      match readMessage () with
+      | None -> ()
+      | Just msg ->
+          let method = M.unwrapOr "" (M.andThen J.asString (J.get "method" msg)) in
+          let id = J.get "id" msg in
+          let params = M.unwrapOr (J.jNull ()) (J.get "params" msg) in
+          let uri = M.unwrapOr "" (M.andThen J.asString (J.path ["textDocument", "uri"] params)) in
+          if method == "exit" then ()
+          else if turnedAway stage method id then again docs stage
+          else if method == "initialized" then again docs (begun stage)
+          else if method == "initialize" then
+            (let u = reply (M.unwrapOr (J.jNull ()) id) (introduced features own extra) in
+             again docs stage)
+          else if method == "shutdown" then
+            (let u = reply (M.unwrapOr (J.jNull ()) id) (J.jNull ()) in again docs Stage.Ending)
+          else if method == "textDocument/didOpen" or method == "textDocument/didChange" then
+            (let text =
+               (if method == "textDocument/didOpen" then
+                  M.andThen J.asString (J.path ["textDocument", "text"] params)
+                else lastChange params)
+             in match text with
+                | None -> again docs stage
+                | Just t ->
+                    (match withText docs uri t with
+                     | (d2, file) ->
+                         (let u =
+                            setText
+                              (if method == "textDocument/didOpen" then Just uri else None)
+                              file
+                              t
+                          in
+                          let w = publishAll name diagnose d2 in
+                          again d2 stage)))
+          else if method == "textDocument/didClose" then
+            (let u = cleared uri in again (closing docs uri) stage)
+          else
+            match id with
+            | None ->
+                if V.elem method hears and heard (askedOf docs method params) then
+                  (let w = publishAll name diagnose docs in again docs stage)
+                else again docs stage
+            | Just i -> (let u = answering features answer docs method i params in again docs stage)
 
-fun looping about name own setText diagnose answer docs =
-  match readMessage () with
-  | None -> ()
-  | Just msg ->
-      let method = M.unwrapOr "" (M.andThen J.asString (J.get "method" msg)) in
-      let id = J.get "id" msg in
-      let params = M.unwrapOr (J.jNull ()) (J.get "params" msg) in
-      let uri = M.unwrapOr "" (M.andThen J.asString (J.path ["textDocument", "uri"] params)) in
-      if method == "exit" then ()
-      else if method == "initialize" then
-        (let u =
-           (match about with
-            | (_, features, _, extra) ->
-                reply (M.unwrapOr (J.jNull ()) id) (initialized name features own extra))
-         in loop about setText diagnose answer docs)
-      else if method == "shutdown" then
-        (let u = reply (M.unwrapOr (J.jNull ()) id) (J.jNull ()) in
-         loop about setText diagnose answer docs)
-      else if method == "textDocument/didOpen" or method == "textDocument/didChange" then
-        (let text =
-           (if method == "textDocument/didOpen" then
-              M.andThen J.asString (J.path ["textDocument", "text"] params)
-            else lastChange params)
-         in match text with
-            | None -> loop about setText diagnose answer docs
-            | Just t ->
-                (match withText docs uri t with
-                 | (d2, file) ->
-                     (let u =
-                        setText (if method == "textDocument/didOpen" then Just uri else None) file t
-                      in
-                      let w = publishAll name diagnose d2 in
-                      loop about setText diagnose answer d2)))
-      else if method == "textDocument/didClose" then
-        (let u =
-           notify
-             "textDocument/publishDiagnostics"
-             (J.jObject [("uri", J.jString uri), ("diagnostics", J.jArray [])])
-         in loop about setText diagnose answer docs)
-      else
-        match id with
-        | None -> loop about setText diagnose answer docs
-        | Just i ->
-            (let u = answering own answer docs method i uri params in
-             loop about setText diagnose answer docs)
+-- A document closed: nothing is wrong in it any more, as far as the editor
+-- is told -- it will not be looked at again to say otherwise.
+fun cleared uri =
+  notify
+    "textDocument/publishDiagnostics"
+    (J.jObject [("uri", J.jString uri), ("diagnostics", J.jArray [])])
 
--- A request answered: by `answer`, of the file it is about; or, about no
--- open file, only if its method is one of the language's `own`.
-fun answering (own : [String]) answer docs method i uri params =
-  match fileOf docs uri with
+-- A request answered: as `answer` refuses it or answers it, of the file it
+-- is about; or, by nobody, said to be no method the server has -- unless it
+-- is one Lingua answers, about a file not open, which is answered nothing.
+fun answering features answer docs method i params =
+  let a = askedOf docs method params in
+  match answer docs method a.file a.text a.offset params with
+  | Just (Ok r) -> reply i r
+  | Just (Err (code, message)) -> replyError i code message
   | None ->
-      if V.elem method own then
-        reply i (M.unwrapOr (J.jNull ()) (answer docs method (0 - 1) "" 0 params))
-      else reply i (J.jNull ())
-  | Just file ->
-      (let t = textOf docs file in
-       match answer docs method file t (offsetIn t params) params with
-       | Just r -> reply i r
-       | None -> replyError i (0 - 32601) "`${method}` is not something this server does")
+      if a.file < 0 and V.elem method (answeredBy features) then reply i (J.jNull ())
+      else replyError i methodNotFound "unhandled request: ${method}"
 
 -- The whole text of the last change: the server asks for whole documents.
 fun lastChange params =
@@ -430,23 +559,26 @@ fun lastChange params =
 fun publishAll name diagnose docs =
   published name docs (V.map (\file -> (file, diagnose file)) (openFiles docs))
 
--- The editor told what was `found` wrong, file by file.
+-- The editor told what was `found` wrong, file by file: in each file still
+-- open.
 fun published name docs (found : [(Int, [Diagnostic])]) =
   V.foldl
     (\u f ->
       match f with
       | (file, wrong) ->
-          let t = textOf docs file in
-          let starts = lineStarts t in
-          notify
-            "textDocument/publishDiagnostics"
-            (J.jObject [
-               ("uri", J.jString (uriOf docs file)),
-               (
-                 "diagnostics",
-                 J.jArray (V.map (diagnosticJson name (uriOf docs file) t starts) wrong)
-               )
-             ]))
+          if not (isOpen docs file) then ()
+          else
+            let t = textOf docs file in
+            let starts = lineStarts t in
+            notify
+              "textDocument/publishDiagnostics"
+              (J.jObject [
+                 ("uri", J.jString (uriOf docs file)),
+                 (
+                   "diagnostics",
+                   J.jArray (V.map (diagnosticJson name (uriOf docs file) t starts) wrong)
+                 )
+               ]))
     ()
     found
 
@@ -471,17 +603,20 @@ data Arrived = Got Json | NoMore | Found Int
     name
     features
     (own : [String])
+    (hears : [String])
     extra
     opened
     setText
     diagnose
     answer
+    heard
     interrupt
     allow =
   let inbox = Thread.newChannel () in
   let reader = Thread.spawn (\() -> reading inbox) in
   attending
     (name, features, own, extra)
+    (hears, heard)
     (edited opened setText)
     diagnose
     answer
@@ -489,6 +624,7 @@ data Arrived = Got Json | NoMore | Found Int
     allow
     inbox
     (emptyDocs ())
+    Stage.Starting
     0
     None
 
@@ -523,86 +659,119 @@ fun stopping working interrupt allow =
 
 -- `edit` counts the edits so far, and `working` is the thread looking at the
 -- files as the last of them left them, if it has not been heard from.
-fun attending about setText diagnose answer interrupt allow inbox docs (edit : Int) working =
-  let again = \d e w -> attending about setText diagnose answer interrupt allow inbox d e w in
-  match about with
-  | (name, features, own, extra) ->
-      match Thread.receive inbox with
-      | Arrived.NoMore -> finishing name docs working
-      | Arrived.Found at ->
-          if at != edit then again docs edit working
-          else (let u = finishing name docs working in again docs edit None)
-      | Arrived.Got msg ->
-          let method = M.unwrapOr "" (M.andThen J.asString (J.get "method" msg)) in
-          let id = J.get "id" msg in
-          let params = M.unwrapOr (J.jNull ()) (J.get "params" msg) in
-          let uri = M.unwrapOr "" (M.andThen J.asString (J.path ["textDocument", "uri"] params)) in
-          if method == "exit" then ()
-          else if method == "initialize" then
-            (let u = reply (M.unwrapOr (J.jNull ()) id) (initialized name features own extra) in
-             again docs edit working)
-          else if method == "shutdown" then
-            (let u = reply (M.unwrapOr (J.jNull ()) id) (J.jNull ()) in again docs edit working)
-          else if method == "textDocument/didOpen" or method == "textDocument/didChange" then
-            (let text =
-               (if method == "textDocument/didOpen" then
-                  M.andThen J.asString (J.path ["textDocument", "text"] params)
-                else lastChange params)
-             in match text with
-                | None -> again docs edit working
-                | Just t ->
-                    (let s = stopping working interrupt allow in
-                     match withText docs uri t with
-                     | (d2, file) ->
-                         let u =
-                           setText
-                             (if method == "textDocument/didOpen" then Just uri else None)
-                             file
-                             t
-                         in
-                         let files = openFiles d2 in
-                         let at = edit + 1 in
-                         let task =
-                           Thread.spawn (\() ->
-                             let found = V.map (\f -> (f, diagnose f)) files in
-                             let w = Thread.send inbox (Arrived.Found at) in
-                             found)
-                         in again d2 at (Just task)))
-          else if method == "textDocument/didClose" then
-            (let u =
-               notify
-                 "textDocument/publishDiagnostics"
-                 (J.jObject [("uri", J.jString uri), ("diagnostics", J.jArray [])])
-             in again docs edit working)
-          else
-            match id with
-            | None -> again docs edit working
-            | Just i ->
-                (let u = answering own answer docs method i uri params in again docs edit working)
+fun attending
+    about
+    hearing
+    setText
+    diagnose
+    answer
+    interrupt
+    allow
+    inbox
+    docs
+    (stage : Stage)
+    (edit : Int)
+    working =
+  let again =
+    \d s e w -> attending about hearing setText diagnose answer interrupt allow inbox d s e w
+  in
+  -- Every open file looked at on a thread of its own, as edit `at` left
+  -- them.
+  let look =
+    \d s at ->
+      (let files = openFiles d in
+       let task =
+         Thread.spawn (\() ->
+           let found = V.map (\f -> (f, diagnose f)) files in
+           let w = Thread.send inbox (Arrived.Found at) in
+           found)
+       in again d s at (Just task))
+  in match (about, hearing) with
+     | ((name, features, own, extra), (hears, heard)) ->
+         match Thread.receive inbox with
+         | Arrived.NoMore -> finishing name docs working
+         | Arrived.Found at ->
+             if at != edit then again docs stage edit working
+             else (let u = finishing name docs working in again docs stage edit None)
+         | Arrived.Got msg ->
+             let method = M.unwrapOr "" (M.andThen J.asString (J.get "method" msg)) in
+             let id = J.get "id" msg in
+             let params = M.unwrapOr (J.jNull ()) (J.get "params" msg) in
+             let uri =
+               M.unwrapOr "" (M.andThen J.asString (J.path ["textDocument", "uri"] params))
+             in if method == "exit" then ()
+                else if turnedAway stage method id then again docs stage edit working
+                else if method == "initialized" then again docs (begun stage) edit working
+                else if method == "initialize" then
+                  (let u = reply (M.unwrapOr (J.jNull ()) id) (introduced features own extra) in
+                   again docs stage edit working)
+                else if method == "shutdown" then
+                  (let u = reply (M.unwrapOr (J.jNull ()) id) (J.jNull ()) in
+                   again docs Stage.Ending edit working)
+                else if method == "textDocument/didOpen" or method == "textDocument/didChange" then
+                  (let text =
+                     (if method == "textDocument/didOpen" then
+                        M.andThen J.asString (J.path ["textDocument", "text"] params)
+                      else lastChange params)
+                   in match text with
+                      | None -> again docs stage edit working
+                      | Just t ->
+                          (let s = stopping working interrupt allow in
+                           match withText docs uri t with
+                           | (d2, file) ->
+                               let u =
+                                 setText
+                                   (if method == "textDocument/didOpen" then Just uri else None)
+                                   file
+                                   t
+                               in look d2 stage (edit + 1)))
+                else if method == "textDocument/didClose" then
+                  (let u = cleared uri in again (closing docs uri) stage edit working)
+                else
+                  match id with
+                  | None ->
+                      if V.elem method hears then
+                        -- What the language does may set what the files are
+                        -- looked at for, so the looking is stopped first; and
+                        -- what it had not finished, it does again.
+                        (let s = stopping working interrupt allow in
+                         if heard (askedOf docs method params) or M.isSome working then
+                           look docs stage (edit + 1)
+                         else again docs stage edit None)
+                      else again docs stage edit working
+                  | Just i ->
+                      (let u = answering features answer docs method i params in
+                       again docs stage edit working)
 
 fun diagnosticJson name uri t starts (d : Diagnostic) =
   match d with
   | Diagnostic sev msg at labels notes ->
-      J.jObject [
-        ("range", rangeJson t starts at),
-        ("severity", J.jInt (severityCode sev)),
-        ("source", J.jString name),
-        ("message", J.jString (S.join "\n" (V.pushFront notes msg))),
-        (
-          "relatedInformation",
-          J.jArray
-            (V.map
-               (\l ->
-                 J.jObject [
-                   (
-                     "location",
-                     J.jObject [("uri", J.jString uri), ("range", rangeJson t starts (fst l))]
-                   ),
-                   ("message", J.jString (snd l))
-                 ])
-               labels)
-        )
-      ]
+      let said =
+        [
+          ("range", rangeJson t starts at),
+          ("severity", J.jInt (severityCode sev)),
+          ("source", J.jString name),
+          ("message", J.jString (S.join "\n" (V.pushFront notes msg)))
+        ]
+      in
+      -- What is said of other places, if anything is.
+      if V.isEmpty labels then J.jObject said
+      else
+        J.jObject
+          (V.pushBack said (
+             "relatedInformation",
+             J.jArray
+               (V.map
+                  (\l ->
+                    J.jObject [
+                      (
+                        "location",
+                        J.jObject [("uri", J.jString uri), ("range", rangeJson t starts (fst l))]
+                      ),
+                      ("message", J.jString (snd l))
+                    ])
+                  labels)
+           ))
 
 fun severityCode s =
   match s with
@@ -624,21 +793,20 @@ fun owned (own : [String]) : [(String, Json)] =
 
 -- What the server can do, from the features it was given, the methods the
 -- language answers itself, and what else it says: of two that say the same
--- thing, the later.
-fun initialized name features (own : [String]) (extra : [(String, Json)]) =
+-- thing, the later. Nothing the protocol takes as said is said: the
+-- encoding of a column is UTF-16 unless the server says otherwise, and the
+-- server is no more than what it can do.
+fun introduced features (own : [String]) (extra : [(String, Json)]) =
   let has = \f -> V.elem f features in
   let when = \f fields -> if has f then fields else [] in
   let said = V.append (owned own) extra in
   let over = \fields -> V.filter (\f -> not (V.any (\x -> fst x == fst f) said)) fields in
-  J.jObject [
-    (
+  J.jObject
+    [(
       "capabilities",
       J.jObject
         (V.concat [
-           [
-             ("positionEncoding", J.jString "utf-16"),
-             ("textDocumentSync", J.jObject [("openClose", J.jBool True), ("change", J.jInt 1)])
-           ],
+           [("textDocumentSync", J.jObject [("openClose", J.jBool True), ("change", J.jInt 1)])],
            when "tree" [
              (
                "semanticTokensProvider",
@@ -676,9 +844,7 @@ fun initialized name features (own : [String]) (extra : [(String, Json)]) =
          ]
            |> over
            |> (\fields -> V.append fields said))
-    ),
-    ("serverInfo", J.jObject [("name", J.jString name)])
-  ]
+    )]
 
 -- --- answers -----------------------------------------------------------------
 
@@ -943,8 +1109,26 @@ fun lineSegments t starts a b =
 
 -- What `server` writes when it is sent `messages` and then no more: each of
 -- its replies and notifications, in order. For a test of a server, which
--- otherwise reads what an editor sends it.
+-- otherwise reads what an editor sends it. The server is begun as an editor
+-- begins one -- `initialize`, and then `initialized` -- with what `messages`
+-- leave out of that, and its answer to an `initialize` it was not sent is
+-- not among what it wrote.
 @pub fun told (messages : [Json]) server =
+  let methodOf = \m -> M.andThen J.asString (J.get "method" m) in
+  let has = \m -> V.any (\x -> methodOf x == Just m) messages in
+  let note = J.jObject [("jsonrpc", J.jString "2.0"), ("method", J.jString "initialized")] in
+  let begun =
+    if not (has "initialize") then
+      V.append [request (0 - 1) "initialize" (J.jObject []), note] messages
+    else if has "initialized" then messages
+    else V.concatMap (\x -> if methodOf x == Just "initialize" then [x, note] else [x]) messages
+  in
+  let ours = \j -> not (has "initialize") and J.get "id" j == Just (J.jInt (0 - 1)) in
+  V.filter (\j -> not (ours j)) (toldAsSent begun server)
+
+-- What `server` writes when it is sent `messages`, exactly, and then no
+-- more.
+@pub fun toldAsSent (messages : [Json]) server =
   let bodies = V.map J.render messages in
   -- Which message is next, and how much of it has been read: nothing, the
   -- line that says how long it is, or the empty line after that.
@@ -986,7 +1170,7 @@ use Lingua.Pipe (named)
 def features : [String] =
   [
     "text", "diagnostics", "tree", "hover", "definition", "references", "completion", "symbols",
-    "format", "resolved", "requests", "capabilities", "opened"
+    "format", "resolved", "requests", "capabilities", "opened", "refuse", "notifications"
   ]
 
 -- `| hover = hoverAt`: a feature, where it was written, and the function.
@@ -1043,12 +1227,18 @@ fun lspCode pub name lang db (threaded : Bool) fs =
       if has f then "    else if method == \"${method}\" then Just (${reply})\n" else ""
   in
   let requests = if has "requests" then fn "requests" else "[]" in
+  let notifications = if has "notifications" then fn "notifications" else "[]" in
   -- A language's own answer comes first, so that it may answer in Lingua's
   -- place; and nothing of Lingua's is asked of no file.
   let ownArm =
     if has "requests" then
-      "    else if LinguaV.elem method (LinguaLsp.methodsOf ${requests}) then LinguaLsp.answered ${requests} db (LinguaLsp.asked docs method file t offset params)\n    else if file < 0 then None\n"
+      "    else if LinguaV.elem method (LinguaLsp.methodsOf ${requests}) then LinguaLsp.answered ${requests} db (LinguaLsp.asked docs method file t offset params)\n"
     else ""
+  in
+  -- Before either, whether the language refuses it.
+  let refusal =
+    if has "refuse" then "(${fn "refuse"} db (LinguaLsp.asked docs method file t offset params))"
+    else "None"
   in
   let tree = "(${fn "tree"} db file)" in
   let refs = "(${fn "references"} db file offset)" in
@@ -1056,13 +1246,17 @@ fun lspCode pub name lang db (threaded : Bool) fs =
   let args = "    \"${lang}\"
     [${S.join ", " (V.map (\f -> "\"${fst (fst f)}\"") fs)}]
     (LinguaLsp.methodsOf ${requests})
+    (LinguaLsp.methodsOf ${notifications})
     ${if has "capabilities" then fn "capabilities" else "[]"}
     (\\file uri -> ${if has "opened" then "${fn "opened"} db file uri" else "()"})
     (\\file t -> ${fn "text"} db file t)
     (\\file -> ${if has "diagnostics" then "${fn "diagnostics"} db file" else "[]"})
     (\\docs method file t offset params ->
+    LinguaLsp.answerOr ${refusal} (\\() ->
     if False then None
-${ownArm}${arm "hover" "textDocument/hover" "LinguaLsp.hoverReply t (${fn "hover"} db file offset)"}${arm "tree" "textDocument/semanticTokens/full" "LinguaLsp.tokensReply t (tokens${name} db file)"}${arm "tree" "textDocument/foldingRange" "LinguaLsp.foldingReply t ${tree}"}${arm "tree" "textDocument/selectionRange" "LinguaLsp.selectionReply t ${tree} params"}${arm "definition" "textDocument/definition" "LinguaLsp.locationsReply docs (${fn "definition"} db file offset)"}${arm "references" "textDocument/references" "LinguaLsp.locationsReply docs ${refs}"}${arm "references" "textDocument/documentHighlight" "LinguaLsp.highlightsReply t file ${refs}"}${arm "references" "textDocument/prepareRename" "LinguaLsp.prepareRenameReply t file offset ${refs}"}${arm "references" "textDocument/rename" "LinguaLsp.renameReply docs ${refs} (LinguaLsp.newName params)"}${arm "completion" "textDocument/completion" "LinguaLsp.completionReply (${fn "completion"} db file offset)"}${arm "symbols" "textDocument/documentSymbol" "LinguaLsp.symbolsReply t (${fn "symbols"} db file)"}${arm "format" "textDocument/formatting" "LinguaLsp.formatReply t (${fn "format"} db file)"}    else None)
+${ownArm}    else if file < 0 then None
+${arm "hover" "textDocument/hover" "LinguaLsp.hoverReply t (${fn "hover"} db file offset)"}${arm "tree" "textDocument/semanticTokens/full" "LinguaLsp.tokensReply t (tokens${name} db file)"}${arm "tree" "textDocument/foldingRange" "LinguaLsp.foldingReply t ${tree}"}${arm "tree" "textDocument/selectionRange" "LinguaLsp.selectionReply t ${tree} params"}${arm "definition" "textDocument/definition" "LinguaLsp.locationsReply docs (${fn "definition"} db file offset)"}${arm "references" "textDocument/references" "LinguaLsp.locationsReply docs ${refs}"}${arm "references" "textDocument/documentHighlight" "LinguaLsp.highlightsReply t file ${refs}"}${arm "references" "textDocument/prepareRename" "LinguaLsp.prepareRenameReply t file offset ${refs}"}${arm "references" "textDocument/rename" "LinguaLsp.renameReply docs ${refs} (LinguaLsp.newName params)"}${arm "completion" "textDocument/completion" "LinguaLsp.completionReply (${fn "completion"} db file offset)"}${arm "symbols" "textDocument/documentSymbol" "LinguaLsp.symbolsReply t (${fn "symbols"} db file)"}${arm "format" "textDocument/formatting" "LinguaLsp.formatReply t (${fn "format"} db file)"}    else None))
+    (\\a -> LinguaLsp.heard ${notifications} db a)
 " in
   let inTurn =
     \called -> "${pub}fun ${called} () =\n  let db = new${db} () in\n  LinguaLsp.serve\n${args}"
@@ -1130,8 +1324,9 @@ fun opening (uri : String) (text : String) : Json =
 
 fun about (uri : String) : Json = J.jObject [("textDocument", J.jObject [("uri", J.jString uri)])]
 
--- A server with nothing but a language's own requests: how long the file
--- asked about is, and one that is about no file.
+-- A server with little but a language's own requests: how long the file
+-- asked about is -- refused, of a file not open -- and one that is about no
+-- file. It formats too, though as nothing.
 fun lengths () =
   let own =
     [
@@ -1140,14 +1335,19 @@ fun lengths () =
     ]
   in serve
        "test"
-       ["text"]
+       ["text", "format"]
        (methodsOf own)
+       []
        [("experimental", J.jBool True)]
        (\file uri -> ())
        (\file t -> ())
        (\file -> [])
        (\docs method file t offset params ->
-         answered own () (asked docs method file t offset params))
+         answerOr
+           (if method == "test/length" and file < 0 then Just (invalidParams, "no file is open")
+            else None)
+           (\() -> answered own () (asked docs method file t offset params)))
+       (\a -> False)
 
 fun resultOf (j : Json) : Maybe Json = J.get "result" j
 
@@ -1176,13 +1376,58 @@ fun resultOf (j : Json) : Maybe Json = J.get "result" j
     told
       [
         request 1 "workspace/symbol" (J.jObject [("query", J.jString "x")]),
-        request 2 "textDocument/hover" (about "file:///nowhere")
+        request 2 "textDocument/formatting" (about "file:///nowhere")
       ]
       lengths
   in
   let a =
     assertEq (M.andThen resultOf (V.get said 0)) (Just (J.jInt (0 - 1))) "its own, with file -1"
-  in assertEq (M.andThen resultOf (V.get said 1)) (Just (J.jNull ())) "and any other, nothing"
+  in assertEq (M.andThen resultOf (V.get said 1)) (Just (J.jNull ())) "and one of Lingua's, nothing"
+
+@test fun aRequestNobodyAnswersIsUnhandledWhateverItIsAbout () =
+  let said =
+    told
+      [
+        request 1 "test/other" (about "file:///nowhere"),
+        request 2 "textDocument/hover" (about "file:///nowhere"),
+        opening "file:///a" "x",
+        request 3 "test/other" (about "file:///a")
+      ]
+      lengths
+  in
+  let errorOf = \i -> M.andThen (J.get "error") (V.get said i) in
+  let unhandled =
+    \m ->
+      Just
+        (J.jObject [
+           ("code", J.jInt methodNotFound),
+           ("message", J.jString "unhandled request: ${m}")
+         ])
+  in
+  let a = assertEq (errorOf 0) (unhandled "test/other") "of a file not open" in
+  let b =
+    assertEq (errorOf 1) (unhandled "textDocument/hover") "one of the protocol's this server lacks"
+  in assertEq (errorOf 3) (unhandled "test/other") "and of a file that is"
+
+@test fun aRequestRefusedIsAnErrorWithTheLanguagesReason () =
+  let said =
+    told
+      [
+        request 1 "test/length" (about "file:///nowhere"),
+        opening "file:///a" "abc",
+        request 2 "test/length" (about "file:///a")
+      ]
+      lengths
+  in
+  let a =
+    assertEq
+      (M.andThen (J.get "error") (V.get said 0))
+      (Just (J.jObject [("code", J.jInt invalidParams), ("message", J.jString "no file is open")]))
+      "the code and the message the language gave"
+  in assertEq
+       (M.andThen resultOf (V.get said 2))
+       (Just (J.jInt 3))
+       "and what it does not refuse, answered"
 
 @test fun aServerSaysItCanDoWhatTheLanguageAnswers () =
   let said = told [request 1 "initialize" (J.jObject [])] lengths in
@@ -1191,10 +1436,149 @@ fun resultOf (j : Json) : Maybe Json = J.get "result" j
     assertEq (can "workspaceSymbolProvider") (Just (J.jBool True)) "a method of the protocol's"
   in
   let b = assertEq (can "experimental") (Just (J.jBool True)) "what else it says" in
-  assertEq (can "hoverProvider") None "and nothing it was not given"
+  let c = assertEq (can "hoverProvider") None "and nothing it was not given" in
+  let d =
+    assertEq (can "positionEncoding") None "nor the encoding every server has unless it says"
+  in assertEq (M.andThen (J.path ["result", "serverInfo"]) (V.get said 0)) None "nor a name"
 
--- A server on threads, given what has arrived for it already: what it wrote.
-fun attended (arrived : [Arrived]) setText diagnose answer interrupt allow =
+@test fun aRequestIsAnsweredOnlyWhileTheServerIsServing () =
+  let note = J.jObject [("jsonrpc", J.jString "2.0"), ("method", J.jString "initialized")] in
+  let said =
+    toldAsSent
+      [
+        request 1 "workspace/symbol" (J.jObject []),
+        request 2 "initialize" (J.jObject []),
+        request 3 "workspace/symbol" (J.jObject []),
+        note,
+        request 4 "workspace/symbol" (J.jObject []),
+        request 5 "shutdown" (J.jNull ()),
+        request 6 "workspace/symbol" (J.jObject [])
+      ]
+      lengths
+  in
+  let codes =
+    V.map
+      (\j ->
+        match (J.path ["error", "code"] j, J.get "result" j) with
+        | (Just c, _) -> c
+        | (None, _) -> J.jString "answered")
+      said
+  in
+  let a =
+    assertEq
+      codes
+      [
+        J.jInt serverNotInitialized,
+        J.jString "answered",
+        J.jInt serverNotInitialized,
+        J.jString "answered",
+        J.jString "answered",
+        J.jInt invalidRequest
+      ]
+      "before `initialized` only `initialize`; after `shutdown` nothing"
+  in assertEq
+       (M.andThen (J.path ["error", "message"]) (V.last said))
+       (Just (J.jString "the server is shutting down"))
+       "and why"
+
+-- What is said of a file in what a server wrote: each time, how many things
+-- are wrong in it.
+fun publishedOf (uri : String) (said : [Json]) : [Int] =
+  V.concatMap
+    (\j ->
+      if J.path ["params", "uri"] j == Just (J.jString uri) then
+        [V.len (M.unwrapOr [] (M.andThen J.asArray (J.path ["params", "diagnostics"] j)))]
+      else [])
+    said
+
+-- A server that finds one thing wrong in every file, and is told of a
+-- notification of its own: `test/poke`, after which it says what is wrong
+-- may have changed.
+fun poked () =
+  let pokes = [("test/poke", \db (a : Asked) -> True)] in
+  serve
+    "test"
+    ["text", "diagnostics"]
+    []
+    (methodsOf pokes)
+    []
+    (\file uri -> ())
+    (\file t -> ())
+    (\file -> [Diagnostic Severity.Error "wrong" (Meta 0 1) [] []])
+    (\docs method file t offset params -> answerOr None (\() -> None))
+    (\a -> heard pokes () a)
+
+fun notice (method : String) (params : Json) : Json =
+  J.jObject [("jsonrpc", J.jString "2.0"), ("method", J.jString method), ("params", params)]
+
+@test fun aClosedFileIsForgotten () =
+  let said =
+    told
+      [
+        opening "file:///a" "x",
+        opening "file:///b" "y",
+        notice "textDocument/didClose" (about "file:///a"),
+        opening "file:///b" "z",
+        request 1 "test/length" (about "file:///a")
+      ]
+      lengths
+  in
+  let looked =
+    told
+      [
+        opening "file:///a" "x",
+        notice "textDocument/didClose" (about "file:///a"),
+        notice "test/poke" (J.jObject []),
+        opening "file:///a" "y"
+      ]
+      poked
+  in
+  let a =
+    assertEq
+      (M.andThen (J.path ["error", "code"]) (V.last said))
+      (Just (J.jInt invalidParams))
+      "asked about as a file not open"
+  in assertEq
+       (publishedOf "file:///a" looked)
+       [1, 0, 1]
+       "what is wrong in it said, cleared when it is closed, not looked at until it is opened again"
+
+@test fun aNotificationTheLanguageHearsHasEveryOpenFileLookedAtAgain () =
+  let said =
+    told
+      [
+        opening "file:///a" "x",
+        opening "file:///b" "y",
+        notice "test/poke" (J.jObject []),
+        notice "test/unheard" (J.jObject [])
+      ]
+      poked
+  in
+  let a = assertEq (publishedOf "file:///a" said) [1, 1, 1] "at each opening, and when poked" in
+  assertEq (publishedOf "file:///b" said) [1, 1] "and the other, once it is open"
+
+@test fun aDiagnosticSaysOtherPlacesOnlyIfItHasAny () =
+  let t = "let x = 1" in
+  let json =
+    \labels ->
+      diagnosticJson
+        "test"
+        "file:///a"
+        t
+        (lineStarts t)
+        (Diagnostic Severity.Error "no" (Meta 4 5) labels [])
+  in
+  let a = assertEq (J.get "relatedInformation" (json [])) None "none, and nothing said" in
+  assertEq
+    (M.map
+       (\j -> V.len (M.unwrapOr [] (J.asArray j)))
+       (J.get "relatedInformation" (json [(Meta 8 9, "here")])))
+    (Just 1)
+    "one, and it"
+
+-- A server on threads, serving, given what has arrived for it already: what
+-- it wrote. It hears `test/poke`, and does `poke` then.
+fun attended (arrived : [Arrived]) setText diagnose answer interrupt allow poke =
   let inbox = Thread.newChannel () in
   let u = V.foldl (\acc a -> Thread.send inbox a) () arrived in
   written
@@ -1202,13 +1586,16 @@ fun attended (arrived : [Arrived]) setText diagnose answer interrupt allow =
        (withOutput (\() ->
           attending
             ("test", ["text"], ["test/go"], [])
+            (["test/poke"], \a -> poke ())
             (\o file t -> setText file t)
             diagnose
-            answer
+            (\docs method file t offset params ->
+              M.map (\j -> Ok j) (answer docs method file t offset params))
             interrupt
             allow
             inbox
             (emptyDocs ())
+            Stage.Serving
             0
             None)))
 
@@ -1232,6 +1619,7 @@ fun attended (arrived : [Arrived]) setText diagnose answer interrupt allow =
         Just (J.jString "gone"))
       (\() -> ())
       (\() -> ())
+      (\() -> False)
   in
   let a =
     assertEq (M.andThen resultOf (V.get said 0)) (Just (J.jString "gone")) "the answer, first"
@@ -1264,6 +1652,7 @@ fun attended (arrived : [Arrived]) setText diagnose answer interrupt allow =
           let u = Stm.writeTVar gate True in
           Stm.modifyTVar stops (\n -> n + 1)))
       (\() -> ())
+      (\() -> False)
   in
   let a = assertEq (V.len said) 1 "one thing said, not two" in
   let b =
@@ -1279,6 +1668,59 @@ fun attended (arrived : [Arrived]) setText diagnose answer interrupt allow =
       (Just (J.jString "second"))
       "what is wrong in the text that is there"
   in assertEq (Stm.readTVarIO stops) 1 "and the looking was stopped once, by the edit"
+
+@test fun whatWasFoundInAFileClosedSinceIsNotSaid () =
+  -- Looking at the file waits for the request, which comes after the file
+  -- is closed.
+  let gate = Stm.newTVarIO False in
+  let said =
+    attended
+      [
+        Arrived.Got (opening "file:///a" "x"),
+        Arrived.Got (notice "textDocument/didClose" (about "file:///a")),
+        Arrived.Got (request 1 "test/go" (J.jObject [])),
+        Arrived.NoMore
+      ]
+      (\file t -> ())
+      (\file ->
+        let u = Stm.atomically (\() -> Stm.check (Stm.readTVar gate)) in
+        [Diagnostic Severity.Error "found" (Meta 0 1) [] []])
+      (\docs method file t offset params ->
+        let u = Stm.atomically (\() -> Stm.writeTVar gate True) in
+        Just (J.jNull ()))
+      (\() -> ())
+      (\() -> ())
+      (\() -> False)
+  in assertEq (publishedOf "file:///a" said) [0] "only that nothing is wrong in it, when it closed"
+
+@test fun aNotificationHeardStopsTheLookingAndLooksAgain () =
+  -- Looking never ends by itself until it has been stopped once; the
+  -- language hears the notification, changing nothing, and what it had not
+  -- finished is looked at again.
+  let gate = Stm.newTVarIO False in
+  let stops = Stm.newTVarIO 0 in
+  let said =
+    attended
+      [
+        Arrived.Got (opening "file:///a" "first"),
+        Arrived.Got (notice "test/poke" (J.jObject [])),
+        Arrived.Got (notice "test/unheard" (J.jObject [])),
+        Arrived.NoMore
+      ]
+      (\file t -> ())
+      (\file ->
+        if Stm.readTVarIO gate then [Diagnostic Severity.Error "again" (Meta 0 1) [] []]
+        else (let u = Stm.atomically (\() -> Stm.check (Stm.readTVar gate)) in []))
+      (\docs method file t offset params -> None)
+      (\() ->
+        Stm.atomically (\() ->
+          let u = Stm.writeTVar gate True in
+          Stm.modifyTVar stops (\n -> n + 1)))
+      (\() -> ())
+      (\() -> False)
+  in
+  let a = assertEq (publishedOf "file:///a" said) [1] "what was found the second time, once" in
+  assertEq (Stm.readTVarIO stops) 1 "and the looking was stopped once, when it was heard"
 
 @test fun tokensAreEncodedFromTheOneBefore () =
   assertEq
@@ -1307,10 +1749,13 @@ fun located () =
     ["text", "opened"]
     (methodsOf own)
     []
+    []
     (\file uri -> setRef seen (V.pushBack (getRef seen) "${show file} at ${pathOf uri}"))
     (\file t -> setRef seen (V.pushBack (getRef seen) "${show file} is ${t}"))
     (\file -> [])
-    (\docs method file t offset params -> answered own () (asked docs method file t offset params))
+    (\docs method file t offset params ->
+      answerOr None (\() -> answered own () (asked docs method file t offset params)))
+    (\a -> False)
 
 @test fun aServerIsToldWhereAFileIsBeforeItsText () =
   let said =

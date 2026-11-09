@@ -46,6 +46,8 @@ converts to and from the protocol's lines and UTF-16 columns.
 | `symbols`      | `db -> Int -> [(String, String, Meta)]`      | document symbols: name, kind, place              |
 | `format`       | `db -> Int -> String`                        | formatting, as one edit (see [format.md](format.md)) |
 | `requests`     | `[(String, db -> Asked -> Json)]`            | the language's own requests, below               |
+| `refuse`       | `db -> Asked -> Maybe (Int, String)`         | a request answered with an error instead, below  |
+| `notifications` | `[(String, db -> Asked -> Bool)]`           | the language's own notifications, below          |
 | `capabilities` | `[(String, Json)]`                           | what else the server says it can do              |
 
 `opened` is called when a file is opened, before its `text`, with the
@@ -121,6 +123,68 @@ Rules:
   `capabilities`; of two that say the same thing, yours is the one sent.
 - A method of the language's own needs no capability. The editor's extension
   sends it.
+- **A method nobody answers** gets the error `-32601` with the message
+  `unhandled request: <method>`, whether or not the file it names is open.
+  A method Lingua answers, asked about a file that isn't open, gets `null`.
+
+## Refusing a request
+
+`refuse` is asked about every request before anything answers it, Lingua's
+own included. Return `Just (code, message)` to answer with that error
+instead, or `None` to let the request be answered as usual.
+
+```meadow
+fun refusalOf db (a : Asked) : Maybe (Int, String) =
+  if a.method != "textDocument/rename" then None
+  else
+    let name = newName a.params in
+    if isName name then None else Just (requestFailed, "`${name}` is not a name")
+```
+
+`Lingua.Lsp` names the codes: `requestFailed` (`-32803`), `invalidParams`
+(`-32602`), `methodNotFound` (`-32601`), `invalidRequest` (`-32600`) and
+`serverNotInitialized` (`-32002`). A refusal keeps Lingua's own answer for
+every other case, so a language that can't rename a module refuses that one
+rename and still has Lingua rename everything else.
+
+## A language's own notifications
+
+The server handles `initialized`, `exit` and the document notifications
+itself. `notifications` gives what the language does when it hears any other
+notification, such as `workspace/didChangeWatchedFiles`. Each is asked with
+the notification as an `Asked`, its file `-1` unless the notification names an
+open document. It returns whether what is wrong in the open files may have
+changed. On `True`, every open file is looked at again and its diagnostics
+published.
+
+```meadow
+def serverNotifications =
+  [("workspace/didChangeWatchedFiles", \db (a : Asked) -> restudied db a.params)]
+```
+
+A threaded server stops any looking under way before the language hears a
+notification, since what it does may set an input. Whatever the looking hadn't
+finished is looked at again, even when the language returns `False`.
+
+Any other notification is ignored.
+
+## The session
+
+The server follows the protocol's lifecycle:
+
+- **Before the editor says `initialized`**, every request except `initialize`
+  is answered `serverNotInitialized`.
+- **After `shutdown`**, every request is answered `invalidRequest` with the
+  message `the server is shutting down`. `exit` ends the server.
+- **Closing a document forgets it.** The server publishes an empty list of
+  diagnostics for it, since nothing will update them now. After that it
+  isn't looked at after edits, and a request about it is asked as about a file
+  that isn't open. Opened again, it keeps its number, and `opened` is told
+  again.
+
+`initialize` is answered with the capabilities alone. The server doesn't
+write `positionEncoding` (UTF-16 is what the protocol assumes) or
+`serverInfo`.
 
 ## Testing a server
 
@@ -141,6 +205,12 @@ would send, and answers what it wrote, each message as JSON:
 
 The first thing written after an edit is the diagnostics of every open file,
 so a request's reply comes after those.
+
+`told` begins the session as an editor does. If `messages` have no
+`initialize`, it sends `initialize` and `initialized` first, and leaves its
+own `initialize`'s reply out of what it returns. If they have `initialize` but
+no `initialized`, it sends `initialized` right after. To send exactly the
+messages given, as a test of the lifecycle must, use `toldAsSent`.
 [Editor.mw](../examples/MiniML/src/Editor.mw) has the helpers `opening`,
 `asking` and `inFile`.
 
