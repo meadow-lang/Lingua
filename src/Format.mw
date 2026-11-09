@@ -31,6 +31,8 @@
 --   tight       nothing: two things with no space between
 --   kept        `line` where the text had blank space between the two
 --               things, `tight` where it had none
+--   aswritten   as the text had it: a break, a blank line, a space -- one
+--               that stays a space -- or nothing
 --   items("," line)
 --               a child that is many, with its separators between two of
 --               its nodes -- each token the one the tree has there -- and
@@ -127,18 +129,21 @@ use Pretty (Doc)
   | Breaks Int Int
   | Mark Int
   | Kept
+  | AsWritten
   | NoGroup
 
 use Elem.*
 
 -- How two things are parted, weakest first: by nothing; by nothing, or a
--- break where the group breaks; by a space, or a break where it breaks; by a
--- break, always; by a blank line, which is kept where the text had one.
+-- break where the group breaks; by a space, always; by a space, or a break
+-- where it breaks; by a break, always; by a blank line, which is kept where
+-- the text had one.
 def tightly : Int = 0
 def cutting : Int = 1
-def lining : Int = 2
-def breaking : Int = 3
-def blanking : Int = 4
+def spacing : Int = 2
+def lining : Int = 3
+def breaking : Int = 4
+def blanking : Int = 5
 
 -- The same, as functions: what `format!` writes a rule with.
 @pub fun tok (t : String) : Elem = Tok t
@@ -180,6 +185,11 @@ def blanking : Int = 4
 -- there; nothing where it had none: two things that touch stay touching, and
 -- two apart stay apart.
 @pub def kept : Elem = Kept
+
+-- As the text had it: a break where it had one -- a blank line where it had
+-- one -- a space where it had blank space on one line, and nothing where the
+-- two things touch.
+@pub def aswritten : Elem = AsWritten
 
 -- A formatter: how wide a level is, how wide a line may be -- 0 for one that
 -- only indents -- what a kind is called, which kinds are trivia, the rules,
@@ -277,6 +287,7 @@ fun leaves (es : [Elem]) : [Elem] =
       | Breaks _ _ -> []
       | Mark _ -> []
       | Kept -> []
+      | AsWritten -> []
       | NoGroup -> []
       | other -> [other])
     es
@@ -383,6 +394,7 @@ fun indentSpans (unit : Int) (es : [Elem]) (from : Int) : [(Int, Int, Int)] =
                  | Breaks _ _ -> (out, at)
                  | Mark _ -> (out, at)
                  | Kept -> (out, at)
+                 | AsWritten -> (out, at)
                  | NoGroup -> (out, at)
                  | _ -> (out, at + 1)))
           ([], from)
@@ -606,7 +618,10 @@ fun lastEnd (st : Style k) (g : Green k) : Int =
 -- columns in -- or something to write, at a column, and the partings it
 -- begins and ends with of its own, a level in, or -1 for none: a break it
 -- begins or ends with stands with one beside it rather than as well as it.
-data Item = Parting Int Int | Written Int (Doc ()) Int Int
+data Item
+  = Parting Int Int
+  | Written Int (Doc ()) Int Int
+  | Trailer (Doc ())
 
 use Item.*
 
@@ -721,7 +736,7 @@ fun writtenAsIs (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
              let set =
                if not fresh then w.cur
                else if opens > 0 or w.asked or w.col < 0 then 0
-               else max (w.col - base) (if w.begun then unitOf st else 0)
+               else max (w.col - base) (if w.begun and M.isSome (R.parent s) then unitOf st else 0)
              in
              let lead =
                if fresh then breaksAfter PP.nil n else PP.text (if w.shown then w.gap else "")
@@ -737,6 +752,21 @@ fun writtenAsIs (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
                   begun = True
                 }
          in
+         -- Blank space `t` met: breaks owed, if it has any, and how far in the
+         -- line it breaks to is; or else the space before what follows.
+         let blankSpace =
+           \w t ->
+             let lines = S.split "\n" t in
+             let n = min 2 (V.len lines - 1) in
+             if n == 0 then
+               (if w.owed > 0 or w.broke > 0 or S.isEmpty t then w else { w | gap = t })
+             else
+               {
+                 w | owed = max w.owed n,
+                 gap = "",
+                 col = stringByteLength (V.getOr "" lines (V.len lines - 1))
+               }
+         in
          let step =
            \w i ->
              match V.get all i with
@@ -748,18 +778,15 @@ fun writtenAsIs (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
                      -- A comment on a line of its own between two items is
                      -- neither's: the next line is set in as it would be. It
                      -- is no new item at its column, so goes on with nothing.
-                     (let after = put { w | begun = False } 0 (PP.text (S.trim t)) in
-                      { after | asked = w.asked, begun = w.begun })
-                   else
-                     let lines = S.split "\n" t in
-                     let n = min 2 (V.len lines - 1) in
-                     if n == 0 then (if w.owed > 0 or w.broke > 0 then w else { w | gap = t })
-                     else
-                       {
-                         w | owed = max w.owed n,
-                         gap = "",
-                         col = stringByteLength (V.getOr "" lines (V.len lines - 1))
-                       }
+                     -- Breaks in the same piece as the comment, before it and
+                     -- after it, are kept as the pieces of blank space around
+                     -- it would be.
+                     (match blankEnds t with
+                      | (lead, body, tail) ->
+                          let ahead = blankSpace w lead in
+                          let after = put { ahead | begun = False } 0 (PP.text body) in
+                          blankSpace { after | asked = ahead.asked, begun = w.begun } tail)
+                   else blankSpace w t
                  else if R.isTokenOf c then
                    (if S.isEmpty (R.text c) then w else put w 0 (PP.text (R.text c)))
                  else
@@ -1069,7 +1096,18 @@ fun itemsOf
          | (out, at, done) ->
              (match e with
               | Mark strength -> (V.pushBack out (Parting strength level), at, done)
-              | Kept -> (V.pushBack out (Parting (keptAt st kids found at done) level), at, done)
+              -- Read from the text: what parts the last thing written from
+              -- the next. After nothing at all -- the rule's own first
+              -- element -- it parts the node from what is before it. After
+              -- what the rule names but this node does not have, such as
+              -- attributes it has none of, it parts nothing.
+              | Kept ->
+                  if at > 0 and done < 0 then acc
+                  else (V.pushBack out (Parting (keptAt st kids found at done) level), at, done)
+              | AsWritten ->
+                  if at > 0 and done < 0 then acc
+                  else
+                    (V.pushBack out (Parting (asWrittenAt st kids found at done) level), at, done)
               | NoGroup -> acc
               | Breaks _ _ -> acc
               | Indent inner -> enclosed out at done inner (level + unitOf st)
@@ -1117,22 +1155,36 @@ fun separatedItems
   let parted =
     \a b ending ->
       let seps = V.range a b in
-      match V.foldl
-        (\acc e ->
+      -- A parting read from the text, between what was written last and
+      -- the separator or node that comes next.
+      let spaced =
+        \acc strength ->
           match acc with
           | (out, left) ->
-              (match e with
-               | Tok _ ->
-                   (match V.get left 0 with
-                    | Just j -> (V.append out (kidItem st all places kids level j), V.drop left 1)
-                    | None -> acc)
-               | Mark strength ->
-                   if V.isEmpty left and ending then acc
-                   else (V.pushBack out (Parting strength level), left)
-               | _ -> acc))
-        ([], seps)
-        between with
-      | (out, left) -> V.append out (V.concatMap (\j -> kidItem st all places kids level j) left)
+              if V.isEmpty left and ending then acc
+              else
+                let next = M.unwrapOr b (V.get left 0) in
+                let last = (next - 1) in
+                (V.pushBack out (Parting (strength (gapBetween st kids last next)) level), left)
+      in match V.foldl
+           (\acc e ->
+             match acc with
+             | (out, left) ->
+                 (match e with
+                  | Tok _ ->
+                      (match V.get left 0 with
+                       | Just j ->
+                           (V.append out (kidItem st all places kids level j), V.drop left 1)
+                       | None -> acc)
+                  | Mark strength ->
+                      if V.isEmpty left and ending then acc
+                      else (V.pushBack out (Parting strength level), left)
+                  | Kept -> spaced acc (\gap -> if S.isEmpty gap then tightly else lining)
+                  | AsWritten -> spaced acc partingOfGap
+                  | _ -> acc))
+           ([], seps)
+           between with
+         | (out, left) -> V.append out (V.concatMap (\j -> kidItem st all places kids level j) left)
   in V.concat
        (V.map
           (\i ->
@@ -1166,7 +1218,59 @@ fun keptAt (st : Style k) (kids : [Syntax k]) (found : [(Int, Int)]) (at : Int) 
        | Just c -> if blankAt (snd (R.textRange c)) then lining else tightly
        | None -> lining)
 
--- Whether the text between child `j` and the one before it has a blank line.
+-- What `aswritten` before leaf `at` is: the blank space the text had between
+-- the last thing written and the next thing the rule names, as a parting.
+fun asWrittenAt (st : Style k) (kids : [Syntax k]) (found : [(Int, Int)]) (at : Int) (done : Int)
+    : Int =
+  let next =
+    M.map
+      (\i -> fst (V.getOr absent found i))
+      (V.find (\i -> present (V.getOr absent found i)) (V.range at (V.len found)))
+  in partingOfGap (gapBetween st kids done (M.unwrapOr (0 - 1) next))
+
+-- The text between child `a` and child `b` -- or, with only one of them, the
+-- blank space before `b` or after `a`.
+fun gapBetween (st : Style k) (kids : [Syntax k]) (a : Int) (b : Int) : String =
+  let t = sourceOf st in
+  let isBlank = \i -> V.elem (stringSlice t i (i + 1)) [" ", "\n", "\t", "\r"] in
+  let rec back i = if i > 0 and isBlank (i - 1) then back (i - 1) else i in
+  let rec ahead i = if i < stringByteLength t and isBlank i then ahead (i + 1) else i in
+  match (V.get kids a, V.get kids b) with
+  | (Just x, Just y) -> stringSlice t (snd (R.textRange x)) (fst (R.textRange y))
+  | (None, Just y) -> (let to = fst (R.textRange y) in stringSlice t (back to) to)
+  | (Just x, None) -> (let from = snd (R.textRange x) in stringSlice t from (ahead from))
+  | _ -> " "
+
+-- The text between two things, as `aswritten` parts them: a blank line, a
+-- break, a space, or nothing.
+fun partingOfGap (gap : String) : Int =
+  let breaks = V.len (S.split "\n" gap) - 1 in
+  if breaks >= 2 then blanking
+  else if breaks == 1 then breaking
+  else if S.isEmpty gap then tightly
+  else spacing
+
+-- A piece of trivia's blank space before what is not blank in it, that, and
+-- its blank space after: `\n-- one\n` is a break, a comment, and a break. A
+-- grammar whose skipped text is kept as runs has comments and the breaks
+-- around them in one piece.
+fun blankEnds (t : String) : (String, String, String) =
+  let n = stringByteLength t in
+  let lead = n - stringByteLength (S.trimStart t) in
+  let tail = n - stringByteLength (S.trimEnd t) in
+  if lead >= n then (t, "", "")
+  else (stringSlice t 0 lead, stringSlice t lead (n - tail), stringSlice t (n - tail) n)
+
+fun leadOf (t : String) : String = match blankEnds t with | (l, _, _) -> l
+
+fun tailOf (t : String) : String = match blankEnds t with | (_, _, r) -> r
+
+-- How many breaks blank space has, two at most.
+fun breakCount (blank : String) : Int = min 2 (V.len (S.split "\n" blank) - 1)
+
+-- Whether the text between child `j` and the one before it has a blank line
+-- -- before the first comment on a line of its own, if there is one: a blank
+-- line after that is the comment's to keep.
 fun blankBefore (all : [Syntax k]) (places : [Int]) (j : Int) : Bool =
   let from = V.getOr 0 places (j - 1) + 1 in
   let text =
@@ -1177,13 +1281,19 @@ fun blankBefore (all : [Syntax k]) (places : [Int]) (j : Int) : Bool =
          (V.range from (V.getOr from places j)))
   in
   let pieces = S.split "\n" text in
-  V.any (\i -> S.isEmpty (S.trim (V.getOr "x" pieces i))) (V.range 1 (V.len pieces - 1))
+  -- The first line, after the first, with a comment on it.
+  let upTo =
+    M.unwrapOr
+      (V.len pieces - 1)
+      (V.find (\i -> not (S.isEmpty (S.trim (V.getOr "" pieces i)))) (V.range 1 (V.len pieces - 1)))
+  in V.any (\i -> S.isEmpty (S.trim (V.getOr "x" pieces i))) (V.range 1 upTo)
 
 -- The parting items begin with, of their own -- or -1.
 fun openingOf (items : [Item]) : Int =
   match V.get items 0 with
   | Just (Parting n _) -> n
   | Just (Written _ _ o _) -> o
+  | Just (Trailer _) -> 0 - 1
   | None -> 0 - 1
 
 -- The parting items end with, of their own -- or -1.
@@ -1191,6 +1301,7 @@ fun closingOf (items : [Item]) : Int =
   match V.last items with
   | Just (Parting n _) -> n
   | Just (Written _ _ _ c) -> c
+  | Just (Trailer _) -> breaking
   | None -> 0 - 1
 
 -- Child `j`, with the comments written before it, each on a line of its own:
@@ -1216,28 +1327,63 @@ fun kidItem
       (\i -> (let t = S.trim (textAt i) in if S.isEmpty t then [] else [(i, t)]))
       (V.range before at)
   in
+  -- A comment ended the line before it if no break comes between them -- in
+  -- the pieces before it, or in its own piece's blank space before it.
   let endsLine =
     (match V.get found 0 with
-     | Just (i, _) -> j > 0 and not (V.any (\k -> S.contains "\n" (textAt k)) (V.range before i))
+     | Just (i, _) ->
+         j > 0
+           and not (V.any (\k -> S.contains "\n" (textAt k)) (V.range before i))
+           and not (S.contains "\n" (leadOf (textAt i)))
      | None -> False)
+  in
+  -- Whether a blank line follows the comment in piece `i`: in its own blank
+  -- space after it, and the pieces up to the next comment or the child.
+  let blankAfter =
+    \i ->
+      let next =
+        M.unwrapOr
+          at
+          (V.find (\k -> k > i and M.isSome (V.find (\f -> fst f == k) found)) (V.range (i + 1) at))
+      in
+      let between =
+        S.join
+          ""
+          (V.concat [
+             [tailOf (textAt i)],
+             V.map textAt (V.range (i + 1) next),
+             (if next < at then [leadOf (textAt next)] else [])
+           ])
+      in breakCount between >= 2
   in
   let none = 0 - 1 in
   let atEnd =
     (match (endsLine, V.get found 0) with
-     | (True, Just (_, t)) -> [Written level (PP.text t) none none, Parting breaking level]
+     | (True, Just (i, t)) ->
+         V.append [Trailer (PP.text t)] (if blankAfter i then [Parting blanking level] else [])
      | _ -> [])
   in
-  let comments = V.map snd (if endsLine then V.drop found 1 else found) in
+  let comments = if endsLine then V.drop found 1 else found in
+  -- Each comment, a break after it -- two, where a blank line followed it.
+  let after = \c -> if blankAfter (fst c) then PP.append PP.hardline PP.hardline else PP.hardline in
   let commented =
-    \own -> V.foldr (\c d -> PP.append (PP.append (PP.text c) PP.hardline) d) own comments
+    \own -> V.foldr (\c d -> PP.append (PP.append (PP.text (snd c)) (after c)) d) own comments
   in
   let onlyComments =
-    if V.isEmpty comments then []
-    else
-      [
-        Written level (PP.intersperse (V.map PP.text comments) PP.hardline) none none,
-        Parting breaking level
-      ]
+    match V.last comments with
+    | None -> []
+    | Just last ->
+        [
+          Written
+            level
+            (V.foldr
+               (\c d -> PP.append (PP.append (PP.text (snd c)) (after c)) d)
+               (PP.text (snd last))
+               (V.take comments (V.len comments - 1)))
+            none
+            none,
+          Parting (if blankAfter (fst last) then blanking else breaking) level
+        ]
   in
   let opening = \opens -> if V.isEmpty comments then opens else none in
   let own =
@@ -1289,6 +1435,8 @@ fun trailing (st : Style k) (all : [Syntax k]) (last : Int) : [Item] =
 -- space between two written things nothing parts. Of several partings in a
 -- row the strongest stands -- and of a parting and a break beside it that
 -- something written begins or ends with of its own, what the stronger asks.
+-- A comment that ended a line stays at the end of it, whatever partings come
+-- before it, and a break follows it.
 fun assemble (st : Style k) (items : [Item]) : Doc () =
   match V.foldl
     (\acc item ->
@@ -1296,6 +1444,8 @@ fun assemble (st : Style k) (items : [Item]) : Doc () =
       | (doc, pending, level, closed) ->
           (match item with
            | Parting strength at -> (doc, max pending strength, at, closed)
+           | Trailer d ->
+               (PP.append doc (PP.append PP.space d), max pending breaking, level, tightly)
            | Written at d opens closes ->
                -- What ended the last written thing is there only if it is a
                -- break: a softer parting at the end of a group writes nothing.
@@ -1326,6 +1476,7 @@ fun besides (pending : Int) (beside : Int) : Doc () =
 fun partingDoc (strength : Int) : Doc () =
   if strength == tightly then PP.nil
   else if strength == cutting then PP.line_
+  else if strength == spacing then PP.space
   else if strength == lining then PP.line
   else if strength == breaking then PP.hardline
   else PP.append PP.hardline PP.hardline
@@ -1371,7 +1522,7 @@ use Written.*
 -- `indent`, `group` and `align` before parentheses -- or `indent` and
 -- `group` before a number and parentheses -- are what they say; anywhere else
 -- they are a child's name. The partings are words of their own.
-def partings : [String] = ["tight", "cut", "line", "newline", "kept"]
+def partings : [String] = ["tight", "cut", "line", "newline", "kept", "aswritten"]
 
 fun writtenOf (ts : [TokenTree]) : [Written] = writing ts 0 []
 

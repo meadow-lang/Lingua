@@ -52,7 +52,7 @@ syntax! {
     "name" = Name _
   }
   grammar {
-    File = expr:Expr
+    File = items:Expr*
     Expr = first:Term rest:Tail*
     Tail = op:"+" operand:Term
     Term = List | LetE | MatchE | Tagged | Var
@@ -75,6 +75,8 @@ format! {
   indent 2
   width 40
   skip "@fmt(skip)"
+    | File = items(newline)
+    | Tagged = attr aswritten expr
     | Expr = first rest
     | Tail = kept op kept operand
     | List = "[" indent(cut items(tight "," line)) cut "]"
@@ -84,6 +86,14 @@ format! {
 }
 
 fun listed (src : String) : String = formatListed (fst (parseLists src))
+
+format! {
+  Plain for Lists
+  indent 2
+  width 60
+}
+
+fun plain (src : String) : String = formatPlain (fst (parseLists src))
 
 @test fun aListsCommasAreBetweenItsItems () =
   let a = assertEq (listed "[a,b ,  c]") "[a, b, c]" "each after an item, and a space after it" in
@@ -172,3 +182,92 @@ fun listed (src : String) : String = formatListed (fst (parseLists src))
        (formatListedWithin 0 (fst (parseLists "[a,\n@fmt(skip) [b,\nc],\nd]")))
        "[a,\n  @fmt(skip) [b,\nc],\n  d]"
        "and when only indenting, a line that starts inside it is left alone"
+
+@test fun aCommentThatEndsALineStaysAtItsEnd () =
+  let a = assertEq (listed "[x] -- after\n[y]") "[x] -- after\n[y]" "after a separator's break" in
+  assertEq
+    (listed "[aaaaaaaaaa, -- one\nbbbbbbbbbb, cccccccccc, dddddddddd]")
+    "[\n  aaaaaaaaaa, -- one\n  bbbbbbbbbb,\n  cccccccccc,\n  dddddddddd\n]"
+    "and after the comma it followed, the list broken"
+
+@test fun aBlankLineAfterACommentIsKept () =
+  let a =
+    assertEq
+      (listed "-- top\n\n[x]\n\n-- c\n\n[y]\n")
+      "-- top\n\n[x]\n\n-- c\n\n[y]\n"
+      "after a comment, as before one"
+  in assertEq (listed "[x]\n-- c\n\n[y]") "[x]\n-- c\n\n[y]" "and only where it was"
+
+@test fun theRootsLinesStayWhereTheyWere () =
+  assertEq
+    (plain "[x]\n[y]\n\n  [z]")
+    "[x]\n[y]\n\n  [z]"
+    "a file with no rule: its items are not taken for lines that go on"
+
+@test fun asWrittenKeepsABreakASpaceOrNothing () =
+  assertEq
+    (V.map listed ["@a(b)\n[x]", "@a(b)   [x]", "@a(b)[x]", "@a(b)\n\n\n[x]"])
+    ["@a(b)\n[x]", "@a(b) [x]", "@a(b)[x]", "@a(b)\n\n[x]"]
+    "a break, a space, nothing, and a blank line, as the text had them"
+
+-- The same shapes from a lexer that skips blank space and comments, as Meadow's
+-- does: the parser keeps what it skipped as runs, a comment and the breaks
+-- around it in one piece.
+@derive(Lexer)
+@pub data Bare
+  = @regex("[ \t\r\n]+") @skip Space
+  | @regex("--[^\n]*") @skip Comment
+  | @token("[") Open
+  | @token("]") Close
+  | @token(",") Comma
+  | @token("@") At
+  | @regex("[a-z0-9]+") Name String
+
+syntax! {
+  Skips
+  lexer Bare
+  tokens { "[" = Open, "]" = Close, "," = Comma, "@" = At, "name" = Name _ }
+  grammar {
+    File = items:Item*
+    Item = attrs:Attr* thing:Thing
+    Attr = "@" name:Var
+    Thing = List | Var
+    List = "[" items:(Var ("," Var)*)? "]"
+    Var = "name"
+  }
+}
+
+format! {
+  SkipsPlain for Skips
+  indent 2
+  width 40
+}
+
+format! {
+  SkipsFiled for Skips
+  indent 2
+  width 40
+    | File = items(newline)
+    | Item = attrs(aswritten) aswritten thing
+    | List = "[" tight items(tight "," line) tight "]"
+}
+
+@test fun aCommentRunIsWrittenWithItsBreaks () =
+  let src = "-- a comment\nx\n\ny -- after\n-- before z\nz\n" in
+  let a = assertEq (formatSkipsPlain (fst (parseSkips src))) src "with no rule" in
+  assertEq (formatSkipsFiled (fst (parseSkips src))) src "and with a rule for the file"
+
+@test fun aPartingAfterNothingWrittenPartsNothing () =
+  let src = "-- top
+--
+-- more
+
+[x]
+@a
+[y]
+@b @c [z]
+" in
+  assertEq
+    (formatSkipsFiled (fst (parseSkips src)))
+    src
+    "an item with no attributes has no break before it, nor blank line before its comments"
