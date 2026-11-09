@@ -1799,11 +1799,15 @@ fun gapBetween (st : Style k) (kids : [Syntax k]) (a : Int) (b : Int) : String =
 -- The text between two things, as `aswritten` parts them: a blank line, a
 -- break, a space, or nothing.
 fun partingOfGap (gap : String) : Int =
-  let breaks = V.len (S.split "\n" gap) - 1 in
-  if breaks >= 2 then blanking
-  else if breaks == 1 then breaking
-  else if S.isEmpty gap then tightly
-  else spacing
+  let lines = S.split "\n" gap in
+  -- A blank line is a line of nothing but blank space -- not the line a
+  -- comment between the two is on.
+  let blank =
+    V.any (\i -> S.isEmpty (S.trim (V.getOr "x" lines i))) (V.range 1 (V.len lines - 1))
+  in if blank then blanking
+     else if V.len lines > 1 then breaking
+     else if S.isEmpty gap then tightly
+     else spacing
 
 -- A piece of trivia's blank space before what is not blank in it, that, and
 -- its blank space after: `\n-- one\n` is a break, a comment, and a break. A
@@ -1982,7 +1986,11 @@ fun kidItem
          let r = R.textRange c in
          if snd r > fst r then [Pos (fst r) (snd r)] else []
      | None -> [])
-  in V.concat [atEnd, placed, own]
+  in
+  -- Comments on lines of their own begin a line, whatever parting comes
+  -- before them -- where anything does, in its node.
+  let ownLine = if V.isEmpty comments or j == 0 then [] else [Parting breaking level] in
+  V.concat [atEnd, ownLine, placed, own]
 
 -- The trivia from child `from` up to `to` that is not blank: comments.
 fun commentsIn (all : [Syntax k]) (from : Int) (to : Int) : [String] =
