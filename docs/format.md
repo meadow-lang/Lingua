@@ -85,6 +85,7 @@ Its formatter rule names the same things in the same order:
 | `when 1 xs(…)(…)`, `when 7+ xs(…)(…)` | the first where `xs` is exactly one node and no separators, or seven nodes or more; the second where not |
 | `chained x` | child `x` is no group of its own: its rule breaks with this group |
 | `broken x`  | child `x`'s rule breaks, however short it is |
+| `wide x`    | child `x`'s `group N(…)`s are plain groups: on one line as far as the width |
 | `hug K…(xs)` | the last node of `xs`, where it is a `K`, may start on the line of what is before it and break inside itself before `xs` breaks |
 | `fill N`    | between a separated child's nodes: a space, or a break before a node that does not fit whole; only where each node is N tokens at most (0 for any) and there are no comments, and `line` otherwise |
 | `kept`      | `line` where the text had blank space between the two things, `tight` where it had none |
@@ -322,6 +323,16 @@ line where it is a type inline:
 record Person = {
   name : String
 }
+```
+
+**`wide x`** lets child `x`'s `group N(…)`s, and those of the nodes between it
+and what it holds, go on one line as far as the width, as plain groups do. A
+`let` that reads as one line only while it is short elsewhere may be as long
+as the line where it is alone in parentheses:
+
+```meadow
+| LetE = group 60("let" binds line "in" body)
+| Paren = "(" tight wide elems tight ")"
 ```
 
 **`hug K…(xs)`** lets the last node of a child that is many hug what comes
@@ -632,7 +643,7 @@ one-line functions over it. The same module can be used by hand:
 | `nogroup`                | a rule's first element, for one that is no group |
 | `line`, `cut`, `newline`, `tight`, `space`, `kept`, `aswritten` | the separators |
 | `ifBroke broken flat`, `whenKind kinds yes no`, `whenCount n orMore leaf yes no` | a parting by whether a group broke; a layout by a child's kind or count |
-| `chained e`, `broken e`, `fillUpTo n`, `hugging kinds e` | a child that is no group of its own; one that always breaks; running on; a last node that hugs |
+| `chained e`, `broken e`, `wide e`, `fillUpTo n`, `hugging kinds e` | a child that is no group of its own; one that always breaks; running on; a last node that hugs |
 | `layout st g`            | what `format<Name>` calls when there is a width |
 | `reindent st g`          | what it calls when there is none               |
 | `continuation st g`      | what `indent<Name>` calls                      |

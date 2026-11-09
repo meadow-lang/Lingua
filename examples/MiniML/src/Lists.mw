@@ -190,6 +190,18 @@ format! {
 
 fun blocky (src : String) : String = formatBlocky (fst (parseLists src))
 
+-- A `let` on one line only while it is 20 columns -- but as far as the width
+-- where it is alone in parentheses.
+format! {
+  Roomy for Lists
+  indent 2
+  width 80
+    | LetE = group 20("let" name "=" value "in" line body)
+    | Paren = "(" tight wide elems tight ")"
+}
+
+fun roomy (src : String) : String = formatRoomy (fst (parseLists src))
+
 format! {
   Plain for Lists
   indent 2
@@ -499,3 +511,14 @@ format! {
        (hugged "call f aaaaaaaaaaaaaa <bbbbbbbbbbbbbbbbb>")
        "call f\n  aaaaaaaaaaaaaa\n  <bbbbbbbbbbbbbbbbb>"
        "with none, it does not, though its first line would fit"
+
+@test fun aWideChildsShortGroupsAreAsWideAsTheWidth () =
+  let a =
+    assertEq
+      (roomy "let aaaa = xxxxx in aaaa")
+      "let aaaa = xxxxx in\naaaa"
+      "24 columns, more than its 20: broken"
+  in assertEq
+       (roomy "(let aaaa = xxxxx in aaaa)")
+       "(let aaaa = xxxxx in aaaa)"
+       "and in parentheses, where its parent makes it wide, on one line"
