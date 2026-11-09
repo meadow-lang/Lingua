@@ -165,8 +165,9 @@ use Pretty (Doc)
   | Fill Int
   | Hug [(String, Int, String)] Elem
   | Flat [Elem]
-  | Tiers [([String], Bool)] Int Int [Elem]
-  | Entries [String] Int [([String], Bool)] Int [Elem]
+  | Tiers [([String], Int)] Int Int [Elem]
+  | Entries [String] Int [([String], Int)] Int [Elem]
+  | Chain [([String], Int)] Int Elem
   | NoGroup
 
 use Elem.*
@@ -320,13 +321,19 @@ def blanking : Int = 7
 @pub fun entried
     (own : [String])
     (arm : Int)
-    (tiers : [([String], Bool)])
+    (tiers : [([String], Int)])
     (other : Int)
     (fallback : [Elem])
     : Elem =
   Entries own arm tiers other fallback
 
-@pub fun tiered (tiers : [([String], Bool)]) (other : Int) (indent : Int) (es : [Elem]) : Elem =
+-- A child of token trees laid out as one entry of a macro's body is: split
+-- at its operators, by `tiers`, and otherwise as the text had it -- a list in
+-- a bracket, split at its separators.
+@pub fun tokenChain (tiers : [([String], Int)]) (other : Int) (e : Elem) : Elem =
+  Chain tiers other e
+
+@pub fun tiered (tiers : [([String], Int)]) (other : Int) (indent : Int) (es : [Elem]) : Elem =
   Tiers tiers other indent es
 
 -- A child that is many whose last node may hug what is before it: start on
@@ -481,6 +488,7 @@ fun leaves (es : [Elem]) : [Elem] =
       | Flat inner -> leaves inner
       | Tiers _ _ _ inner -> leaves inner
       | Entries _ _ _ _ fallback -> leaves fallback
+      | Chain _ _ e -> [e]
       | NoGroup -> []
       | other -> [other])
     es
@@ -1186,7 +1194,7 @@ fun tieredDoc
     (kids : [Syntax k])
     (head : Int)
     (tails : [Int])
-    (tiers : [([String], Bool)])
+    (tiers : [([String], Int)])
     (other : Int)
     (indent : Int)
     : Maybe (Doc ()) =
@@ -1199,7 +1207,7 @@ fun tieredDoc
     \op ->
       M.unwrapOr
         other
-        (V.find (\i -> V.elem op (fst (V.getOr ([], False) tiers i))) (V.range 0 (V.len tiers)))
+        (V.find (\i -> V.elem op (fst (V.getOr ([], 0) tiers i))) (V.range 0 (V.len tiers)))
   in match V.get kids head with
      | None -> None
      | Just h ->
@@ -1222,7 +1230,8 @@ fun tieredDoc
                            let r = R.textRange opKid in
                            let operand =
                              PP.intersperse (V.map (\c -> docOf st c) (V.drop held 1)) PP.space
-                           in if blankAt (fst r - 1) and blankAt (snd r) then
+                           in if snd (V.getOr ([], 0) tiers (tierOf op)) == 2
+                                or blankAt (fst r - 1) and blankAt (snd r) then
                                 Just (lead, V.pushBack parts (op, tierOf op, operand))
                               else
                                 let glued =
@@ -1268,7 +1277,7 @@ fun entriesItems
     (r : (Int, Int))
     (own : [String])
     (arm : Int)
-    (tiers : [([String], Bool)])
+    (tiers : [([String], Int)])
     (other : Int)
     : Maybe [Item] =
   let t = sourceOf st in
@@ -1409,7 +1418,7 @@ fun entryDoc
     (b : Int)
     (bar : Bool)
     (arm : Int)
-    (tiers : [([String], Bool)])
+    (tiers : [([String], Int)])
     (other : Int)
     : Doc () =
   let t = sourceOf st in
@@ -1425,7 +1434,7 @@ fun entryDoc
     \op ->
       M.unwrapOr
         other
-        (V.find (\i -> V.elem op (fst (V.getOr ([], False) tiers i))) (V.range 0 (V.len tiers)))
+        (V.find (\i -> V.elem op (fst (V.getOr ([], 0) tiers i))) (V.range 0 (V.len tiers)))
   in
   let commented = V.any (\j -> not (S.isEmpty (S.trim (gap j)))) (V.range (a + 1) (b + 1)) in
   if commented then PP.text (stringSlice t (fst (range a)) (snd (range b)))
@@ -1444,16 +1453,17 @@ fun entryDoc
     in
     let from = if bar then a + 1 else a in
     let spaced = \j -> not (S.isEmpty (gap j)) in
+    let styleOf = \op -> snd (V.getOr ([], 0) tiers (tierOf op)) in
+    -- An operator spaced on both sides -- or a separator, however spaced.
     let isOp =
       \j ->
         j > from
           and j < b
-          and spaced j
-          and spaced (j + 1)
           and (match V.get kids j with
            | Just c ->
                (R.isTokenOf c or V.len (kidsOf st c) == 1)
                  and V.elem (firstTokenText st c) operators
+                 and (styleOf (firstTokenText st c) == 2 or spaced j and spaced (j + 1))
            | None -> False)
     in
     -- The lead, and each operator and what follows it up to the next.
@@ -1490,7 +1500,7 @@ fun entryDoc
        else chain
 
 fun tiersBuilt
-    (tiers : [([String], Bool)])
+    (tiers : [([String], Int)])
     (indent : Int)
     (lead : Doc ())
     (parts : [(String, Int, Doc ())])
@@ -1510,10 +1520,12 @@ fun tiersBuilt
       in
       let runOf = \from to -> V.drop (V.take parts to) from in
       let firstEnd = V.getOr (V.len parts) cuts 0 in
-      let trailing =
+      -- How the tier breaks: before its operators; after them; or, a
+      -- separator's, after it, what follows no further in than what is before.
+      let style =
         (match V.get tiers loosest with
-         | Just (_, after) -> after
-         | None -> False)
+         | Just (_, s) -> s
+         | None -> 0)
       in
       let pieces =
         V.map
@@ -1523,14 +1535,15 @@ fun tiersBuilt
             match V.get parts i with
             | Just (op, _, d) ->
                 let rest = tiersBuilt tiers indent d (runOf (i + 1) next) in
-                if trailing then PP.concat [PP.space, PP.text op, PP.line, rest]
+                if style == 2 then PP.concat [PP.text op, PP.line, rest]
+                else if style == 1 then PP.concat [PP.space, PP.text op, PP.line, rest]
                 else PP.concat [PP.line, PP.text op, PP.space, rest]
             | None -> PP.nil)
           (V.range 0 (V.len cuts))
       in PP.group
            (PP.append
               (tiersBuilt tiers indent lead (runOf 0 firstEnd))
-              (PP.nest indent (PP.concat pieces)))
+              (PP.nest (if style == 2 then 0 else indent) (PP.concat pieces)))
 
 -- `d` on one line: each place it may break as it is where it does not, and
 -- each group in it so too. A break it must have -- a comment's -- it keeps.
@@ -2032,6 +2045,34 @@ fun itemsOf
               -- could not place -- as its rule's own layout.
               -- A macro's body an entry a line, where it is entries; and
               -- where not, as the bracket's own layout says.
+              -- Token trees as one entry.
+              | Chain tiers other _ ->
+                  let r = V.getOr absent found at in
+                  if not (present r) then (out, at + 1, done)
+                  else
+                    let skipped =
+                      V.concatMap
+                        (\j -> kidItem st all places kids level j)
+                        (V.range (done + 1) (fst r))
+                    in
+                    let place =
+                      (match (V.get kids (fst r), V.get kids (snd r)) with
+                       | (Just a, Just b) -> [Pos (fst (R.textRange a)) (snd (R.textRange b))]
+                       | _ -> [])
+                    in (
+                         V.concat [
+                           out,
+                           skipped,
+                           place,
+                           [Written
+                              level
+                              (entryDoc st kids (fst r) (snd r) False (unitOf st) tiers other)
+                              (0 - 1)
+                              (0 - 1)]
+                         ],
+                         at + 1,
+                         snd r
+                       )
               | Entries own arm tiers other fallback ->
                   let plain =
                     \u ->
@@ -2702,8 +2743,9 @@ data Written
   | WGroupWithin Int [Written]
   | WAlign [Written]
   | WFlat [Written]
-  | WTiers [([String], Bool)] Int Int [Written] Loc
-  | WEntries [String] Int [([String], Bool)] Int [Written] Loc
+  | WTiers [([String], Int)] Int Int [Written] Loc
+  | WChain [([String], Int)] Int String Loc
+  | WEntries [String] Int [([String], Int)] Int [Written] Loc
   | WIfBroke String String Loc
   | WWhen [(String, Loc)] [Written] [Written] Loc
   | WWhenCount Int Bool String Loc [Written] [Written]
@@ -2771,6 +2813,14 @@ fun writing (ts : [TokenTree]) (i : Int) (out : [Written]) : [Written] =
                           (j + 2)
                           (V.pushBack out (WEntries own arm tiers other (writtenOf fallback) at)))
                | _ -> writing ts (i + 1) (V.pushBack out (WName "entries" at))))
+  | (Just (Word "chain" at), Just (Group Paren table _)) ->
+      (match V.get ts (i + 2) with
+       | Just (Group Paren inner _) ->
+           (match (tiersOf table, V.get inner 0) with
+            | ((tiers, other), Just (Word w wat)) ->
+                writing ts (i + 3) (V.pushBack out (WChain tiers other w wat))
+            | _ -> writing ts (i + 1) (V.pushBack out (WName "chain" at)))
+       | _ -> writing ts (i + 1) (V.pushBack out (WName "chain" at)))
   | (Just (Word "tiers" at), Just next) ->
       -- `tiers`, a level's width if one is given, the tiers, and the chain.
       let indent = (match next with | Num n _ -> n | _ -> 0 - 1) in
@@ -2998,24 +3048,25 @@ fun isEnumProd sorts p =
 -- operators in quotes, `trailing` where the break goes after them; and which
 -- of them is `other`, where an operator no tier names goes -- the last, where
 -- none says.
-fun tiersOf (ts : [TokenTree]) : ([([String], Bool)], Int) =
+fun tiersOf (ts : [TokenTree]) : ([([String], Int)], Int) =
   let step =
     \acc t ->
       match acc with
       | (done, (ops, after, isOther), other) ->
           (match t with
            | Str s _ -> (done, (V.pushBack ops s, after, isOther), other)
-           | Word "trailing" _ -> (done, (ops, True, isOther), other)
+           | Word "trailing" _ -> (done, (ops, 1, isOther), other)
+           | Word "sep" _ -> (done, (ops, 2, isOther), other)
            | Word "other" _ -> (done, (ops, after, True), other)
            | p ->
                if isPunct ";" p then
                  (
                    V.pushBack done (ops, after),
-                   ([], False, False),
+                   ([], 0, False),
                    if isOther then V.len done else other
                  )
                else acc)
-  in match V.foldl step ([], ([], False, False), 0 - 1) ts with
+  in match V.foldl step ([], ([], 0, False), 0 - 1) ts with
      | (done, (ops, after, isOther), other) ->
          let all = if V.isEmpty ops and not isOther then done else V.pushBack done (ops, after) in
          let o = if isOther then V.len done else other in
@@ -3037,6 +3088,7 @@ fun leafNames (ws : [Written]) : [String] =
       | WAlign inner -> leafNames inner
       | WFlat inner -> leafNames inner
       | WTiers _ _ _ inner _ -> leafNames inner
+      | WChain _ _ n _ -> [n]
       | WEntries _ _ _ _ fallback _ -> leafNames fallback
       | WWhen _ yes _ _ -> leafNames yes
       | WWhenCount _ _ _ _ yes _ -> leafNames yes
@@ -3078,7 +3130,13 @@ fun elemCode sorts tokenFields rule fs (names : [String]) (w : Written)
                 at]
          else
            inside fallback (\code ->
-             "LinguaF.entried [${S.join ", " (V.map (\k -> quote "Node${k}") own)}] (0 + ${if arm < 0 then "(0 - 1)" else show arm}) [${S.join ", " (V.map (\t -> "([${S.join ", " (V.map quote (fst t))}], ${if snd t then "True" else "False"})") tiers)}] ${show other} ${code}")
+             "LinguaF.entried [${S.join ", " (V.map (\k -> quote "Node${k}") own)}] (0 + ${if arm < 0 then "(0 - 1)" else show arm}) [${S.join ", " (V.map (\t -> "([${S.join ", " (V.map quote (fst t))}], ${show (snd t)})") tiers)}] ${show other} ${code}")
+     | WChain tiers other n at ->
+         (match fieldOfRule sorts tokenFields rule fs n at with
+          | Err failed -> Err failed
+          | Ok (kinds, many, _) ->
+              Ok
+                "LinguaF.tokenChain [${S.join ", " (V.map (\t -> "([${S.join ", " (V.map quote (fst t))}], ${show (snd t)})") tiers)}] ${show other} (LinguaF.child [${S.join ", " (V.map quote kinds)}] ${if many then "True" else "False"})")
      | WTiers tiers other indent inner at ->
          if V.len (leafNames inner) != 2 then
            Err
@@ -3087,7 +3145,7 @@ fun elemCode sorts tokenFields rule fs (names : [String]) (w : Written)
                 at]
          else
            inside inner (\code ->
-             "LinguaF.tiered [${S.join ", " (V.map (\t -> "([${S.join ", " (V.map quote (fst t))}], ${if snd t then "True" else "False"})") tiers)}] ${show other} (0 + ${if indent < 0 then "(0 - 1)" else show indent}) ${code}")
+             "LinguaF.tiered [${S.join ", " (V.map (\t -> "([${S.join ", " (V.map quote (fst t))}], ${show (snd t)})") tiers)}] ${show other} (0 + ${if indent < 0 then "(0 - 1)" else show indent}) ${code}")
      | WIfBroke broken flat at ->
          (match V.find (\w -> not (V.elem w ["tight", "cut", "space", "line", "newline"])) [
             broken,

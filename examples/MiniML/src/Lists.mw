@@ -267,7 +267,14 @@ format! {
   Macro for Lists
   indent 2
   width 40
-    | Brace = "{" entries own Mac 4("|"; "=" trailing; "->" trailing; "+")(tight trees tight) "}"
+    | Brace =
+        "{"
+          entries
+          own
+          Mac
+          4("," sep; "|"; "=" trailing; "->" trailing; "+")(indent(cut chain("," sep; "+")(trees))
+             cut)
+          "}"
 }
 
 fun bodied (src : String) : String = formatMacro (fst (parseLists src))
@@ -765,3 +772,17 @@ format! {
     (V.map runs ["< x >", "<a, b>", "<(aaaaaaaaaa, bbbbbbbbbb, cccccccccc)>"])
     ["<x>", "<a, b>", "<(aaaaaaaaaa, bbbbbbbbbb, cccccccccc)>"]
     "one thing against the brackets; a list where commas are in its items, not in a bracket within"
+
+@test fun aListInAMacrosBodyBreaksAtItsCommas () =
+  assertEq
+    (V.map bodied [
+       "mac {\nx {aaaaaaaaaa, bbbbbbbbbb, cccccccccc, dddddddddd}\ny\n}",
+       "mac {\naaaaaaaaaaaa, bbbbbbbbbbbb, cccccccccccc, dddd\ne\n}",
+       "mac {\nx {a, b}\ny\n}"
+     ])
+    [
+      "mac {\n  x {\n    aaaaaaaaaa,\n    bbbbbbbbbb,\n    cccccccccc,\n    dddddddddd\n  }\n  y\n}",
+      "mac {\n  aaaaaaaaaaaa,\n  bbbbbbbbbbbb,\n  cccccccccccc,\n  dddd\n  e\n}",
+      "mac {\n  x {a, b}\n  y\n}"
+    ]
+    "a list within an item a line, an entry split at its commas, and what fits on one line"
