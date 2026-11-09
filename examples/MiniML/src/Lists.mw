@@ -46,6 +46,7 @@ syntax! {
   Lists
   lexer Tok
   trivia { Space, Comment }
+  starts { Arm, Expr }
   tokens {
     "let" = Let,
     "in" = In,
@@ -267,6 +268,10 @@ format! {
   Macro for Lists
   indent 2
   width 40
+  reparse "|" parseListsArm else parseListsExpr
+    | Arm = "|" pat "->" indent(line body)
+    | Expr = first indent(rest)
+    | Tail = line op operand
     | Brace =
         "{"
           entries
@@ -751,9 +756,9 @@ format! {
       "mac {\n  aaaaaaaaaaaa =\n    bbbbbbbbbbbb + cccccccccccc\n  e = f\n}"
       "at its loosest, a level in"
   in assertEq
-       (bodied "mac {\n| aaaaaaaaaaaaaaaa -> bbbbbbbbbbbbbbbbbbbbbb\n| c -> d\n}")
-       "mac {\n  | aaaaaaaaaaaaaaaa ->\n      bbbbbbbbbbbbbbbbbbbbbb\n  | c -> d\n}"
-       "and an arm's body four in from its `|`"
+       (bodied "mac {\n| aaaaaaa bbbbbbbb -> cccccccccccccccccccccc\n| c -> d\n}")
+       "mac {\n  | aaaaaaa bbbbbbbb ->\n      cccccccccccccccccccccc\n  | c -> d\n}"
+       "and, where it does not read as an arm, an arm's body four in from its `|`"
 
 @test fun aBodyThatIsNoEntriesIsLaidOutAsItsBracketSays () =
   assertEq
@@ -786,3 +791,14 @@ format! {
       "mac {\n  x {a, b}\n  y\n}"
     ]
     "a list within an item a line, an entry split at its commas, and what fits on one line"
+
+@test fun anEntryThatReadsAsTheLanguageIsLaidOutAsItIs () =
+  let a =
+    assertEq
+      (bodied "mac {\nhead\n| aaaa -> bbbbbbbbbb + cccccccccc + dddddddddd\n}")
+      "mac {\n  head\n    | aaaa ->\n      bbbbbbbbbb\n        + cccccccccc\n        + dddddddddd\n}"
+      "an arm, by the rules for an arm and what is in it"
+  in assertEq
+       (bodied "mac {\nx = y\nz = w\n}")
+       "mac {\n  x = y\n  z = w\n}"
+       "and what does not read as the language, by its tokens"

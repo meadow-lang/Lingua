@@ -37,6 +37,7 @@ errors in it.
 | `indent N`   | how many spaces a level is                                       | 2               |
 | `width N`    | how wide a line may be                                           | none: indent only |
 | `skip "…"`   | a node with a child reading as this, blank space aside, is kept as it was written; may be given more than once | none |
+| `reparse "|" f else g` | a macro body's entry starting `|` is read by `f`, any other by `g`, and laid out as a tree of the language where it reads with no error | none |
 
 `indent` comes before `width`, and `width` before `skip`. Whether there is a `width` decides which of two
 modes the formatter works in; see [Two modes](#two-modes).
@@ -473,6 +474,17 @@ an entry a line:
   chain("," sep)(trees)) cut` breaks a list in a body an item a line. The body of a `|`
   entry is `N` columns in from its `|` (two levels, where `N` is not given).
   An entry with a comment among its trees is written as it was.
+- **As the language, where it reads as the language.** With `reparse "|"
+  parseSurfaceArm else parseSurfaceExpr` in the header, an entry is first
+  read by one of those: an entry starting with `|` by the first, any other by
+  the second. Where it reads whole with no error, it is laid out by the
+  formatter's rules as that tree, as the same text anywhere else would be:
+  an application's arguments, a hug, a `let`, all as the language has them.
+  Where it does not, such as a field of a `lang!` or a rule of a `syntax!`,
+  it is split by its tokens as above. The readers are what `syntax!` writes
+  for the rules a `starts { Arm, Expr }` section names: `parse<Lang><Rule>`,
+  the text read as that rule, with an error where the rule ends before the
+  text does.
 
 **`skip "@fmt(skip)"`** in the header keeps a node exactly as it was written,
 comments and all, when one of its children reads as that text, blank space
