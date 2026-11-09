@@ -79,6 +79,9 @@ Its formatter rule names the same things in the same order:
 | `cut`       | nothing, or a line break where its group breaks                           |
 | `newline`   | a line break, always; its group and every group around it break           |
 | `tight`     | nothing: the two things touch                                             |
+| `space`     | a space, always: one that does not break when its group does              |
+| `ifbroke(a, b)` | after a group: parting `a` where that group broke, `b` where it did not |
+| `when K(…)(…)` | a child laid out by the first where it is a `K`, and by the second where it is not |
 | `kept`      | `line` where the text had blank space between the two things, `tight` where it had none |
 | `aswritten` | as the text had it: `newline` where it had a break (a blank line where it had one), a space where it had blank space on one line, nothing where the two touched |
 | (nothing)   | a single space                                                            |
@@ -221,6 +224,40 @@ not a place to break, so a break elsewhere in the group does not move it.
 rule's first element they part the node from what comes before it, as in
 `Tail = kept op kept operand`. After children the node does not have, such
 as a declaration's attributes when it has none, they part nothing.
+
+**`ifbroke(a, b)`** chooses the parting after a group by whether the group
+broke. `a` and `b` are each one of `tight`, `cut`, `space`, `line` and
+`newline`. A `let` whose body goes on its `in`'s line when the binding broke,
+and on a line of its own when the binding did not but the whole `let` does not
+fit:
+
+```meadow
+| LetE = group 60(group("let" name "=" indent(line value) line "in") ifbroke(space, line) body)
+```
+
+```text
+let a =                                     let a = x in
+  [bbbbbbbbbb, cccccccccc, dddddddddd]      [bbbbbbbbbb, cccccccccc, dddddddddd]
+in a
+```
+
+The group is tried on one line, followed by `b`. If that does not fit, it is
+laid out broken, followed by `a`.
+
+**`when K(…)(…)`** lays a child out one way when it is a `K` (through nodes
+that hold nothing but one node, as for `breaks`) and another way when it is
+not. Several kinds may be named, `when IfE MatchE(…)(…)`, and both layouts
+name the same child. An `else if` that goes on with the chain:
+
+```meadow
+| IfE = "if" cond "then" group(indent(line yes)) line "else" when IfE(no)(group(indent(line no)))
+```
+
+```text
+if aaaaaaaa then xxxxxxxx
+else if bbbbbbbb then yyyyyyyy
+else zzzzzzzz
+```
 
 **`skip "@fmt(skip)"`** in the header keeps a node exactly as it was written,
 comments and all, when one of its children reads as that text, blank space
@@ -494,7 +531,8 @@ one-line functions over it. The same module can be used by hand:
 | `style unit width name trivia rules` | a formatter; `width` 0 for indent only |
 | `tok`, `child`, `indented`, `indentedBy n`, `grouped`, `groupedWithin n`, `aligned`, `separated kinds between`, `breaksAt n leaf` | the pieces of a rule |
 | `nogroup`                | a rule's first element, for one that is no group |
-| `line`, `cut`, `newline`, `tight`, `kept` | the separators              |
+| `line`, `cut`, `newline`, `tight`, `space`, `kept`, `aswritten` | the separators |
+| `ifBroke broken flat`, `whenKind kinds yes no` | a parting by whether a group broke; a child by its kind |
 | `layout st g`            | what `format<Name>` calls when there is a width |
 | `reindent st g`          | what it calls when there is none               |
 | `continuation st g`      | what `indent<Name>` calls                      |

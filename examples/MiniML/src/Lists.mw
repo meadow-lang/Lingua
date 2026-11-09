@@ -18,6 +18,9 @@ use Std.Test (assertEq)
   | @token("in") In
   | @token("match") Match
   | @token("with") With
+  | @token("if") If
+  | @token("then") Then
+  | @token("else") Else
   | @token("|") Bar
   | @token("->") Arrow
   | @token("=") Equals
@@ -39,6 +42,9 @@ syntax! {
     "in" = In,
     "match" = Match,
     "with" = With,
+    "if" = If,
+    "then" = Then,
+    "else" = Else,
     "|" = Bar,
     "->" = Arrow,
     "=" = Equals,
@@ -55,7 +61,8 @@ syntax! {
     File = items:Expr*
     Expr = first:Term rest:Tail*
     Tail = op:"+" operand:Term
-    Term = List | LetE | MatchE | Tagged | Var
+    Term = List | LetE | MatchE | IfE | Tagged | Var
+    IfE = "if" cond:Expr "then" yes:Expr "else" no:Expr
     Tagged = attr:Attr expr:Expr
     Attr = "@" name:Var "(" arg:Var ")"
     List = "[" items:(Expr ("," Expr)* ","?)? "]"
@@ -86,6 +93,31 @@ format! {
 }
 
 fun listed (src : String) : String = formatListed (fst (parseLists src))
+
+-- A `let` whose body goes on its `in`'s line when the binding broke, and on
+-- a line of its own when the binding did not but the whole does not fit;
+-- and an `if` whose `else` goes on with another `if` as one chain.
+format! {
+  Chained for Lists
+  indent 2
+  width 40
+    | File = items(newline)
+    | Expr = first rest
+    | Tail = kept op kept operand
+    | LetE =
+        group
+          60(breaks
+             2
+             body
+             group("let" name "=" indent(line value) line "in")
+             ifbroke(space, line)
+             body)
+    | IfE =
+        "if" cond "then" group(indent(line yes)) line "else" when IfE(no)(group(indent(line no)))
+    | List = "[" indent(cut items(tight "," line)) cut "]"
+}
+
+fun chained (src : String) : String = formatChained (fst (parseLists src))
 
 format! {
   Plain for Lists
@@ -258,16 +290,37 @@ format! {
   assertEq (formatSkipsFiled (fst (parseSkips src))) src "and with a rule for the file"
 
 @test fun aPartingAfterNothingWrittenPartsNothing () =
-  let src = "-- top
---
--- more
-
-[x]
-@a
-[y]
-@b @c [z]
-" in
+  let src = "-- top\n--\n-- more\n\n[x]\n@a\n[y]\n@b @c [z]\n" in
   assertEq
     (formatSkipsFiled (fst (parseSkips src)))
     src
     "an item with no attributes has no break before it, nor blank line before its comments"
+
+@test fun whatFollowsAGroupIsChosenByWhetherItBroke () =
+  let a = assertEq (chained "let a = x in a") "let a = x in a" "on one line, as it fits" in
+  let b =
+    assertEq
+      (chained "let a = [bbbbbbbbbb, cccccccccc, dddddddddd] in a")
+      "let a =\n  [bbbbbbbbbb, cccccccccc, dddddddddd]\nin a"
+      "the binding broke: the body on the `in`'s line"
+  in assertEq
+       (chained "let a = x in [bbbbbbbbbb, cccccccccc, dddddddddd]")
+       "let a = x in\n[bbbbbbbbbb, cccccccccc, dddddddddd]"
+       "the binding did not, and the whole does not fit: the body on a line of its own"
+
+@test fun aChildIsLaidOutAsItsKindSays () =
+  let a =
+    assertEq
+      (chained "if a then x else if b then y else z")
+      "if a then x else if b then y else z"
+      "on one line, as it fits"
+  in
+  let b =
+    assertEq
+      (chained "if aaaaaaaa then xxxxxxxx else if bbbbbbbb then yyyyyyyy else zzzzzzzz")
+      "if aaaaaaaa then xxxxxxxx\nelse if bbbbbbbb then yyyyyyyy\nelse zzzzzzzz"
+      "an `if` after `else` goes on with the chain, on the `else`'s line"
+  in assertEq
+       (chained "if a then x else [zzzzzzzzzz, wwwwwwwwww, vvvvvvvvvv]")
+       "if a then x\nelse\n  [zzzzzzzzzz, wwwwwwwwww, vvvvvvvvvv]"
+       "and anything else under the `else`, a level in"

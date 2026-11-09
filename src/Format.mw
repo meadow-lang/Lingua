@@ -33,6 +33,13 @@
 --               things, `tight` where it had none
 --   aswritten   as the text had it: a break, a blank line, a space -- one
 --               that stays a space -- or nothing
+--   space       a space, always
+--   ifbroke(space, line)
+--               after a group: the first where it broke, the second where
+--               it did not
+--   when IfE(no)(group(indent(line no)))
+--               a child laid out by the first where it is an `IfE`, and by
+--               the second where it is not
 --   items("," line)
 --               a child that is many, with its separators between two of
 --               its nodes -- each token the one the tree has there -- and
@@ -130,6 +137,8 @@ use Pretty (Doc)
   | Mark Int
   | Kept
   | AsWritten
+  | IfBroke Int Int
+  | When [String] [Elem] [Elem]
   | NoGroup
 
 use Elem.*
@@ -190,6 +199,19 @@ def blanking : Int = 5
 -- one -- a space where it had blank space on one line, and nothing where the
 -- two things touch.
 @pub def aswritten : Elem = AsWritten
+
+-- A space, always: one that does not break when its group does.
+@pub def space : Elem = Mark spacing
+
+-- After a group: `broken` where that group broke, `flat` where it did not.
+@pub fun ifBroke (broken : Elem) (flat : Elem) : Elem =
+  let strength = \e -> (match e with | Mark n -> n | _ -> lining) in
+  IfBroke (strength broken) (strength flat)
+
+-- What a child is laid out as, by its kind: `yes` where it is -- through
+-- nodes that hold nothing but one node -- one of `kinds`, and `no` where it
+-- is not. Both name the one child.
+@pub fun whenKind (kinds : [String]) (yes : [Elem]) (no : [Elem]) : Elem = When kinds yes no
 
 -- A formatter: how wide a level is, how wide a line may be -- 0 for one that
 -- only indents -- what a kind is called, which kinds are trivia, the rules,
@@ -288,6 +310,8 @@ fun leaves (es : [Elem]) : [Elem] =
       | Mark _ -> []
       | Kept -> []
       | AsWritten -> []
+      | IfBroke _ _ -> []
+      | When _ yes _ -> leaves yes
       | NoGroup -> []
       | other -> [other])
     es
@@ -395,6 +419,8 @@ fun indentSpans (unit : Int) (es : [Elem]) (from : Int) : [(Int, Int, Int)] =
                  | Mark _ -> (out, at)
                  | Kept -> (out, at)
                  | AsWritten -> (out, at)
+                 | IfBroke _ _ -> (out, at)
+                 | When _ _ no -> through out at no
                  | NoGroup -> (out, at)
                  | _ -> (out, at + 1)))
           ([], from)
@@ -849,6 +875,14 @@ fun groupWithin (n : Int) (d : Doc ()) : Doc () =
          d
          (PP.flatAlt PP.nil (PP.column (\stop -> if stop - start > n then PP.fail else PP.nil)))))
 
+-- `d` and the parting after it: `flat` where `d` goes on one line, and
+-- `broken` where it does not. The first is tried, `d` made to fail if it
+-- breaks; and if that does not fit, it is the second.
+fun eitherBroken (d : Doc ()) (broken : Int) (flat : Int) : Doc () =
+  PP.union
+    (PP.append (PP.group (PP.append d (PP.flatAlt PP.fail PP.nil))) (partingDoc flat))
+    (PP.append d (partingDoc broken))
+
 -- What a group that must break holds: nothing, broken, and on one line, a
 -- failure -- so neither it nor any group around it goes on one line.
 def unflat : Doc () = PP.flatAlt PP.nil PP.fail
@@ -935,6 +969,7 @@ fun breaksIn (es : [Elem]) : [(Int, Int)] =
       | Indent inner -> breaksIn inner
       | IndentBy _ inner -> breaksIn inner
       | Align inner -> breaksIn inner
+      | When _ yes no -> V.append (breaksIn yes) (breaksIn no)
       | _ -> [])
     es
 
@@ -1108,6 +1143,48 @@ fun itemsOf
                   if at > 0 and done < 0 then acc
                   else
                     (V.pushBack out (Parting (asWrittenAt st kids found at done) level), at, done)
+              -- The thing written last, as it is where it broke and as it
+              -- is where it did not, each with its own parting after it.
+              | IfBroke broken flat ->
+                  (match V.last out with
+                   | Just (Written w d opens _) ->
+                       (
+                         V.pushBack
+                           (V.take out (V.len out - 1))
+                           (Written w (eitherBroken d broken flat) opens tightly),
+                         at,
+                         done
+                       )
+                   | _ -> (V.pushBack out (Parting flat level), at, done))
+              -- The child laid out as its kind says.
+              | When kinds yes no ->
+                  -- The first child the layouts name, past their tokens.
+                  let first =
+                    M.unwrapOr
+                      0
+                      (V.find
+                         (\i ->
+                           match V.get (leaves yes) i with
+                           | Just (Tok _) -> False
+                           | _ -> True)
+                         (V.range 0 (V.len (leaves yes))))
+                  in
+                  let kind =
+                    (match V.get kids (fst (V.getOr absent found (at + first))) with
+                     | Just c -> kindName st (inmost st c)
+                     | None -> "")
+                  in (match itemsOf
+                        st
+                        all
+                        places
+                        kids
+                        found
+                        holds
+                        (if V.elem kind kinds then yes else no)
+                        level
+                        at
+                        done with
+                      | (items, at2, done2) -> (V.append out items, at2, done2))
               | NoGroup -> acc
               | Breaks _ _ -> acc
               | Indent inner -> enclosed out at done inner (level + unitOf st)
@@ -1513,6 +1590,8 @@ data Written
   | WGroup [Written]
   | WGroupWithin Int [Written]
   | WAlign [Written]
+  | WIfBroke String String Loc
+  | WWhen [(String, Loc)] [Written] [Written] Loc
   | WSep String Loc [Written]
   | WBreaks Int String Loc
   | WMark String
@@ -1522,7 +1601,7 @@ use Written.*
 -- `indent`, `group` and `align` before parentheses -- or `indent` and
 -- `group` before a number and parentheses -- are what they say; anywhere else
 -- they are a child's name. The partings are words of their own.
-def partings : [String] = ["tight", "cut", "line", "newline", "kept", "aswritten"]
+def partings : [String] = ["tight", "cut", "space", "line", "newline", "kept", "aswritten"]
 
 fun writtenOf (ts : [TokenTree]) : [Written] = writing ts 0 []
 
@@ -1552,6 +1631,25 @@ fun writing (ts : [TokenTree]) (i : Int) (out : [Written]) : [Written] =
        | _ -> writing ts (i + 1) (V.pushBack out (WName "group" at)))
   | (Just (Word "align" _), Just (Group Paren inner _)) ->
       writing ts (i + 2) (V.pushBack out (WAlign (writtenOf inner)))
+  | (Just (Word "ifbroke" at), Just (Group Paren inner _)) ->
+      (match V.concatMap (\t -> match t with | Word w _ -> [w] | _ -> []) inner with
+       | words ->
+           writing
+             ts
+             (i + 2)
+             (V.pushBack out (WIfBroke (V.getOr "" words 0) (V.getOr "" words 1) at)))
+  | (Just (Word "when" at), Just (Word _ _)) ->
+      -- `when` and its kinds, then the two layouts.
+      let kinds =
+        V.concatMap
+          (\t -> match t with | Word w wat -> [(w, wat)] | _ -> [])
+          (V.takeWhile (\t -> match t with | Word _ _ -> True | _ -> False) (V.drop ts (i + 1)))
+      in
+      let next = i + 1 + V.len kinds in
+      (match (V.get ts next, V.get ts (next + 1)) with
+       | (Just (Group Paren yes _), Just (Group Paren no _)) ->
+           writing ts (next + 2) (V.pushBack out (WWhen kinds (writtenOf yes) (writtenOf no) at))
+       | _ -> writing ts (i + 1) (V.pushBack out (WName "when" at)))
   | (Just (Word "breaks" at), Just (Num n _)) ->
       (match V.get ts (i + 2) with
        | Just (Word w wat) -> writing ts (i + 3) (V.pushBack out (WBreaks n w wat))
@@ -1675,6 +1773,7 @@ fun leafNames (ws : [Written]) : [String] =
       | WGroup inner -> leafNames inner
       | WGroupWithin _ inner -> leafNames inner
       | WAlign inner -> leafNames inner
+      | WWhen _ yes _ _ -> leafNames yes
       | _ -> [])
     ws
 
@@ -1698,6 +1797,42 @@ fun elemCode sorts tokenFields rule fs (names : [String]) (w : Written)
      | WGroup inner -> inside inner (\code -> "LinguaF.grouped ${code}")
      | WGroupWithin n inner -> inside inner (\code -> "LinguaF.groupedWithin ${show n} ${code}")
      | WAlign inner -> inside inner (\code -> "LinguaF.aligned ${code}")
+     | WIfBroke broken flat at ->
+         (match V.find (\w -> not (V.elem w ["tight", "cut", "space", "line", "newline"])) [
+            broken,
+            flat
+          ] with
+          | Just w ->
+              Err
+                [Fail
+                   "`ifbroke(broken, flat)` is two partings -- `tight`, `cut`, `space`, `line` or `newline` -- and `${w}` is not one"
+                   at]
+          | None -> Ok "LinguaF.ifBroke LinguaF.${broken} LinguaF.${flat}")
+     | WWhen kinds yes no at ->
+         let prodNames =
+           V.concatMap
+             (\s ->
+               match s with
+               | Sort _ ps -> V.map (\p -> match p with | Prod m _ -> m) ps)
+             sorts
+         in (match V.find (\k -> not (V.elem (fst k) prodNames)) kinds with
+             | Just (k, kat) -> Err [Fail "no rule of the grammar is called ${k}" kat]
+             | None ->
+                 if leafNames yes != leafNames no then
+                   Err
+                     [Fail
+                        "`when` lays one child out two ways: both name the same things, in the same order"
+                        at]
+                 else
+                   match (
+                     elemsCode sorts tokenFields rule fs names yes,
+                     elemsCode sorts tokenFields rule fs names no
+                   ) with
+                   | (Ok a, Ok b) ->
+                       Ok
+                         "LinguaF.whenKind [${S.join ", " (V.map (\k -> quote "Node${fst k}") kinds)}] ${a} ${b}"
+                   | (Err failed, _) -> Err failed
+                   | (_, Err failed) -> Err failed)
      | WIndent inner -> inside inner (\code -> "LinguaF.indented ${code}")
      | WIndentBy n inner ->
          inside inner (\code ->
