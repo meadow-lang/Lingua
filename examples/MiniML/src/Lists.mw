@@ -110,14 +110,40 @@ format! {
              2
              body
              group("let" name "=" indent(line value) line "in")
-             ifbroke(space, line)
-             body)
+             when
+             LetE(newline body)(ifbroke(space, line) body))
     | IfE =
-        "if" cond "then" group(indent(line yes)) line "else" when IfE(no)(group(indent(line no)))
+        "if"
+          cond
+          "then"
+          group(indent(line yes))
+          line
+          "else"
+          when
+          IfE(chained no)(group(indent(line no)))
     | List = "[" indent(cut items(tight "," line)) cut "]"
 }
 
 fun chained (src : String) : String = formatChained (fst (parseLists src))
+
+-- A list of seven items or more run on, as many to a line as fit, while each
+-- is one token; and a list of one item, with no comma, spaced inside.
+format! {
+  Filled for Lists
+  indent 2
+  width 30
+    | List =
+        when
+          1
+          items("[" items "]")(when
+             7+
+             items("[" indent(cut items(tight "," fill 1)) cut "]")("["
+                indent(cut items(tight "," line))
+                cut
+                "]"))
+}
+
+fun filled (src : String) : String = formatFilled (fst (parseLists src))
 
 format! {
   Plain for Lists
@@ -324,3 +350,48 @@ format! {
        (chained "if a then x else [zzzzzzzzzz, wwwwwwwwww, vvvvvvvvvv]")
        "if a then x\nelse\n  [zzzzzzzzzz, wwwwwwwwww, vvvvvvvvvv]"
        "and anything else under the `else`, a level in"
+
+@test fun aChainBreaksAsOne () =
+  let a =
+    assertEq
+      (chained "if aaaaaaaa then xxxxxxxx else if bbbb then yyyy else zzzz")
+      "if aaaaaaaa then xxxxxxxx\nelse if bbbb then yyyy\nelse zzzz"
+      "every `else` of it once one breaks, though the inner `if` would fit"
+  in assertEq
+       (chained "let a = x in let b = y in b")
+       "let a = x in\nlet b = y in\nb"
+       "and a `let` chain's next step on a line of its own"
+
+@test fun whatALayoutBeginsWithSeesWhatCameBeforeIt () =
+  assertEq
+    (chained "let a = [bbbbbbbbbb, cccccccccc, dddddddddd] in a")
+    "let a =\n  [bbbbbbbbbb, cccccccccc, dddddddddd]\nin a"
+    "`ifbroke` first in a `when`'s layout sees the group before the `when`"
+
+@test fun aNodeIsLaidOutByHowManyItHolds () =
+  let a =
+    assertEq
+      (V.map filled ["[x]", "[x,]", "[a, b]", "[]"])
+      ["[ x ]", "[x,]", "[a, b]", "[]"]
+      "one item and no comma one way; a comma, two, or none the other"
+  in assertEq
+       (filled "[aaaaaa, bbbbbb, cccccc, dddddd, eeeeee, ffffff]")
+       "[\n  aaaaaa,\n  bbbbbb,\n  cccccc,\n  dddddd,\n  eeeeee,\n  ffffff\n]"
+       "six: an item a line"
+
+@test fun smallItemsRunOnAsManyToALineAsFit () =
+  let a =
+    assertEq
+      (filled "[aaaa, bbbb, cccc, dddd, eeee, ffff, gggg, hhhh]")
+      "[\n  aaaa, bbbb, cccc, dddd,\n  eeee, ffff, gggg, hhhh\n]"
+      "eight of a token each: as many to a line as fit"
+  in
+  let b =
+    assertEq
+      (filled "[a, b, c, d, e, f, g]")
+      "[a, b, c, d, e, f, g]"
+      "and on one line where they all fit"
+  in assertEq
+       (filled "[aaaa, bbbb, cccc, dddd, eeee, ffff, let a = x in a]")
+       "[\n  aaaa,\n  bbbb,\n  cccc,\n  dddd,\n  eeee,\n  ffff,\n  let a = x in a\n]"
+       "but an item a line where one is more than a token"
