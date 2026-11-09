@@ -426,8 +426,11 @@ fixities:
 
 The tiers are written loosest first and parted by `;`, each a list of
 operators. `trailing` puts a tier's break after its operators instead of
-before them, and `other` is the tier of any operator the table does not
-name (the last tier, where no tier says `other`). The chain is split at the
+before them. `sep` makes a tier's operators separators: the break goes after
+them, what follows is no further in than what is before, and they split the
+chain however they are spaced, so `a, b` and `a,b` both split at the comma.
+`other` is the tier of any operator the table does not name (the last tier,
+where no tier says `other`). The chain is split at the
 loosest tier present, each part split the same way at the next. Each split
 is a group: the first part, then, a level in, each operator and the part
 after it.
@@ -463,7 +466,11 @@ an entry a line:
   two kept where the text had one, and the bracket closing on a line of its
   own. A `|` entry after one that is not is a level further in.
 - **Within an entry,** the trees are split at its spaced operators as `tiers`
-  splits a chain, and are otherwise as the text had them. The body of a `|`
+  splits a chain, and are otherwise as the text had them. A `sep` tier, such
+  as `"," ";" sep`, splits an entry's list at its commas.
+- **`chain(TABLE)(trees)`** lays out a child of token trees as one entry,
+  split by the table, as a bracket's `ELSE` layout may: `indent(cut
+  chain("," sep)(trees)) cut` breaks a list in a body an item a line. The body of a `|`
   entry is `N` columns in from its `|` (two levels, where `N` is not given).
   An entry with a comment among its trees is written as it was.
 
