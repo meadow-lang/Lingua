@@ -26,12 +26,14 @@ until there are no more. `for Session` means the prompt makes its database with
 
 ## Features
 
-Only `text` and `eval` are required. Each of the others turns something on.
+Only `text` and one of `eval` or `answer` are required. Each of the others
+turns something on.
 
 | feature        | type                                         | what it gives                              |
 | -------------- | -------------------------------------------- | ------------------------------------------ |
 | `text`         | `db -> Int -> String -> ()`                  | how what is typed reaches the compiler     |
-| `eval`         | `db -> Int -> String`                        | what entering an entry prints              |
+| `eval`         | `db -> Int -> String`                        | what entering an entry prints; nothing, if it is empty |
+| `answer`       | `db -> Int -> [Spoken]`                      | in place of `eval`: what entering it answers, a part at a time, each `ToOut` or `ToErr` |
 | `tree`         | `db -> Int -> Green k`                       | colour, multi-line entries, indentation    |
 | `errors`       | `db -> Int -> [Int]`                         | where the parser's errors are, in bytes    |
 | `completion`   | `db -> Int -> Int -> [(String, String)]`     | Tab: names and what each is, at a byte     |
@@ -40,16 +42,25 @@ Only `text` and `eval` are required. Each of the others turns something on.
 | `panes`        | `[(String, db -> Int -> String -> Int -> Opened e)]` | the language's panes, each opened by a key or a command: see [Panes](#panes) |
 | `modes`        | `[(String, db -> String -> Maybe String)]`   | the modes a command may enter: see [Modes](#modes) |
 | `status`       | `db -> Int -> String`                        | what is written above every line           |
-| `start`        | `db -> String -> String`                     | a mode's: what entering it with a text does and says |
+| `start`        | `db -> String -> String`                     | what beginning says: a mode's, given the text it was entered with; the prompt's own, given `""` |
 | `indent`       | `Green k -> String`                          | what a continuation line opens with        |
 | `commands`     | `[(String, String, String, db -> String -> Reply)]` | the language's own `:` lines        |
+| `unknown`      | `db -> String -> Reply`                      | a `:` line that is no command: what it does, given the whole line |
 | `prompt`       | text                                         | what a line starts with; `"> "` if omitted |
 | `history`      | text                                         | the file entries are kept in between runs  |
 | `theme`        | text                                         | the theme it starts in; `soft` if omitted  |
+| `own`          | text                                         | which of the prompt's own commands it has: `"help quit"`; all three if omitted |
+| `remember`     | text                                         | `"lines"` to keep `:` lines in the history too; `"entries"` if omitted |
+| `interrupt`    | text                                         | `"quit"` for Ctrl-C to end the prompt; `"drop"`, giving the entry up, if omitted |
 
-`prompt`, `history` and `theme` are text in quotes; the rest are function
-names. Mixing them up, naming a feature a prompt does not have, or leaving out
-`text` or `eval` is an error where it was written.
+`prompt`, `history`, `theme`, `own`, `remember` and `interrupt` are text in
+quotes; the rest are function names. Mixing them up, naming a feature a prompt
+does not have, leaving out `text`, or giving both `eval` and `answer` or
+neither, is an error where it was written.
+
+Each of `answer`'s parts is written on a line of its own: a `ToOut` to
+standard output, a `ToErr` to standard error, in order. An empty one writes
+nothing. `LinguaRepl.saying` makes an `answer` of an `eval`.
 
 Without `tree` the prompt colours nothing from the tree, never indents, and
 takes every entry as finished. (A database with a language server is still
@@ -99,7 +110,7 @@ The line is [LineEditor](https://github.com/meadow-lang/LineEditor)'s.
 | Enter                                  | enter a finished entry, or start a new line       |
 | Alt-Enter, Ctrl-J                      | start a new line                                  |
 | Ctrl-F                                 | open the finder                                   |
-| Ctrl-C                                 | give the entry up                                 |
+| Ctrl-C                                 | give the entry up; with `interrupt = "quit"`, end the prompt |
 | Ctrl-D on an empty entry               | end the prompt                                    |
 
 Pasted text goes in as it is.
@@ -274,10 +285,12 @@ back to `soft`.
 ## Commands
 
 A line that starts with `:` is for the prompt, not the language. It is not
-coloured, never counts as unfinished, is not evaluated, and is not written to
-the history file.
+coloured, never counts as unfinished, and is not evaluated. It is written to
+the history file only with `remember = "lines"`. A command's name ends at
+blank space of any kind, so `:t` and an entry on the line after it is `:t`
+given that entry.
 
-Every prompt has three:
+Every prompt has three, unless `own` names fewer:
 
 | command        | does                                                             |
 | -------------- | ---------------------------------------------------------------- |
@@ -288,7 +301,10 @@ Every prompt has three:
 
 An unknown theme lists the ones there are. A name that is no command is
 answered with what there is: `` `:x` is not something this prompt does: it has
-`:type`, `:help`, `:quit`, `:theme` ``.
+`:type`, `:help`, `:quit`, `:theme` ``. With `unknown`, the language answers
+it instead, given the whole line: `Reply.Entry line` hands it to the parser,
+as a language whose own syntax has `:` lines would. A prompt command `own`
+leaves out is such a line too.
 
 Tab completes a command's name while the cursor is in it.
 
