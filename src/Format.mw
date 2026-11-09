@@ -1566,26 +1566,52 @@ fun entriesItems
                    let before = if a == fst r then "" else gap a in
                    let lines = S.split "\n" before in
                    let trailer = S.trim (V.getOr "" lines 0) in
-                   let own = V.filter (\l -> not (S.isEmpty l)) (V.map S.trim (V.drop lines 1)) in
-                   let blank =
-                     V.any
-                       (\i -> S.isEmpty (S.trim (V.getOr "x" lines i)))
-                       (V.range 1 (V.len lines - 1))
+                   -- The lines between the one the entry before ends and the
+                   -- one this begins, each trimmed: a comment, or nothing.
+                   let middle = V.map S.trim (V.drop (V.take lines (V.len lines - 1)) 1) in
+                   let said =
+                     V.filter
+                       (\i -> not (S.isEmpty (V.getOr "" middle i)))
+                       (V.range 0 (V.len middle))
                    in
+                   let blankIn =
+                     \from to -> V.any (\i -> S.isEmpty (V.getOr "x" middle i)) (V.range from to)
+                   in
+                   let parted = \b -> Parting (if b then blanking else breaking) at in
                    let lead =
                      V.concat [
                        (if S.isEmpty trailer then [] else [Trailer (PP.text trailer)]),
-                       [Parting (if blank then blanking else breaking) at],
-                       (if V.isEmpty own then []
-                        else
-                          [
-                            Written
-                              at
-                              (PP.intersperse (V.map PP.text own) PP.hardline)
-                              (0 - 1)
-                              (0 - 1),
-                            Parting breaking at
-                          ])
+                       (match (V.get said 0, V.last said) with
+                        | (Just first, Just last) ->
+                            -- Comments on lines of their own, and a blank line
+                            -- before them, between two, and after them, where
+                            -- the text had one.
+                            [
+                              parted (blankIn 0 first),
+                              Written
+                                at
+                                (fst
+                                   (V.foldl
+                                      (\acc i ->
+                                        match acc with
+                                        | (d, prev) ->
+                                            (
+                                              PP.concat [
+                                                d,
+                                                PP.hardline,
+                                                (if blankIn (prev + 1) i then PP.hardline
+                                                 else PP.nil),
+                                                PP.text (V.getOr "" middle i)
+                                              ],
+                                              i
+                                            ))
+                                      (PP.text (V.getOr "" middle first), first)
+                                      (V.drop said 1)))
+                                (0 - 1)
+                                (0 - 1),
+                              parted (blankIn (last + 1) (V.len middle))
+                            ]
+                        | _ -> [parted (blankIn 0 (V.len middle))])
                      ]
                    in (
                         V.append

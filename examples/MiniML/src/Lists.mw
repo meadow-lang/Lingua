@@ -768,6 +768,20 @@ format! {
        "mac {\n  a = b + c\n  d = e\n}"
        "and a line that starts with an operator goes on with the entry before, at its column too"
 
+@test fun aBlankLineAroundACommentInAMacroBodyIsKeptWhereItWas () =
+  assertEq
+    (V.map bodied [
+       "mac {\na = b\n\n-- c\n\nd = e\n}",
+       "mac {\na = b\n-- c\n\n-- d\nd = e\n}",
+       "mac {\na = b\n\n-- c\nd = e\n}"
+     ])
+    [
+      "mac {\n  a = b\n\n  -- c\n\n  d = e\n}",
+      "mac {\n  a = b\n  -- c\n\n  -- d\n  d = e\n}",
+      "mac {\n  a = b\n\n  -- c\n  d = e\n}"
+    ]
+    "before the comments, between two, and after them"
+
 @test fun aBarEntryUnderAHeadingIsALevelIn () =
   let a =
     assertEq
