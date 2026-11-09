@@ -565,6 +565,11 @@ several lines, is left alone.
 Formatting changes the space between tokens and nothing else. This is checked
 by the tests for both whole and broken programs.
 
+- **Nothing but blank space changes, or nothing does.** `format<Name>` checks
+  what it laid out against the text, blank space aside. Where they differ,
+  which would be a fault in the formatter, it gives the text back as it was:
+  better unformatted than changed. `Lingua.Format.layoutUnchecked` is the
+  same layout unchecked, for a test that looks for such faults.
 - **Every token survives, in order.** The rules are matched against the
   lossless tree's children as they are met. A child a rule did not name,
   something the parser could not place, is written where it was.
@@ -683,6 +688,7 @@ one-line functions over it. The same module can be used by hand:
 | `ifBroke broken flat`, `whenKind kinds yes no`, `whenCount n orMore leaf yes no` | a parting by whether a group broke; a layout by a child's kind or count |
 | `chained e`, `broken e`, `wide e`, `fillUpTo n`, `hugging kinds e` | a child that is no group of its own; one that always breaks; running on; a last node that hugs |
 | `layout st g`            | what `format<Name>` calls when there is a width |
+| `layoutUnchecked st g`   | the same, not checked against the text          |
 | `reindent st g`          | what it calls when there is none               |
 | `continuation st g`      | what `indent<Name>` calls                      |
 | `within st width`        | the formatter at another width                 |

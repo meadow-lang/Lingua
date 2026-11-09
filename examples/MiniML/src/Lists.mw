@@ -622,3 +622,13 @@ format! {
     (chained "let a = x in\nlet b = y in\n-- note\nb")
     "let a = x in\nlet b = y in\n-- note\nb"
     "the step's `line` broke, and the comment's break is that one, not another"
+
+@test fun nothingIsLostWhereALineAfterABreakIsTooLong () =
+  let src =
+    "let a = x in\nlet b  =  y in\nmatch zzzz with | aaaa -> bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb | c -> d | e -> f"
+  in
+  let squeezed = \s -> S.join "" (S.split " " (S.join "" (S.split "\n" s))) in
+  let a = assertEq (squeezed (chained src)) (squeezed src) "every token still there, in order" in
+  -- What formatting gives back as it was, when it would have lost text, is
+  -- not laid out: so laid out, nothing was lost on the way.
+  assertEq (chained src == src) False "and laid out, not given back as it was"

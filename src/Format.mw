@@ -802,6 +802,17 @@ use Item.*
 -- rule on one line if it fits, and broken where its rule says if not.
 @pub fun layout (style : Style k) (g : Green k) : String =
   let t = G.text g in
+  let laid = layoutUnchecked style g in
+  -- Laying out changes blank space and nothing else. Where it changed
+  -- anything else -- a fault, which may have lost what was written -- the
+  -- text is given back as it was: better unformatted than changed.
+  if unblank laid == unblank t then laid else t
+
+-- The tree's text laid out as `layout` lays it out, but not checked against
+-- the text: what a test of the formatter compares, to find where `layout`
+-- gave a text back because laying it out changed more than its space.
+@pub fun layoutUnchecked (style : Style k) (g : Green k) : String =
+  let t = G.text g in
   let st = reading style t in
   match PP.render (widthOf st) (docOf st (R.root g)) with
   | Ok out ->
@@ -818,6 +829,10 @@ use Item.*
       in S.trimEnd (S.join "\n" lines)
            ++ (if S.endsWith "\n" t and not (S.isEmpty (S.trim out)) then "\n" else "")
   | Err _ -> t
+
+-- `t` without its blank space.
+fun unblank (t : String) : String =
+  S.fromChars (V.filter (\c -> not (V.elem (C.code c) [32, 9, 10, 13])) (S.chars t))
 
 -- Whether a token of `g` has blank space before a line's end in it.
 fun blankEndsInATokenOf (g : Green k) : Bool =
@@ -1047,7 +1062,13 @@ fun groupWithin (n : Int) (d : Doc ()) : Doc () =
 -- breaks; and if that does not fit, it is the second.
 fun eitherBroken (d : Doc ()) (broken : Int) (flat : Int) : Doc () =
   PP.union
-    (PP.append (PP.group (PP.append d (PP.flatAlt PP.fail PP.nil))) (partingDoc flat))
+    -- Something after the parting, nothing as it is: a break the first way
+    -- ends with goes on to what is after it, and must find that within the
+    -- way being tried -- a break at the very end would go on to what follows
+    -- the union, and where the way was then given up, that would be lost.
+    (PP.append
+       (PP.append (PP.group (PP.append d (PP.flatAlt PP.fail PP.nil))) (partingDoc flat))
+       (Doc.Text ""))
     (PP.append d (partingDoc broken))
 
 -- What a group of `items` is, `normal` as it is laid out: where a node may
