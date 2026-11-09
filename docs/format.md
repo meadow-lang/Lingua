@@ -63,6 +63,9 @@ Its formatter rule names the same things in the same order:
 **Pieces.**
 
 - A **token** is written as it is in the grammar, in quotes: `"let"`, `"="`.
+  It is the kind the grammar's token table gives that name, so one the lexer
+  spells many ways is found however it is spelled: `"interp_start"` for
+  `"interp_start" = InterpStart _`, whatever piece of a string it is.
 - A **child** is written by its label: `value`, `body`. A child the grammar did
   not label goes by the name its accessor has: `Paren` holds an unlabelled
   `Expr`, so its rule says `expr`.
