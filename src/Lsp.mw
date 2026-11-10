@@ -33,6 +33,13 @@
 --   format        db -> Int -> String              its text, set out: what a
 --                                                  formatter (`format!`) makes
 --                                                  of its tree
+--   opened        db -> Int -> String -> ()        where a file the editor
+--                                                  opens is -- its uri --
+--                                                  before its text is set
+--   closed        db -> Int -> ()                  a file the editor closed:
+--                                                  what the language keeps of
+--                                                  it forgotten, and the files
+--                                                  still open looked at again
 --
 -- Only `text` is needed; the server says it can do what it was given.
 --
@@ -373,11 +380,12 @@ fun answeredBy (features : [String]) : [String] =
 -- `setText` of every edit, `diagnose` asked what is wrong in each open file
 -- after it, and `answer` given every other request -- its method, the file
 -- it is about, the file's text and the byte it points at -- answering `None`
--- for one nobody answers, and an error for one refused. `own` are the
--- methods the language answers itself, which may be about no file, and
--- `extra` what else it says the server can do; `hears` are the
--- notifications the language hears, and `heard` what it does at one, saying
--- whether what is wrong may have changed.
+-- for one nobody answers, and an error for one refused. `closed`, if there
+-- is one, is told of each file the editor closes, and the files still open
+-- are looked at again. `own` are the methods the language answers itself,
+-- which may be about no file, and `extra` what else it says the server can
+-- do; `hears` are the notifications the language hears, and `heard` what it
+-- does at one, saying whether what is wrong may have changed.
 @pub fun serve
     name
     features
@@ -385,6 +393,7 @@ fun answeredBy (features : [String]) : [String] =
     (hears : [String])
     extra
     opened
+    closed
     setText
     diagnose
     answer
@@ -393,6 +402,7 @@ fun answeredBy (features : [String]) : [String] =
     (name, features, own, extra)
     hears
     (edited opened setText)
+    closed
     diagnose
     answer
     heard
@@ -483,8 +493,8 @@ fun utf8 (bytes : [Int]) : [Char] =
       else go (i + 1) (V.pushBack out (C.fromCode x))
   in go 0 []
 
-fun looping about hears setText diagnose answer heard docs (stage : Stage) =
-  let again = \d s -> looping about hears setText diagnose answer heard d s in
+fun looping about hears setText closed diagnose answer heard docs (stage : Stage) =
+  let again = \d s -> looping about hears setText closed diagnose answer heard d s in
   match about with
   | (name, features, own, extra) ->
       match readMessage () with
@@ -521,7 +531,14 @@ fun looping about hears setText diagnose answer heard docs (stage : Stage) =
                           let w = publishAll name diagnose d2 in
                           again d2 stage)))
           else if method == "textDocument/didClose" then
-            (let u = cleared uri in again (closing docs uri) stage)
+            (let u = cleared uri in
+             let d2 = closing docs uri in
+             match (closed, fileOf docs uri) with
+             | (Just close, Just file) ->
+                 (let w = close file in
+                  let x = publishAll name diagnose d2 in
+                  again d2 stage)
+             | _ -> again d2 stage)
           else
             match id with
             | None ->
@@ -606,6 +623,7 @@ data Arrived = Got Json | NoMore | Found Int
     (hears : [String])
     extra
     opened
+    closed
     setText
     diagnose
     answer
@@ -618,6 +636,7 @@ data Arrived = Got Json | NoMore | Found Int
     (name, features, own, extra)
     (hears, heard)
     (edited opened setText)
+    closed
     diagnose
     answer
     interrupt
@@ -663,6 +682,7 @@ fun attending
     about
     hearing
     setText
+    closed
     diagnose
     answer
     interrupt
@@ -673,7 +693,7 @@ fun attending
     (edit : Int)
     working =
   let again =
-    \d s e w -> attending about hearing setText diagnose answer interrupt allow inbox d s e w
+    \d s e w -> attending about hearing setText closed diagnose answer interrupt allow inbox d s e w
   in
   -- Every open file looked at on a thread of its own, as edit `at` left
   -- them.
@@ -726,7 +746,16 @@ fun attending
                                    t
                                in look d2 stage (edit + 1)))
                 else if method == "textDocument/didClose" then
-                  (let u = cleared uri in again (closing docs uri) stage edit working)
+                  (let u = cleared uri in
+                   let d2 = closing docs uri in
+                   match (closed, fileOf docs uri) with
+                   | (Just close, Just file) ->
+                       -- What the language forgets may change what is wrong
+                       -- in the rest, so the looking is stopped first.
+                       (let s = stopping working interrupt allow in
+                        let w = close file in
+                        look d2 stage (edit + 1))
+                   | _ -> again d2 stage edit working)
                 else
                   match id with
                   | None ->
@@ -1170,7 +1199,7 @@ use Lingua.Pipe (named)
 def features : [String] =
   [
     "text", "diagnostics", "tree", "hover", "definition", "references", "completion", "symbols",
-    "format", "resolved", "requests", "capabilities", "opened", "refuse", "notifications"
+    "format", "resolved", "requests", "capabilities", "opened", "closed", "refuse", "notifications"
   ]
 
 -- `| hover = hoverAt`: a feature, where it was written, and the function.
@@ -1249,6 +1278,7 @@ fun lspCode pub name lang db (threaded : Bool) fs =
     (LinguaLsp.methodsOf ${notifications})
     ${if has "capabilities" then fn "capabilities" else "[]"}
     (\\file uri -> ${if has "opened" then "${fn "opened"} db file uri" else "()"})
+    ${if has "closed" then "(Just (\\file -> ${fn "closed"} db file))" else "None"}
     (\\file t -> ${fn "text"} db file t)
     (\\file -> ${if has "diagnostics" then "${fn "diagnostics"} db file" else "[]"})
     (\\docs method file t offset params ->
@@ -1340,6 +1370,7 @@ fun lengths () =
        []
        [("experimental", J.jBool True)]
        (\file uri -> ())
+       None
        (\file t -> ())
        (\file -> [])
        (\docs method file t offset params ->
@@ -1503,6 +1534,7 @@ fun poked () =
     (methodsOf pokes)
     []
     (\file uri -> ())
+    None
     (\file t -> ())
     (\file -> [Diagnostic Severity.Error "wrong" (Meta 0 1) [] []])
     (\docs method file t offset params -> answerOr None (\() -> None))
@@ -1543,6 +1575,37 @@ fun notice (method : String) (params : Json) : Json =
        [1, 0, 1]
        "what is wrong in it said, cleared when it is closed, not looked at until it is opened again"
 
+-- A server that keeps which files it has the text of, and forgets one when
+-- it is closed: what is wrong in a file is one thing for each file it keeps.
+fun keeping () =
+  let kept = newRef [] in
+  serve
+    "test"
+    ["text", "diagnostics", "closed"]
+    []
+    []
+    []
+    (\file uri -> ())
+    (Just (\file -> setRef kept (V.filter (\f -> f != file) (getRef kept))))
+    (\file t ->
+      if V.elem file (getRef kept) then () else setRef kept (V.pushBack (getRef kept) file))
+    (\file -> V.map (\f -> Diagnostic Severity.Error "kept" (Meta 0 1) [] []) (getRef kept))
+    (\docs method file t offset params -> answerOr None (\() -> None))
+    (\a -> False)
+
+@test fun aClosedFileTheLanguageForgetsHasTheRestLookedAtAgain () =
+  let said =
+    told
+      [
+        opening "file:///a" "x",
+        opening "file:///b" "y",
+        notice "textDocument/didClose" (about "file:///a")
+      ]
+      keeping
+  in
+  let a = assertEq (publishedOf "file:///a" said) [1, 2, 0] "the closed file, cleared" in
+  assertEq (publishedOf "file:///b" said) [2, 1] "and the other, looked at without it"
+
 @test fun aNotificationTheLanguageHearsHasEveryOpenFileLookedAtAgain () =
   let said =
     told
@@ -1579,6 +1642,10 @@ fun notice (method : String) (params : Json) : Json =
 -- A server on threads, serving, given what has arrived for it already: what
 -- it wrote. It hears `test/poke`, and does `poke` then.
 fun attended (arrived : [Arrived]) setText diagnose answer interrupt allow poke =
+  attendedClosing arrived setText None diagnose answer interrupt allow poke
+
+-- The same, told of each file closed with `closed`, if there is one.
+fun attendedClosing (arrived : [Arrived]) setText closed diagnose answer interrupt allow poke =
   let inbox = Thread.newChannel () in
   let u = V.foldl (\acc a -> Thread.send inbox a) () arrived in
   written
@@ -1588,6 +1655,7 @@ fun attended (arrived : [Arrived]) setText diagnose answer interrupt allow poke 
             ("test", ["text"], ["test/go"], [])
             (["test/poke"], \a -> poke ())
             (\o file t -> setText file t)
+            closed
             diagnose
             (\docs method file t offset params ->
               M.map (\j -> Ok j) (answer docs method file t offset params))
@@ -1693,6 +1761,29 @@ fun attended (arrived : [Arrived]) setText diagnose answer interrupt allow poke 
       (\() -> False)
   in assertEq (publishedOf "file:///a" said) [0] "only that nothing is wrong in it, when it closed"
 
+@test fun aClosedFileTheLanguageForgetsHasTheRestLookedAtAgainOnAThread () =
+  let kept = Stm.newTVarIO [] in
+  let said =
+    attendedClosing
+      [
+        Arrived.Got (opening "file:///a" "x"),
+        Arrived.Got (opening "file:///b" "y"),
+        Arrived.Got (notice "textDocument/didClose" (about "file:///a")),
+        Arrived.NoMore
+      ]
+      (\file t -> Stm.atomically (\() -> Stm.modifyTVar kept (\k -> V.pushBack k file)))
+      (Just (\file ->
+         Stm.atomically (\() -> Stm.modifyTVar kept (\k -> V.filter (\f -> f != file) k))))
+      (\file ->
+        V.map (\f -> Diagnostic Severity.Error "kept" (Meta 0 1) [] []) (Stm.readTVarIO kept))
+      (\docs method file t offset params -> None)
+      (\() -> ())
+      (\() -> ())
+      (\() -> False)
+  in
+  let a = assertEq (V.last (publishedOf "file:///a" said)) (Just 0) "the closed file, cleared" in
+  assertEq (V.last (publishedOf "file:///b" said)) (Just 1) "and the other, looked at without it"
+
 @test fun aNotificationHeardStopsTheLookingAndLooksAgain () =
   -- Looking never ends by itself until it has been stopped once; the
   -- language hears the notification, changing nothing, and what it had not
@@ -1751,6 +1842,7 @@ fun located () =
     []
     []
     (\file uri -> setRef seen (V.pushBack (getRef seen) "${show file} at ${pathOf uri}"))
+    None
     (\file t -> setRef seen (V.pushBack (getRef seen) "${show file} is ${t}"))
     (\file -> [])
     (\docs method file t offset params ->
