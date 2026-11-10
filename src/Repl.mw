@@ -68,7 +68,7 @@
 --                                                  it comes and written then,
 --                                                  in order with what the run
 --                                                  itself prints
---   unknown      db -> String -> Reply            a line that starts with `:`
+--   unknown       db -> String -> Reply            a line that starts with `:`
 --                                                  and is no command: what it
 --                                                  does -- an `Entry`, say
 --   prompt        what a line starts with; `history`, the file entries are
