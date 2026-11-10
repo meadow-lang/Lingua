@@ -1188,3 +1188,16 @@ format! {
     (formatFlatShort (fst (parseLists "[aaaa,bbbb,   cccc]")))
     "[aaaa, bbbb, cccc]"
     "the group longer than it may be on one line, and not the whole text as it was written"
+
+@test fun aCommentAtTheEndOfTheTextKeepsItsLine () =
+  let srcs = ["x\n\n-- end\n", "x\n-- one\n-- two", "x -- after\n\n\n-- last\n"] in
+  let a =
+    assertEq
+      (V.map listed srcs)
+      ["x\n\n-- end\n", "x\n-- one\n-- two", "x -- after\n\n-- last\n"]
+      "after a blank line, a break, or on the line of what is before it, as the text had it"
+  in
+  assertEq
+    (V.map (\x -> formatSkipsFiled (fst (parseSkips x))) srcs)
+    ["x\n\n-- end\n", "x\n-- one\n-- two", "x -- after\n\n-- last\n"]
+    "and so where the comments and the breaks around them are one piece"

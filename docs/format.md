@@ -725,6 +725,9 @@ by the tests for both whole and broken programs.
   the end of a line, after the token before it, stays at the end of that
   line, with a line break after it, whatever separator the rule puts before
   what follows. A blank line before or after a comment is kept, one at most.
+  Comments after a node's last thing, such as those at the end of a file
+  after its last declaration, keep the line, break, or blank line the text
+  had before each of them.
 - **Skipped text kept as runs.** A grammar whose lexer skips blank space and
   comments (`@skip`), rather than declaring them `trivia`, has them in the
   tree as runs: a comment and the line breaks around it in one piece. Such a
