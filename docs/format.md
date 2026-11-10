@@ -493,8 +493,11 @@ an entry a line:
   of kind `K` or `L` -- at any depth -- what that node holds. The operators
   found so are split by the table, and every other node is laid out by its
   own rule. A child that is many is found across the table's operators
-  between its nodes. Its loosest tier breaks with what holds the chain, so a
-  brace's commas go a line each where the brace breaks:
+  between its nodes. `chain N(…)` sets what follows a part's first operand
+  `N` columns in from it, rather than a level, and leaves that operand where
+  it is: a signature's type, `chain 4("->" "=>" trailing; "!")(ty implies
+  eff)`, as rustfmt sets one. Its loosest tier breaks with what holds the
+  chain, so a brace's commas go a line each where the brace breaks:
 
   ```meadow
   | BraceE =
