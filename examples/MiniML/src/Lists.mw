@@ -1104,3 +1104,72 @@ format! {
     (formatChainyFar (fst (parseLists "(aaaaaaaa + bbbbbbbb + cccccccc, dd)")))
     "(\n  aaaaaaaa\n      + bbbbbbbb\n      + cccccccc,\n  dd\n)"
     "its `+`s four in, and its first operand and its commas where they would be"
+
+@test fun aListInABraceBreaksAnItemALineWithIt () =
+  assertEq
+    (bodied "mac {\nhead xxxxxxxxxxxx {aaaa, bbbb, cccc, dddd, eeee}\n}")
+    "mac {\n  head xxxxxxxxxxxx {\n    aaaa,\n    bbbb,\n    cccc,\n    dddd,\n    eeee\n  }\n}"
+    "its commas break where the brace does, though what is between them fits a line"
+
+-- What a list holds lined up after its `[`.
+format! {
+  SkipsAligned for Skips
+  indent 2
+  width 40
+    | File = items(newline)
+    | List = "[" tight align(items(tight "," line)) tight "]"
+}
+
+@test fun aCommentsLinesAreAllSetInWhereItIs () =
+  assertEq
+    (formatSkipsAligned (fst (parseSkips "[a,\n-- one\n-- two\n    -- three\nb]\n")))
+    "[a,\n -- one\n -- two\n     -- three\n b]\n"
+    "each line of a run of them where the first is, or as far in from it as it was"
+
+-- Items that run on, an operator's operands a step in where it breaks.
+format! {
+  FilledApplied for Lists
+  indent 2
+  width 26
+    | Vec = when + "," body("<" indent(cut body) cut ">")("<" tight body tight ">")
+    | VecBody = first filled 4 tail
+    | VecItem = nogroup tight "," line expr
+    | Expr = first indent(rest)
+    | Tail = line op operand
+}
+
+@test fun anItemRunOnBreaksBeforeItAndNotWithin () =
+  assertEq
+    (formatFilledApplied (fst (parseLists "<aaaa, bbbb, cccc, ddddd + ee, ff>")))
+    "<\n  aaaa, bbbb, cccc,\n  ddddd + ee, ff\n>"
+    "`ddddd + ee` on the next line whole, and not broken at its `+`"
+
+@test fun aBarEntrysBodyAfterItsArrowOrEqualsIsTheLanguage () =
+  assertEq
+    (bodied
+       "mac {\nhead\n| p {aaaaaaaaaa, bbbbbbbbbb, cccccccccc} -> x\n| q {r} y = zzzzzzzzzz + wwwwwwwwww + vvvvvvvvvv\n}")
+    "mac {\n  head\n    | p {\n      aaaaaaaaaa,\n      bbbbbbbbbb,\n      cccccccccc\n    } -> x\n    | q {r} y =\n        zzzzzzzzzz\n          + wwwwwwwwww\n          + vvvvvvvvvv\n}"
+    "the body on the line its pattern ends where it fits, and one after `=` laid out by the rules where no `->` is"
+
+-- A list in a brace whose items run on from four of them, each one token.
+format! {
+  MacroRuns for Lists
+  indent 2
+  width 24
+    | Mac = "mac" body
+    | Brace = "{" indent(cut chain("," sep 4 1; "+")(trees)) cut "}"
+}
+
+@test fun aListOfSoManySmallItemsRunsOn () =
+  assertEq
+    (V.map (\x -> formatMacroRuns (fst (parseLists x))) [
+       "mac {aaaa, bbbb, cccc, dddd, eeee, ffff}",
+       "mac {aaaaaaaa, bbbbbbbb, cccccccc}",
+       "mac {aaaa, bbbb, cccc, dddd + e, ffff}"
+     ])
+    [
+      "mac {\n  aaaa, bbbb, cccc,\n  dddd, eeee, ffff\n}",
+      "mac {\n  aaaaaaaa,\n  bbbbbbbb,\n  cccccccc\n}",
+      "mac {\n  aaaa,\n  bbbb,\n  cccc,\n  dddd + e,\n  ffff\n}"
+    ]
+    "four or more run on, three do not, nor any where one is more than a token"

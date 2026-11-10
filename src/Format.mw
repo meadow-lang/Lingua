@@ -1258,9 +1258,9 @@ fun writtenAsIs (st : Style k) (s : Syntax k) : (Doc (), Int, Bool) =
                      -- after it, are kept as the pieces of blank space around
                      -- it would be.
                      (match blankEnds t with
-                      | (lead, body, tail) ->
+                      | (lead, _, tail) ->
                           let ahead = blankSpace w lead in
-                          let after = put { ahead | begun = False } 0 (PP.text body) in
+                          let after = put { ahead | begun = False } 0 (commentOf st c) in
                           blankSpace { after | asked = ahead.asked, begun = w.begun } tail)
                    else blankSpace w t
                  else
@@ -1721,12 +1721,12 @@ fun entryDoc
     (tiers : [([String], Int)])
     (other : Int)
     : Doc () =
-  entryDocAs st kids a b bar arm tiers other True False
+  entryDocAs st kids a b bar arm tiers other True 0
 
 -- The same, the trees read as the language first only where `reread` --
--- not where they are the language's nodes already -- and, where `opened`,
--- broken at their loosest operators with what holds them: a typed chain's
--- commas a line each where its brace breaks.
+-- not where they are the language's nodes already -- and broken at their
+-- loosest operators with what holds them where `opened` is 2, or 1 and they
+-- are separators: a chain's commas a line each where its brace breaks.
 fun entryDocAs
     (st : Style k)
     (kids : [Syntax k])
@@ -1737,7 +1737,7 @@ fun entryDocAs
     (tiers : [([String], Int)])
     (other : Int)
     (reread : Bool)
-    (opened : Bool)
+    (opened : Int)
     : Doc () =
   let t = sourceOf st in
   let range =
@@ -1770,19 +1770,26 @@ fun entryDocAs
           | (g, errs) -> if V.isEmpty errs and G.text g == text then Just g else None)
      | None -> None)
   in
-  -- Where a `|` entry does not read as an arm, what follows its `->` may
-  -- still read as the language -- a `pass!` arm whose pattern says `later`,
-  -- and whose body is an expression like any other. Its pattern is split as
-  -- below, and its body laid out by the rules, `arm` in.
+  -- Where a `|` entry does not read as an arm, what follows its `->` -- or,
+  -- with none, its first `=` -- may still read as the language: a `pass!`
+  -- arm whose pattern says `later`, or a `database!` query's definition,
+  -- and a body that is an expression like any other. What is before it is
+  -- split as below, and the body laid out by the rules, `arm` in.
+  let bodyAfter =
+    \op ->
+      V.find
+        (\j ->
+          match V.get kids j with
+          | Just c -> firstTokenText st c == op
+          | None -> False)
+        (V.range (a + 1) b)
+  in
   let body =
     if not bar or not reread or M.isSome tree then None
     else
-      (match V.find
-         (\j ->
-           match V.get kids j with
-           | Just c -> firstTokenText st c == "->"
-           | None -> False)
-         (V.range (a + 1) b) with
+      (match (match bodyAfter "->" with
+              | Just k -> Just k
+              | None -> bodyAfter "=") with
        | Just k ->
            let bodyText = stringSlice t (fst (range (k + 1))) (snd (range b)) in
            (match M.map snd (V.find (\x -> fst x == "") (readersOf st)) with
@@ -1796,14 +1803,16 @@ fun entryDocAs
   in match (tree, body) with
      | (Just g, _) -> bareDoc (reading st text) (R.root g)
      | (None, Just (k, g, bodyText)) ->
-         PP.group
-           (PP.concat [
-              PP.text "|",
-              PP.space,
-              entryDocAs st kids (a + 1) (k - 1) False (unitOf st) tiers other False False,
-              PP.text " ->",
-              PP.nest arm (PP.append PP.line (bareDoc (reading st bodyText) (R.root g)))
-            ])
+         let op = (match V.get kids k with | Just c -> firstTokenText st c | None -> "->") in
+         -- The body on the line the pattern ends, where it fits there --
+         -- `} -> 1` after a pattern that broke -- and `arm` in under it if not.
+         PP.concat [
+           PP.text "|",
+           PP.space,
+           entryDocAs st kids (a + 1) (k - 1) False (unitOf st) tiers other False 0,
+           PP.text (" " ++ op),
+           PP.group (PP.nest arm (PP.append PP.line (bareDoc (reading st bodyText) (R.root g))))
+         ]
      | (None, None) ->
          if commented then PP.text text
          else
@@ -1831,7 +1840,7 @@ fun entryDocAs
                   | Just c ->
                       (R.isTokenOf c or V.len (kidsOf st c) == 1)
                         and V.elem (firstTokenText st c) operators
-                        and (styleOf (firstTokenText st c) == 2 or spaced j and spaced (j + 1))
+                        and (isSep (styleOf (firstTokenText st c)) or spaced j and spaced (j + 1))
                   | None -> False)
            in
            -- Two things side by side are an application: on one line if it
@@ -1910,6 +1919,43 @@ fun entryDocAs
                ((PP.nil, False, False), [])
                (V.range from (b + 1))
            in
+           let listed =
+             (match built with
+              | (_, parts) ->
+                  let loosest =
+                    V.foldl (\m p -> match p with | (_, tier, _) -> min m tier) 1000000 parts
+                  in isSep (snd (V.getOr ([], 0) tiers loosest)))
+           in
+           -- Where the loosest operators are a `sep N M` tier's, whether its
+           -- items run on: `N` of them at least, each `M` tokens at most, with
+           -- no bracket. If not, the tier is a plain `sep`.
+           let ops = V.filter isOp (V.range from (b + 1)) in
+           let loosestTier = V.foldl (\m j -> min m (tierOf (opAt j))) 1000000 ops in
+           let cutsAt = V.filter (\j -> tierOf (opAt j) == loosestTier) ops in
+           let runStyle = snd (V.getOr ([], 0) tiers loosestTier) in
+           let bounds = V.concat [[from - 1], cutsAt, [b + 1]] in
+           let small =
+             \k ->
+               let counted =
+                 V.map
+                   (\j ->
+                     match V.get kids j with
+                     | Just c -> tokensOfNode st [] c
+                     | None -> (0, False, False))
+                   (V.range (V.getOr 0 bounds k + 1) (V.getOr 0 bounds (k + 1)))
+               in (tokensUpTo runStyle <= 0
+                  or V.foldl (\n x -> match x with | (c, _, _) -> n + c) 0 counted
+                     <= tokensUpTo runStyle)
+                    and not (V.any (\x -> match x with | (_, h, br) -> h or br) counted)
+           in
+           let runsOn =
+             fillsFrom runStyle > 0
+               and V.len cutsAt + 1 >= fillsFrom runStyle
+               and V.all small (V.range 0 (V.len bounds - 1))
+           in
+           let tiers =
+             if runsOn then tiers else V.map (\t -> (fst t, if snd t >= 100 then 2 else snd t)) tiers
+           in
            let built =
              (match built with
               | (lead, parts) ->
@@ -1926,7 +1972,7 @@ fun entryDocAs
            -- them: a brace's commas a line each where the brace breaks.
            let chain =
              (match built with
-              | Doc.Group inner -> if opened then inner else built
+              | Doc.Group inner -> if opened == 2 or opened == 1 and listed then inner else built
               | _ -> built)
            in if bar then
                 PP.concat [
@@ -1935,6 +1981,17 @@ fun entryDocAs
                   chain
                 ]
               else chain
+
+-- Whether a tier's style is a separator's: `sep`, or `sep N M`.
+fun isSep (style : Int) : Bool = style == 2 or style >= 100
+
+-- How many items a `sep N M` tier runs on from: `N`, or 0 for one that never
+-- does.
+fun fillsFrom (style : Int) : Int = if style >= 100 then style % 1000 - 100 else 0
+
+-- How many tokens each item of a `sep N M` tier may be, to run on: `M`, or 0
+-- for any.
+fun tokensUpTo (style : Int) : Int = style / 1000
 
 fun tiersBuilt
     (tiers : [([String], Int)])
@@ -1966,6 +2023,9 @@ fun tiersBuilt
          | Just (_, s) -> s
          | None -> 0)
       in
+      -- A separator's tier that runs its items on: a space after each, or a
+      -- break before an item that does not fit whole.
+      let filling = fillsFrom style > 0 in
       let pieces =
         V.map
           (\k ->
@@ -1974,7 +2034,9 @@ fun tiersBuilt
             match V.get parts i with
             | Just (op, _, d) ->
                 let rest = tiersBuilt tiers indent afterSep d (runOf (i + 1) next) in
-                if style == 2 then PP.concat [PP.text op, PP.line, rest]
+                if isSep style then
+                  (if filling then PP.concat [PP.text op, PP.softline, flattened rest]
+                   else PP.concat [PP.text op, PP.line, rest])
                 else if style == 1 then PP.concat [PP.space, PP.text op, PP.line, rest]
                 else PP.concat [PP.line, PP.text op, PP.space, rest]
             | None -> PP.nil)
@@ -1982,7 +2044,7 @@ fun tiersBuilt
       in PP.group
            (PP.append
               (tiersBuilt tiers indent afterSep lead (runOf 0 firstEnd))
-              (PP.nest (if style == 2 then afterSep else indent) (PP.concat pieces)))
+              (PP.nest (if isSep style then afterSep else indent) (PP.concat pieces)))
 
 -- `d` on one line: each place it may break as it is where it does not, and
 -- each group in it so too. A break it must have -- a comment's -- it keeps.
@@ -2058,7 +2120,20 @@ fun ruledItems (st : Style k) (s : Syntax k) (elems : [Elem]) : ([Item], Bool) =
       let counts = \leaf -> countAt st elems kids found leaf in
       let here = V.map snd (V.filter (\l -> fst l == R.textRange s) (linksOf st)) in
       match itemsOf st all places kids found holds counts here [] elems 0 0 (0 - 1) with
-      | (items, _, taken) ->
+      | (made, _, taken) ->
+          -- A node its parent fills is laid out on one line but where it
+          -- fills: it is put where it fits whole, and a break of what is in
+          -- it would let the fill measure only up to that.
+          let items =
+            if not (V.elem 3 here) then made
+            else
+              V.map
+                (\it ->
+                  match it with
+                  | Written at d o c -> Written at (flattened d) o c
+                  | other -> other)
+                made
+          in
           let rest =
             V.concatMap (\j -> kidItem st all places kids 0 j) (V.range (taken + 1) (V.len kids))
           in
@@ -2518,7 +2593,17 @@ fun itemsOf
                            [Written
                               level
                               (if V.isEmpty ways then
-                                 entryDoc st kids (fst r) (snd r) False stepped tiers other
+                                 entryDocAs
+                                   st
+                                   kids
+                                   (fst r)
+                                   (snd r)
+                                   False
+                                   stepped
+                                   tiers
+                                   other
+                                   True
+                                   1
                                else
                                  -- Its children, and what the nodes it goes through
                                  -- hold, a thing at a time.
@@ -2536,7 +2621,7 @@ fun itemsOf
                                        tiers
                                        other
                                        False
-                                       True))
+                                       2))
                               (0 - 1)
                               (0 - 1)]
                          ],
@@ -2968,6 +3053,35 @@ fun blankEnds (t : String) : (String, String, String) =
   if lead >= n then (t, "", "")
   else (stringSlice t 0 lead, stringSlice t lead (n - tail), stringSlice t (n - tail) n)
 
+-- A comment `t`, begun `col` columns into its line in the text, as lines: a
+-- piece of trivia can be several comments on lines of their own, or a comment
+-- that runs over several lines. Each line after the first is a break and the
+-- line as far in from the first as it was -- set in from where the first is
+-- written, not where it was -- or, where one was further out than the first,
+-- as far in from the furthest out.
+fun commentDoc (t : String) (col : Int) : Doc () =
+  let lines = V.map S.trimEnd (S.split "\n" t) in
+  let rest = V.drop lines 1 in
+  let inOf = \l -> stringByteLength l - stringByteLength (S.trimStart l) in
+  let base =
+    V.foldl (\m l -> if S.isEmpty l then m else min m (inOf l)) col rest
+  in
+  V.foldl
+    (\d l ->
+      PP.append
+        (PP.append d PP.hardline)
+        (if S.isEmpty l then PP.nil
+         else PP.text (stringSlice l (min base (inOf l)) (stringByteLength l))))
+    (PP.text (V.getOr "" lines 0))
+    rest
+
+-- The comment in trivia `c` as `commentDoc` writes it.
+fun commentOf (st : Style k) (c : Syntax k) : Doc () =
+  let t = R.text c in
+  let lead = stringByteLength t - stringByteLength (S.trimStart t) in
+  let from = fst (R.textRange c) + lead in
+  commentDoc (S.trim t) (from - lineStartBefore (sourceOf st) from)
+
 fun leadOf (t : String) : String = match blankEnds t with | (l, _, _) -> l
 
 fun tailOf (t : String) : String = match blankEnds t with | (_, _, r) -> r
@@ -3055,6 +3169,7 @@ fun kidItemAs
       (\i -> (let t = S.trim (textAt i) in if S.isEmpty t then [] else [(i, t)]))
       (V.range before at)
   in
+  let said = \c -> M.unwrapOr (PP.text (snd c)) (M.map (commentOf st) (V.get all (fst c))) in
   -- A comment ended the line before it if no break comes between them -- in
   -- the pieces before it, or in its own piece's blank space before it.
   let endsLine =
@@ -3088,14 +3203,14 @@ fun kidItemAs
   let atEnd =
     (match (endsLine, V.get found 0) with
      | (True, Just (i, t)) ->
-         V.append [Trailer (PP.text t)] (if blankAfter i then [Parting blanking level] else [])
+         V.append [Trailer (said (i, t))] (if blankAfter i then [Parting blanking level] else [])
      | _ -> [])
   in
   let comments = if endsLine then V.drop found 1 else found in
   -- Each comment, a break after it -- two, where a blank line followed it.
   let after = \c -> if blankAfter (fst c) then PP.append PP.hardline PP.hardline else PP.hardline in
   let commented =
-    \own -> V.foldr (\c d -> PP.append (PP.append (PP.text (snd c)) (after c)) d) own comments
+    \own -> V.foldr (\c d -> PP.append (PP.append (said c) (after c)) d) own comments
   in
   let onlyComments =
     match V.last comments with
@@ -3105,8 +3220,8 @@ fun kidItemAs
           Written
             level
             (V.foldr
-               (\c d -> PP.append (PP.append (PP.text (snd c)) (after c)) d)
-               (PP.text (snd last))
+               (\c d -> PP.append (PP.append (said c) (after c)) d)
+               (said last)
                (V.take comments (V.len comments - 1)))
             none
             none,
@@ -3228,8 +3343,10 @@ fun commentsIn (all : [Syntax k]) (from : Int) (to : Int) : [String] =
 -- so that nothing which follows is taken for part of it.
 fun trailing (st : Style k) (all : [Syntax k]) (last : Int) : [Item] =
   V.concatMap
-    (\c -> [Written 0 (PP.text c) (0 - 1) (0 - 1), Parting breaking 0])
-    (commentsIn all (last + 1) (V.len all))
+    (\c ->
+      if S.isEmpty (S.trim (R.text c)) then []
+      else [Written 0 (commentOf st c) (0 - 1) (0 - 1), Parting breaking 0])
+    (V.drop all (last + 1))
 
 -- Items as one document: each at its column, a parting as what it is, and a
 -- space between two written things nothing parts. Of several partings in a
@@ -3714,7 +3831,9 @@ fun isEnumProd sorts p =
         and V.any (\f -> match f with | Field _ (TSort m) _ _ -> m == n | _ -> False) fs
 
 -- A table of tiers as written: its tiers, loosest first, parted by `;`, each
--- operators in quotes, `trailing` where the break goes after them; and which
+-- operators in quotes, `trailing` where the break goes after them, `sep` where
+-- they are separators, and `sep N M` where those run on from `N` items each
+-- `M` tokens at most (any, where `M` is not given); and which
 -- of them is `other`, where an operator no tier names goes -- the last, where
 -- none says.
 fun tiersOf (ts : [TokenTree]) : ([([String], Int)], Int) =
@@ -3726,6 +3845,10 @@ fun tiersOf (ts : [TokenTree]) : ([([String], Int)], Int) =
            | Str s _ -> (done, (V.pushBack ops s, after, isOther), other)
            | Word "trailing" _ -> (done, (ops, 1, isOther), other)
            | Word "sep" _ -> (done, (ops, 2, isOther), other)
+           | Num n _ ->
+               if after == 2 then (done, (ops, 100 + n, isOther), other)
+               else if after >= 100 and after < 1000 then (done, (ops, after + 1000 * n, isOther), other)
+               else acc
            | Word "other" _ -> (done, (ops, after, True), other)
            | p ->
                if isPunct ";" p then

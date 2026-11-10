@@ -361,7 +361,9 @@ own rules, as `CommaItem = "," expr` has its comma:
 
 Where every node of `tail` is N tokens at most, none has a comment and none
 holds a bracket, the `line` in each node's rule is a `fill`, so the nodes run
-on, as many to a line as fit. Otherwise the rules are as written.
+on, as many to a line as fit. Each node is laid out on one line, and goes on
+the next line whole where it does not fit: `show level` is not broken after
+`show`. Otherwise the rules are as written.
 
 **`as`** after either counts a node of the kinds it names as one token,
 however many it holds: `fill 3 as InterpE`, or `filled 4 items as (InterpE
@@ -439,6 +441,11 @@ operators. `trailing` puts a tier's break after its operators instead of
 before them. `sep` makes a tier's operators separators: the break goes after
 them, what follows is no further in than what is before, and they split the
 chain however they are spaced, so `a, b` and `a,b` both split at the comma.
+`sep N M` is a `sep` whose items run on, as many to a line as fit, where
+there are `N` items or more and each is `M` tokens at most with no bracket in
+it (any number of tokens, where `M` is not given). Otherwise it is a plain
+`sep`. `"," sep 7 3` is how `meadow fmt` lays out a brace's list: more than
+six short items run on, and otherwise each is a line of its own.
 `other` is the tier of any operator the table does not name (the last tier,
 where no tier says `other`). The chain is split at the
 loosest tier present, each part split the same way at the next. Each split
@@ -480,7 +487,11 @@ an entry a line:
   as `"," ";" sep`, splits an entry's list at its commas.
 - **`chain(TABLE)(trees)`** lays out a child of token trees as one entry,
   split by the table, as a bracket's `ELSE` layout may: `indent(cut
-  chain("," sep)(trees)) cut` breaks a list in a body an item a line. The body of a `|`
+  chain("," sep)(trees)) cut` breaks a list in a body an item a line. Where
+  the loosest operators in the trees are a `sep` tier's, that tier breaks
+  with what holds the chain: when the bracket breaks, each item goes on a
+  line of its own, even if they would all fit on one, unless a `sep N M`
+  tier runs them on. The body of a `|`
   entry is `N` columns in from its `|` (two levels, where `N` is not given).
   An entry with a comment among its trees is written as it was.
 - **Things side by side** in an entry that does not read as the language are
@@ -522,7 +533,12 @@ an entry a line:
   formatter's rules as that tree, as the same text anywhere else would be:
   an application's arguments, a hug, a `let`, all as the language has them.
   Where it does not, such as a field of a `lang!` or a rule of a `syntax!`,
-  it is split by its tokens as above. The readers are what `syntax!` writes
+  it is split by its tokens as above. A `|` entry that does not read as an
+  arm, such as a `pass!` arm whose pattern says `later`, or a `database!`
+  query's `| query name (x : T) : U =`, may still have a body that reads as
+  the language: what follows its `->`, or its first `=` where it has no
+  `->`. That body is laid out by the rules, on the line the pattern ends where
+  it fits there (`} -> 1`) and a step in under it if not. The readers are what `syntax!` writes
   for the rules a `starts { Arm, Expr }` section names: `parse<Lang><Rule>`,
   the text read as that rule, with an error where the rule ends before the
   text does.
@@ -707,9 +723,11 @@ by the tests for both whole and broken programs.
   comments (`@skip`), rather than declaring them `trivia`, has them in the
   tree as runs: a comment and the line breaks around it in one piece. Such a
   run's breaks are kept as if they were pieces of their own, so a comment
-  never takes in the line after it. Declaring `trivia` is still better: two
-  comments in one run are written as one piece, the lines after the first as
-  they were.
+  never takes in the line after it. Two comments in one run, or a comment
+  that runs over several lines, are written a line at a time: each line after
+  the first as far in from the first as it was in the text, counted from where
+  the first is now. So a run of comments under an `align(…)` lines up at its
+  column.
 - **An `indent(…)` with nothing in it** writes nothing, including the
   separators inside it. So `indent(newline entries)` with no entries adds no
   line break.
