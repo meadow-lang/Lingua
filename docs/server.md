@@ -36,6 +36,7 @@ converts to and from the protocol's lines and UTF-16 columns.
 | -------------- | -------------------------------------------- | ------------------------------------------------ |
 | `text`         | `db -> Int -> String -> ()`                  | how an edit reaches the compiler                 |
 | `opened`       | `db -> Int -> String -> ()`                  | where a file is, when the editor opens it: its uri |
+| `closed`       | `db -> Int -> ()`                            | a file the editor closed, for the language to forget |
 | `diagnostics`  | `db -> Int -> [Diagnostic]`                  | published for every open file after each edit    |
 | `tree`         | `db -> Int -> Green k`                       | semantic tokens, folding ranges, selection ranges |
 | `resolved`     | `db -> Int -> [(Int, String)]`               | what name resolution says particular tokens are  |
@@ -58,6 +59,14 @@ included. A language that checks a file together with the rest of its
 package can use it to find the package's manifest and set the other modules'
 texts as inputs. A query can't read the disk, but `opened` can, before
 anything is asked.
+
+`closed` is called when the editor closes a file, with the file's number.
+The editor is told nothing is wrong in that file any more. A language that
+keeps its own copy of each open file's text drops it here, and goes back to
+what is on disk. That can change what is wrong in the files still open, so
+after `closed` they are all looked at again. On threads, any looking still
+under way is stopped first, as for an edit. A server without `closed` only
+clears the closed file.
 
 ## A language's own requests
 

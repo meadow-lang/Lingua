@@ -62,14 +62,21 @@
 --                                                  entering it answers a part
 --                                                  at a time, to standard
 --                                                  output or standard error
---   unknown       db -> String -> Reply            a line that starts with `:`
+--   speak         db -> Int -> (Spoken -> ()) -> ()
+--                                                  in place of `eval`: the
+--                                                  same parts, each given as
+--                                                  it comes and written then,
+--                                                  in order with what the run
+--                                                  itself prints
+--   unknown      db -> String -> Reply            a line that starts with `:`
 --                                                  and is no command: what it
 --                                                  does -- an `Entry`, say
 --   prompt        what a line starts with; `history`, the file entries are
 --                 kept in between runs; `theme`, the one it starts in;
 --                 `own`, which of `help quit theme` it has (all three);
 --                 `remember`, `"lines"` to keep commands in the history
---                 too (`"entries"`); `interrupt`, `"quit"` for Ctrl-C to end
+--                 too, as typed and not the entry one answers as well
+--                 (`"entries"`); `interrupt`, `"quit"` for Ctrl-C to end
 --                 the prompt (`"drop"`, the entry given up)
 --
 -- An answer that is empty writes nothing, not even a line's end.
@@ -368,6 +375,13 @@ fun sample (theme : Theme) : String =
 -- An `eval` that answers text, as one that answers parts: all of it to
 -- standard output.
 @pub fun saying eval = \t -> [Spoken.ToOut (eval t)]
+
+-- A part written where it goes, on a line of its own: an empty one, not at
+-- all.
+@pub fun spoke (part : Spoken) =
+  match part with
+  | Spoken.ToOut s -> if S.isEmpty s then () else writeOutput (s ++ "\n")
+  | Spoken.ToErr s -> if S.isEmpty s then () else writeError (s ++ "\n")
 
 -- How a prompt goes about what is not an entry: which of its own commands
 -- it has (`own`); what a line that starts with `:` and is no command of its
@@ -975,13 +989,7 @@ fun beginNext pending (text : String) =
 -- part, nothing at all.
 fun entered (history : String) eval (text : String) =
   let u = if S.isEmpty history then () else LE.saveEntry history text in
-  V.foldl
-    (\w part ->
-      match part with
-      | Spoken.ToOut s -> if S.isEmpty s then () else writeOutput (s ++ "\n")
-      | Spoken.ToErr s -> if S.isEmpty s then () else writeError (s ++ "\n"))
-    ()
-    (eval text)
+  V.foldl (\w part -> spoke part) () (eval text)
 
 -- `p` is the prompt: its editor, the cells it keeps, and what it was given.
 -- What it hands back when it is left, if anything.
@@ -1036,7 +1044,7 @@ fun commanded p (again : [String]) (text : String) =
                -- it, and what it brings waits for that.
                (let u = if S.isEmpty first then () else broughtFirst p.pending first in
                 on (beginNext p.pending t))
-           | Step.Enter t -> on (entered p.history p.eval t)
+           | Step.Enter t -> on (entered (unkept p) p.eval t)
            | _ -> on ())
       | None ->
           let own = p.manner.own in
@@ -1058,6 +1066,10 @@ fun commanded p (again : [String]) (text : String) =
                       (say
                          "`:${name}` is not something this prompt does: it has ${S.join ", " (V.map (\n -> "`:${n}`") (commandNamesWith p.commands own))}")
 
+-- The history an entry a command answers is kept in: none, where the
+-- command's own line was kept.
+fun unkept p : String = if p.manner.remember then "" else p.history
+
 -- What a command answered, done: said, shown, entered, or the prompt left.
 fun replied p (again : [String]) (reply : Reply) =
   let on = \u -> entering p again in
@@ -1066,7 +1078,7 @@ fun replied p (again : [String]) (reply : Reply) =
   | Reply.Said said -> on (say said)
   | Reply.Pages title pages -> on (paged title pages)
   | Reply.Edit t -> on (beginNext p.pending t)
-  | Reply.Entry entry -> on (entered p.history p.eval entry)
+  | Reply.Entry entry -> on (entered (unkept p) p.eval entry)
   | Reply.Leave said -> (let u = say said in None)
   | Reply.Back t -> Just t
   | Reply.Mode m arg ->
@@ -1115,9 +1127,9 @@ def replCall : Parser Tokens (Bool, String, String, (String, Bool), [ReplFeature
 
 def replFeatures : [String] =
   [
-    "text", "eval", "answer", "tree", "errors", "completion", "declarations", "search", "panes",
-    "indent", "commands", "unknown", "modes", "status", "start", "prompt", "history", "theme",
-    "own", "remember", "interrupt"
+    "text", "eval", "answer", "speak", "tree", "errors", "completion", "declarations", "search",
+    "panes", "indent", "commands", "unknown", "modes", "status", "start", "prompt", "history",
+    "theme", "own", "remember", "interrupt"
   ]
 
 def replWritten : [String] = ["prompt", "history", "theme", "own", "remember", "interrupt"]
@@ -1165,12 +1177,14 @@ fun writtenWrong (feature : String) (value : String) : Maybe String =
                     [Fail
                        "a prompt needs `text`: how what is typed is given to the compiler"
                        Nowhere]
-                  else if not (has "eval" or has "answer") then
+                  else if not (has "eval" or has "answer" or has "speak") then
                     [Fail
-                       "a prompt needs `eval`, what entering it prints -- or `answer`, the same a part at a time, to standard output and standard error"
+                       "a prompt needs `eval`, what entering it prints -- or `answer`, the same a part at a time, to standard output and standard error, or `speak`, each part as it comes"
                        Nowhere]
-                  else if has "eval" and has "answer" then
-                    [Fail "a prompt has `eval` or `answer`, not both: they say the same" Nowhere]
+                  else if V.len (V.filter has ["eval", "answer", "speak"]) > 1 then
+                    [Fail
+                       "a prompt has one of `eval`, `answer` and `speak`: they say the same"
+                       Nowhere]
                   else
                     -- The database's language server, if one is declared: a
                     -- prompt colours what is typed as it colours a file.
@@ -1248,10 +1262,13 @@ fun replCode pub name lang db (mode : Bool) (server : Maybe String) fs =
     "{ own = ${own}, unknown = ${match given "unknown" with | Just f -> "Just (\\lingua_l -> ${f} db lingua_l)" | None -> "None"}, remember = ${if given "remember" == Just "lines" then "True" else "False"}, quitting = ${if given "interrupt" == Just "quit" then "True" else "False"} }"
   in
   -- What entering an entry answers, a part at a time.
+  -- Parts spoken one by one are written as each is, and leave none to write
+  -- after.
   let eval =
-    (match given "answer" with
-     | Just f -> "(\\t -> ${setting "t"}${f} db 0))"
-     | None -> "(LinguaRepl.saying (\\t -> ${setting "t"}${fn "eval"} db 0)))")
+    (match (given "answer", given "speak") with
+     | (Just f, _) -> "(\\t -> ${setting "t"}${f} db 0))"
+     | (None, Just f) -> "(\\t -> ${setting "t"}let _ = ${f} db 0 LinguaRepl.spoke in []))"
+     | (None, None) -> "(LinguaRepl.saying (\\t -> ${setting "t"}${fn "eval"} db 0)))")
   in
   let editorOn =
     "(\\theme pending -> LinguaRepl.editorFor theme pending ${quoted (M.unwrapOr "> " (given "prompt"))} ${paint} ${tree} ${errors} (\\k -> display k) ${indent} ${completion} ${decls} (LinguaRepl.commandNamesWith ${commands} ${own}) ${panes})"
@@ -2016,6 +2033,20 @@ fun answering (lines : [String]) eval manner =
     "one\ntwo\n"
     "standard output's parts on it, the error on standard error, and the empty part nowhere"
 
+@test fun partsSpokenAsTheyComeAreWrittenInOrderWithWhatTheRunPrints () =
+  -- What `speak` makes of the language's function: it is given `spoke`, and
+  -- leaves nothing to write after.
+  let speak =
+    \t say ->
+      let a = say (Spoken.ToOut "first") in
+      let b = writeOutput "ran ${t}\n" in
+      say (Spoken.ToOut "then")
+  in
+  assertEq
+    (answering ["x"] (\t -> let w = speak t spoke in []) plainManner)
+    "first\nran x\nthen\n"
+    "the run's own output between the parts"
+
 @test fun aLineNoCommandTakesIsTheLanguagesWhereItSaysSo () =
   let manner =
     { own = ["quit"], unknown = Just (\l -> Reply.Entry l), remember = False, quitting = False }
@@ -2029,6 +2060,30 @@ fun answering (lines : [String]) eval manner =
        (answering [":x"] (saying (\t -> "ran ${t}")) plainManner)
        "`:x` is not something this prompt does: it has `:help`, `:quit`, `:theme`\n"
        "and where it does not, the line is said to be none"
+
+@test fun aCommandsLineKeptIsNotKeptAgainAsTheEntryItAnswers () =
+  let kept =
+    \remember ->
+      let saved = newRef [] in
+      let manner = { own = ["quit"], unknown = Just (\l -> Reply.Entry l), remember, quitting = False } in
+      let out =
+        handle
+          (\() ->
+            withOutput (\() ->
+              withoutTerminal [":x", "y"] (\() ->
+                run (plainEditor []) "plain" "h" (saying (\t -> "ran ${t}")) () [] [] [] (\u -> "") manner)))
+          ()
+        with {
+          readToString p resume -> resume (Err "none"),
+          appendString w resume -> (let u = setRef saved (V.pushBack (getRef saved) (snd w)) in resume (Ok ())),
+          exists p resume -> resume False,
+          isFile p resume -> resume False,
+        }
+      in
+      getRef saved
+  in
+  let a = assertEq (kept True) [":x\n", "y\n"] "the line typed, once" in
+  assertEq (kept False) [":x\n", "y\n"] "and with commands not kept, the entry"
 
 @test fun ctrlCEndsAPromptThatSaysSo () =
   let keys = V.concat [typing "1", [T.ctrl "c"], typing "2", [T.key Enter]] in

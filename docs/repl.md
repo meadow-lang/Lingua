@@ -26,7 +26,7 @@ until there are no more. `for Session` means the prompt makes its database with
 
 ## Features
 
-Only `text` and one of `eval` or `answer` are required. Each of the others
+Only `text` and one of `eval`, `answer` or `speak` are required. Each of the others
 turns something on.
 
 | feature        | type                                         | what it gives                              |
@@ -34,6 +34,7 @@ turns something on.
 | `text`         | `db -> Int -> String -> ()`                  | how what is typed reaches the compiler     |
 | `eval`         | `db -> Int -> String`                        | what entering an entry prints; nothing, if it is empty |
 | `answer`       | `db -> Int -> [Spoken]`                      | in place of `eval`: what entering it answers, a part at a time, each `ToOut` or `ToErr` |
+| `speak`        | `db -> Int -> (Spoken -> ()) -> ()`          | in place of `eval`: the same parts, each handed over as it comes and written then |
 | `tree`         | `db -> Int -> Green k`                       | colour, multi-line entries, indentation    |
 | `errors`       | `db -> Int -> [Int]`                         | where the parser's errors are, in bytes    |
 | `completion`   | `db -> Int -> Int -> [(String, String)]`     | Tab: names and what each is, at a byte     |
@@ -50,17 +51,23 @@ turns something on.
 | `history`      | text                                         | the file entries are kept in between runs  |
 | `theme`        | text                                         | the theme it starts in; `soft` if omitted  |
 | `own`          | text                                         | which of the prompt's own commands it has: `"help quit"`; all three if omitted |
-| `remember`     | text                                         | `"lines"` to keep `:` lines in the history too; `"entries"` if omitted |
+| `remember`     | text                                         | `"lines"` to keep `:` lines in the history too, as typed; `"entries"` if omitted |
 | `interrupt`    | text                                         | `"quit"` for Ctrl-C to end the prompt; `"drop"`, giving the entry up, if omitted |
 
 `prompt`, `history`, `theme`, `own`, `remember` and `interrupt` are text in
 quotes; the rest are function names. Mixing them up, naming a feature a prompt
-does not have, leaving out `text`, or giving both `eval` and `answer` or
-neither, is an error where it was written.
+does not have, leaving out `text`, or giving more than one of `eval`, `answer`
+and `speak` or none of them, is an error where it was written.
 
 Each of `answer`'s parts is written on a line of its own: a `ToOut` to
 standard output, a `ToErr` to standard error, in order. An empty one writes
 nothing. `LinguaRepl.saying` makes an `answer` of an `eval`.
+
+`answer` gives its parts once the entry has run, so anything the run itself
+prints comes before all of them. `speak` is given a function to call with
+each part instead, and each is written when it is given. A part said before
+the run, such as an error or `name : scheme`, then comes before what the run
+prints, and a part said after it comes after.
 
 Without `tree` the prompt colours nothing from the tree, never indents, and
 takes every entry as finished. (A database with a language server is still
@@ -286,7 +293,8 @@ back to `soft`.
 
 A line that starts with `:` is for the prompt, not the language. It is not
 coloured, never counts as unfinished, and is not evaluated. It is written to
-the history file only with `remember = "lines"`. A command's name ends at
+the history file only with `remember = "lines"`, and then an entry the
+command answers with is not written as well. A command's name ends at
 blank space of any kind, so `:t` and an entry on the line after it is `:t`
 given that entry.
 
@@ -347,7 +355,7 @@ the line, trimmed. It answers a `Lingua.Repl.Reply`:
 | -------------- | ------------------------------------------------------------ |
 | `Said text`    | writes `text`, or nothing if it is empty, and reads on       |
 | `Pages title pages` | shows `pages`, each a name and its text, a page at a time (see below) |
-| `Entry text`   | enters `text` as if it had been typed: evaluated, and kept in the history file |
+| `Entry text`   | enters `text` as if it had been typed: evaluated, and kept in the history file unless the command's line was |
 | `Edit text`    | begins the next entry with `text`, the cursor after it, for its user to go on with |
 | `Leave text`   | writes `text` and ends the prompt; in a mode, leaves the mode with nothing |
 | `Mode name text` | enters the mode `name` with `text` (see [Modes](#modes))   |
