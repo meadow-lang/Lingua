@@ -535,7 +535,9 @@ fun looping about hears setText closed diagnose answer heard docs (stage : Stage
              let d2 = closing docs uri in
              match (closed, fileOf docs uri) with
              | (Just close, Just file) ->
-                 (let w = close file in let x = publishAll name diagnose d2 in again d2 stage)
+                 (let w = close file in
+                  let x = publishAll name diagnose d2 in
+                  again d2 stage)
              | _ -> again d2 stage)
           else
             match id with
@@ -691,8 +693,7 @@ fun attending
     (edit : Int)
     working =
   let again =
-    \d s e w ->
-      attending about hearing setText closed diagnose answer interrupt allow inbox d s e w
+    \d s e w -> attending about hearing setText closed diagnose answer interrupt allow inbox d s e w
   in
   -- Every open file looked at on a thread of its own, as edit `at` left
   -- them.
@@ -1198,8 +1199,7 @@ use Lingua.Pipe (named)
 def features : [String] =
   [
     "text", "diagnostics", "tree", "hover", "definition", "references", "completion", "symbols",
-    "format", "resolved", "requests", "capabilities", "opened", "closed", "refuse",
-    "notifications"
+    "format", "resolved", "requests", "capabilities", "opened", "closed", "refuse", "notifications"
   ]
 
 -- `| hover = hoverAt`: a feature, where it was written, and the function.
@@ -1587,7 +1587,8 @@ fun keeping () =
     []
     (\file uri -> ())
     (Just (\file -> setRef kept (V.filter (\f -> f != file) (getRef kept))))
-    (\file t -> if V.elem file (getRef kept) then () else setRef kept (V.pushBack (getRef kept) file))
+    (\file t ->
+      if V.elem file (getRef kept) then () else setRef kept (V.pushBack (getRef kept) file))
     (\file -> V.map (\f -> Diagnostic Severity.Error "kept" (Meta 0 1) [] []) (getRef kept))
     (\docs method file t offset params -> answerOr None (\() -> None))
     (\a -> False)
@@ -1771,8 +1772,10 @@ fun attendedClosing (arrived : [Arrived]) setText closed diagnose answer interru
         Arrived.NoMore
       ]
       (\file t -> Stm.atomically (\() -> Stm.modifyTVar kept (\k -> V.pushBack k file)))
-      (Just (\file -> Stm.atomically (\() -> Stm.modifyTVar kept (\k -> V.filter (\f -> f != file) k))))
-      (\file -> V.map (\f -> Diagnostic Severity.Error "kept" (Meta 0 1) [] []) (Stm.readTVarIO kept))
+      (Just (\file ->
+         Stm.atomically (\() -> Stm.modifyTVar kept (\k -> V.filter (\f -> f != file) k))))
+      (\file ->
+        V.map (\f -> Diagnostic Severity.Error "kept" (Meta 0 1) [] []) (Stm.readTVarIO kept))
       (\docs method file t offset params -> None)
       (\() -> ())
       (\() -> ())

@@ -2012,11 +2012,14 @@ fun withoutTerminal (lines : [String]) body =
 
 -- A prompt with no terminal, given `lines`, answering each entry `eval`
 -- and going about other lines as `manner` says: what it wrote.
-fun answering (lines : [String]) eval manner =
+fun answering (lines : [String]) eval manner = answeringIn "" lines eval manner
+
+-- The same, keeping its entries in the file `history`.
+fun answeringIn (history : String) (lines : [String]) eval manner =
   snd
     (withOutput (\() ->
        withoutTerminal lines (\() ->
-         run (plainEditor []) "plain" "" eval () [] [] [] (\u -> "") manner)))
+         run (plainEditor []) "plain" history eval () [] [] [] (\u -> "") manner)))
 
 @test fun anEmptyAnswerWritesNothing () =
   assertEq
@@ -2041,11 +2044,10 @@ fun answering (lines : [String]) eval manner =
       let a = say (Spoken.ToOut "first") in
       let b = writeOutput "ran ${t}\n" in
       say (Spoken.ToOut "then")
-  in
-  assertEq
-    (answering ["x"] (\t -> let w = speak t spoke in []) plainManner)
-    "first\nran x\nthen\n"
-    "the run's own output between the parts"
+  in assertEq
+       (answering ["x"] (\t -> let w = speak t spoke in []) plainManner)
+       "first\nran x\nthen\n"
+       "the run's own output between the parts"
 
 @test fun aLineNoCommandTakesIsTheLanguagesWhereItSaysSo () =
   let manner =
@@ -2065,22 +2067,20 @@ fun answering (lines : [String]) eval manner =
   let kept =
     \remember ->
       let saved = newRef [] in
-      let manner = { own = ["quit"], unknown = Just (\l -> Reply.Entry l), remember, quitting = False } in
+      let manner =
+        { own = ["quit"], unknown = Just (\l -> Reply.Entry l), remember, quitting = False }
+      in
+      -- What the prompt writes to its history file is kept here.
+      let prompt = \() -> answeringIn "h" [":x", "y"] (saying (\t -> "ran ${t}")) manner in
       let out =
-        handle
-          (\() ->
-            withOutput (\() ->
-              withoutTerminal [":x", "y"] (\() ->
-                run (plainEditor []) "plain" "h" (saying (\t -> "ran ${t}")) () [] [] [] (\u -> "") manner)))
-          ()
-        with {
+        handle prompt () with {
           readToString p resume -> resume (Err "none"),
-          appendString w resume -> (let u = setRef saved (V.pushBack (getRef saved) (snd w)) in resume (Ok ())),
+          appendString w resume ->
+            (let u = setRef saved (V.pushBack (getRef saved) (snd w)) in resume (Ok ())),
           exists p resume -> resume False,
           isFile p resume -> resume False,
         }
-      in
-      getRef saved
+      in getRef saved
   in
   let a = assertEq (kept True) [":x\n", "y\n"] "the line typed, once" in
   assertEq (kept False) [":x\n", "y\n"] "and with commands not kept, the entry"
