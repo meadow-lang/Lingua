@@ -169,7 +169,7 @@ use Pretty (Doc)
   | Flat [Elem]
   | Tiers [([String], Int)] Int Int [Elem]
   | Entries [String] Int [([String], Int)] Int [Elem]
-  | Chain [([String], Int)] Int [String] [Elem]
+  | Chain [([String], Int)] Int Int [String] [Elem]
   | Across [String] [String]
   | NoGroup
 
@@ -345,7 +345,7 @@ def blanking : Int = 7
 -- at its operators, by `tiers`, and otherwise as the text had it -- a list in
 -- a bracket, split at its separators.
 @pub fun tokenChain (tiers : [([String], Int)]) (other : Int) (e : Elem) : Elem =
-  Chain tiers other [] [e]
+  Chain tiers other 0 [] [e]
 
 -- Children `es` laid out as one chain of operators, as `tokenChain` lays out
 -- token trees: the operators among them, and among what the nodes of the
@@ -354,7 +354,18 @@ def blanking : Int = 7
 -- every other node is laid out by its own rule.
 @pub fun typedChain (tiers : [([String], Int)]) (other : Int) (through : [String]) (es : [Elem])
     : Elem =
-  Chain tiers other through es
+  Chain tiers other 0 through es
+
+-- The same, what follows its first operand `step` columns in from it: as a
+-- signature's type is, `chain 4(…)`, its first operand where it is.
+@pub fun steppedChain
+    (step : Int)
+    (tiers : [([String], Int)])
+    (other : Int)
+    (through : [String])
+    (es : [Elem])
+    : Elem =
+  Chain tiers other step through es
 
 @pub fun tiered (tiers : [([String], Int)]) (other : Int) (indent : Int) (es : [Elem]) : Elem =
   Tiers tiers other indent es
@@ -526,7 +537,7 @@ fun leaves (es : [Elem]) : [Elem] =
       | Entries _ _ _ _ fallback -> leaves fallback
       -- A child that is many is found across the chain's own operators
       -- between its nodes, as a separated child is: a tuple's commas.
-      | Chain tiers _ ways es ->
+      | Chain tiers _ _ ways es ->
           if V.isEmpty ways then es
           else
             V.map
@@ -686,7 +697,7 @@ fun indentSpans (unit : Int) (es : [Elem]) (from : Int) : [(Int, Int, Int)] =
                  | Flat inner -> through out at inner
                  | Tiers _ _ _ inner -> through out at inner
                  | Entries _ _ _ _ fallback -> through out at fallback
-                 | Chain _ _ _ es -> (out, at + V.len es)
+                 | Chain _ _ _ _ es -> (out, at + V.len es)
                  | NoGroup -> (out, at)
                  | _ -> (out, at + 1)))
           ([], from)
@@ -1675,7 +1686,7 @@ fun entriesItems
                                    a
                                    b
                                    bar
-                                   (if arm < 0 then 2 * unit else arm)
+                                   (if not bar then unit else if arm < 0 then 2 * unit else arm)
                                    tiers
                                    other)
                                 (0 - 1)
@@ -1789,7 +1800,7 @@ fun entryDocAs
            (PP.concat [
               PP.text "|",
               PP.space,
-              entryDocAs st kids (a + 1) (k - 1) False arm tiers other False False,
+              entryDocAs st kids (a + 1) (k - 1) False (unitOf st) tiers other False False,
               PP.text " ->",
               PP.nest arm (PP.append PP.line (bareDoc (reading st bodyText) (R.root g)))
             ])
@@ -1904,7 +1915,7 @@ fun entryDocAs
               | (lead, parts) ->
                   tiersBuilt
                     tiers
-                    (if bar then arm else unitOf st)
+                    arm
                     (if bar then arm else 0)
                     (finished lead)
                     (V.map
@@ -2474,7 +2485,8 @@ fun itemsOf
               -- A macro's body an entry a line, where it is entries; and
               -- where not, as the bracket's own layout says.
               -- Token trees as one entry.
-              | Chain tiers other ways es ->
+              | Chain tiers other step ways es ->
+                  let stepped = if step > 0 then step else unitOf st in
                   -- From the first of its children there is to the last.
                   let rs =
                     V.filter
@@ -2506,7 +2518,7 @@ fun itemsOf
                            [Written
                               level
                               (if V.isEmpty ways then
-                                 entryDoc st kids (fst r) (snd r) False (unitOf st) tiers other
+                                 entryDoc st kids (fst r) (snd r) False stepped tiers other
                                else
                                  -- Its children, and what the nodes it goes through
                                  -- hold, a thing at a time.
@@ -2520,7 +2532,7 @@ fun itemsOf
                                        0
                                        (V.len flat - 1)
                                        False
-                                       (unitOf st)
+                                       stepped
                                        tiers
                                        other
                                        False
@@ -3342,7 +3354,7 @@ data Written
   | WAlign [Written]
   | WFlat [Written]
   | WTiers [([String], Int)] Int Int [Written] Loc
-  | WChain [([String], Int)] Int [(String, Loc)] [(String, Loc)] Loc
+  | WChain Int [([String], Int)] Int [(String, Loc)] [(String, Loc)] Loc
   | WEntries [String] Int [([String], Int)] Int [Written] Loc
   | WIfBroke String String Loc
   | WWhen [(String, Loc)] [Written] [Written] Loc
@@ -3420,21 +3432,24 @@ fun writing (ts : [TokenTree]) (i : Int) (out : [Written]) : [Written] =
                           (j + 2)
                           (V.pushBack out (WEntries own arm tiers other (writtenOf fallback) at)))
                | _ -> writing ts (i + 1) (V.pushBack out (WName "entries" at))))
-  | (Just (Word "chain" at), Just (Group Paren table _)) ->
-      (match V.get ts (i + 2) with
-       | Just (Group Paren inner _) ->
-           -- Its children, and the kinds of node it goes through, if any.
+  | (Just (Word "chain" at), Just next) ->
+      -- `chain`, how far in what follows its first operand is if it says,
+      -- its tiers, its children, and the kinds of node it goes through.
+      let step = (match next with | Num n _ -> n | _ -> 0) in
+      let j = if step > 0 then i + 2 else i + 1 in
+      (match (V.get ts j, V.get ts (j + 1)) with
+       | (Just (Group Paren table _), Just (Group Paren inner _)) ->
            let names =
              V.concatMap (\t -> match t with | Word w wat -> [(w, wat)] | _ -> []) inner
            in
            let ways =
-             (match (V.get ts (i + 3), V.get ts (i + 4)) with
+             (match (V.get ts (j + 2), V.get ts (j + 3)) with
               | (Just (Word "through" _), Just (Group Paren kinds _)) ->
                   (
                     V.concatMap (\t -> match t with | Word w wat -> [(w, wat)] | _ -> []) kinds,
-                    i + 5
+                    j + 4
                   )
-              | _ -> ([], i + 3))
+              | _ -> ([], j + 2))
            in (match tiersOf table with
                | (tiers, other) ->
                    if V.isEmpty names then writing ts (i + 1) (V.pushBack out (WName "chain" at))
@@ -3442,7 +3457,7 @@ fun writing (ts : [TokenTree]) (i : Int) (out : [Written]) : [Written] =
                      writing
                        ts
                        (snd ways)
-                       (V.pushBack out (WChain tiers other names (fst ways) at)))
+                       (V.pushBack out (WChain step tiers other names (fst ways) at)))
        | _ -> writing ts (i + 1) (V.pushBack out (WName "chain" at)))
   | (Just (Word "tiers" at), Just next) ->
       -- `tiers`, a level's width if one is given, the tiers, and the chain.
@@ -3742,7 +3757,7 @@ fun leafNames (ws : [Written]) : [String] =
       | WAlign inner -> leafNames inner
       | WFlat inner -> leafNames inner
       | WTiers _ _ _ inner _ -> leafNames inner
-      | WChain _ _ ns _ _ -> V.map fst ns
+      | WChain _ _ _ ns _ _ -> V.map fst ns
       | WEntries _ _ _ _ fallback _ -> leafNames fallback
       | WWhen _ yes _ _ -> leafNames yes
       | WWhenCount _ _ _ _ yes _ -> leafNames yes
@@ -3793,7 +3808,7 @@ fun elemCode sorts tokenFields rule fs (names : [String]) (w : Written)
          else
            inside fallback (\code ->
              "LinguaF.entried [${S.join ", " (V.map (\k -> quote "Node${k}") own)}] (0 + ${if arm < 0 then "(0 - 1)" else show arm}) [${S.join ", " (V.map (\t -> "([${S.join ", " (V.map quote (fst t))}], ${show (snd t)})") tiers)}] ${show other} ${code}")
-     | WChain tiers other names ways at ->
+     | WChain step tiers other names ways at ->
          let children =
            V.map
              (\x ->
@@ -3816,7 +3831,7 @@ fun elemCode sorts tokenFields rule fs (names : [String]) (w : Written)
              | (_, Just (k, kat)) -> Err [Fail "no rule of the grammar is called ${k}" kat]
              | _ ->
                  Ok
-                   "LinguaF.typedChain ${table} [${S.join ", " (V.map (\w -> quote "Node${fst w}") ways)}] [${S.join ", " (V.concatMap (\c -> match c with | Ok code -> [code] | Err _ -> []) children)}]")
+                   "LinguaF.steppedChain ${show step} ${table} [${S.join ", " (V.map (\w -> quote "Node${fst w}") ways)}] [${S.join ", " (V.concatMap (\c -> match c with | Ok code -> [code] | Err _ -> []) children)}]")
      | WTiers tiers other indent inner at ->
          if V.len (leafNames inner) != 2 then
            Err

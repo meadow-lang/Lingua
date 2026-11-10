@@ -1090,3 +1090,17 @@ format! {
     (formatFilledLines (fst (parseLists "[aaaa, bbbb, cccc, d + eeeeeeeee, ff, gg, hh]")))
     "[\n  aaaa, bbbb, cccc,\n  d + eeeeeeeee, ff, gg, hh\n]"
     "on the next line, and not broken at its own break where the line has room for its start"
+
+-- The same, what follows a part's first operand four in from it.
+format! {
+  ChainyFar for Lists
+  indent 2
+  width 20
+    | Paren = "(" indent(cut chain 4("," sep; "+")(elems) through(Expr Tail)) cut ")"
+}
+
+@test fun aChainSaysHowFarInWhatFollowsItsFirstOperandIs () =
+  assertEq
+    (formatChainyFar (fst (parseLists "(aaaaaaaa + bbbbbbbb + cccccccc, dd)")))
+    "(\n  aaaaaaaa\n      + bbbbbbbb\n      + cccccccc,\n  dd\n)"
+    "its `+`s four in, and its first operand and its commas where they would be"
