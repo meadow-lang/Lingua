@@ -510,7 +510,11 @@ an entry a line:
   between its nodes. `chain N(…)` sets what follows a part's first operand
   `N` columns in from it, rather than a level, and leaves that operand where
   it is: a signature's type, `chain 4("->" "=>" trailing; "!")(ty implies
-  eff)`, as rustfmt sets one. Its loosest tier breaks with what holds the
+  eff)`, as rustfmt sets one. A comment on a line of its own among its nodes
+  is written on a line of its own before the node it came before, where that
+  node now is, and the nodes are still laid out by their rules. A comment at
+  the end of a line, or one before an operator, has the chain written as the
+  text had it. Its loosest tier breaks with what holds the
   chain, so a brace's commas go a line each where the brace breaks:
 
   ```meadow

@@ -1201,3 +1201,15 @@ format! {
     (V.map (\x -> formatSkipsFiled (fst (parseSkips x))) srcs)
     ["x\n\n-- end\n", "x\n-- one\n-- two", "x -- after\n\n-- last\n"]
     "and so where the comments and the breaks around them are one piece"
+
+@test fun aChainWithACommentOnALineOfItsOwnIsStillLaidOut () =
+  assertEq
+    (V.map (\x -> formatChainy (fst (parseLists x))) [
+       "(aa,\n      -- c\n         bbbbbbbb + cccccccc + dddddddd)",
+       "(aa, -- c\n bb)"
+     ])
+    [
+      "(\n  aa,\n  -- c\n  bbbbbbbb\n    + cccccccc\n    + dddddddd\n)",
+      "(aa, -- c\n bb)"
+    ]
+    "the comment where its node now is, and the node broken to the width; one that ends a line, as the text had it"

@@ -1498,7 +1498,14 @@ fun tieredDoc
                                     | None -> Just (PP.append lead glued, parts))))
          in match V.foldl step (Just (docOf st h, [])) tails with
             | None -> None
-            | Just (lead, parts) -> Just (tiersBuilt tiers indent 0 lead parts)
+            | Just (lead, parts) ->
+                Just
+                  (tiersBuilt
+                     tiers
+                     indent
+                     0
+                     lead
+                     (V.map (\p -> match p with | (o, t, d) -> (o, t, d, PP.nil)) parts))
 
 -- `lead` and `parts` split at the loosest tier among them, each part split in
 -- turn, each a group.
@@ -1820,7 +1827,11 @@ fun entryDocAs
          in if op == "=" then PP.group (PP.concat (V.pushBack parts body))
             else PP.concat (V.pushBack parts (PP.group body))
      | (None, None) ->
-         if commented then PP.text text
+         -- Trees with a comment among them are written as the text had them
+         -- -- but the language's own nodes, a typed chain's, with comments on
+         -- lines of their own: those are written before what they were, and
+         -- each node laid out by its rule.
+         if commented and opened != 2 then PP.text text
          else
            let opAt =
              \j ->
@@ -1828,11 +1839,21 @@ fun entryDocAs
                 | Just c -> firstTokenText st c
                 | None -> "")
            in
-           let docAt =
+           let said = \j -> j > a and not (S.isEmpty (S.trim (gap j))) in
+           -- The comments before child `j`, each a line, and a blank line
+           -- before them and after them where the text had one.
+           let ahead =
              \j ->
-               (match V.get kids j with
-                | Just c -> docOf st c
-                | None -> PP.nil)
+               if not (said j) then PP.nil
+               else
+                 let g = gap j in
+                 let at = snd (range (j - 1)) + stringByteLength (leadOf g) in
+                 PP.concat [
+                   (if breakCount (leadOf g) >= 2 then PP.hardline else PP.nil),
+                   commentDoc (S.trim g) (at - lineStartBefore t at),
+                   PP.hardline,
+                   (if breakCount (tailOf g) >= 2 then PP.hardline else PP.nil)
+                 ]
            in
            let from = if bar then a + 1 else a in
            let spaced = \j -> not (S.isEmpty (gap j)) in
@@ -1848,6 +1869,23 @@ fun entryDocAs
                         and V.elem (firstTokenText st c) operators
                         and (isSep (styleOf (firstTokenText st c)) or spaced j and spaced (j + 1))
                   | None -> False)
+           in
+           -- Child `j`, the comments before it first -- but after an
+           -- operator, where they go after the operator's break, with it.
+           let docAt =
+             \j ->
+               (match V.get kids j with
+                | Just c -> PP.append (if isOp (j - 1) then PP.nil else ahead j) (docOf st c)
+                | None -> PP.nil)
+           in
+           -- As the text had them after all, where a comment ends a line
+           -- with something before it, or is before an operator, which is
+           -- written as its tier says and not as a node.
+           let asWritten =
+             commented
+               and V.any
+                 (\j -> said j and (not (S.contains "\n" (leadOf (gap j))) or isOp j))
+                 (V.range (a + 1) (b + 1))
            in
            -- Two things side by side are an application: on one line if it
            -- fits, and each thing applied a line of its own, a step in, if
@@ -1913,13 +1951,16 @@ fun entryDocAs
                  match acc with
                  | (lead, parts) ->
                      if isOp j then
-                       (lead, V.pushBack parts (opAt j, tierOf (opAt j), (PP.nil, False, False)))
+                       (
+                         lead,
+                         V.pushBack parts (opAt j, tierOf (opAt j), (PP.nil, False, False), ahead (j + 1))
+                       )
                      else
                        (match V.last parts with
-                        | Just (op, tier, run) ->
+                        | Just (op, tier, run, notes) ->
                             (
                               lead,
-                              V.pushBack (V.take parts (V.len parts - 1)) (op, tier, onto run j)
+                              V.pushBack (V.take parts (V.len parts - 1)) (op, tier, onto run j, notes)
                             )
                         | None -> (onto lead j, parts)))
                ((PP.nil, False, False), [])
@@ -1929,7 +1970,7 @@ fun entryDocAs
              (match built with
               | (_, parts) ->
                   let loosest =
-                    V.foldl (\m p -> match p with | (_, tier, _) -> min m tier) 1000000 parts
+                    V.foldl (\m p -> match p with | (_, tier, _, _) -> min m tier) 1000000 parts
                   in isSep (snd (V.getOr ([], 0) tiers loosest)))
            in
            -- Where the loosest operators are a `sep N M` tier's, whether its
@@ -1975,7 +2016,7 @@ fun entryDocAs
                     (if bar then arm else if opened > 0 then 0 else unitOf st)
                     (finished lead)
                     (V.map
-                       (\p -> match p with | (op, tier, run) -> (op, tier, finished run))
+                       (\p -> match p with | (op, tier, run, notes) -> (op, tier, finished run, notes))
                        parts))
            in
            -- The language's own nodes break at their loosest with what holds
@@ -1984,7 +2025,8 @@ fun entryDocAs
              (match built with
               | Doc.Group inner -> if opened == 2 or opened == 1 and listed then inner else built
               | _ -> built)
-           in if bar then
+           in if asWritten then PP.text text
+              else if bar then
                 PP.concat [
                   PP.text "|",
                   (if from <= b and spaced from then PP.space else PP.nil),
@@ -2008,18 +2050,18 @@ fun tiersBuilt
     (indent : Int)
     (afterSep : Int)
     (lead : Doc ())
-    (parts : [(String, Int, Doc ())])
+    (parts : [(String, Int, Doc (), Doc ())])
     : Doc () =
   match V.get parts 0 with
   | None -> lead
   | Just _ ->
-      let loosest = V.foldl (\m p -> match p with | (_, tier, _) -> min m tier) 1000000 parts in
+      let loosest = V.foldl (\m p -> match p with | (_, tier, _, _) -> min m tier) 1000000 parts in
       -- Where each run of parts between two of the loosest begins.
       let cuts =
         V.filter
           (\i ->
             match V.get parts i with
-            | Just (_, tier, _) -> tier == loosest
+            | Just (_, tier, _, _) -> tier == loosest
             | None -> False)
           (V.range 0 (V.len parts))
       in
@@ -2042,13 +2084,15 @@ fun tiersBuilt
             let i = V.getOr 0 cuts k in
             let next = V.getOr (V.len parts) cuts (k + 1) in
             match V.get parts i with
-            | Just (op, _, d) ->
+            | Just (op, _, d, notes) ->
+                -- `notes`, the comments after the operator, on the lines after
+                -- its break and before what follows: no part of its group.
                 let rest = tiersBuilt tiers indent afterSep d (runOf (i + 1) next) in
                 if isSep style then
-                  (if filling then PP.concat [PP.text op, PP.softline, flattened rest]
-                   else PP.concat [PP.text op, PP.line, rest])
-                else if style == 1 then PP.concat [PP.space, PP.text op, PP.line, rest]
-                else PP.concat [PP.line, PP.text op, PP.space, rest]
+                  (if filling then PP.concat [PP.text op, PP.softline, notes, flattened rest]
+                   else PP.concat [PP.text op, PP.line, notes, rest])
+                else if style == 1 then PP.concat [PP.space, PP.text op, PP.line, notes, rest]
+                else PP.concat [PP.line, PP.text op, PP.space, notes, rest]
             | None -> PP.nil)
           (V.range 0 (V.len cuts))
       in PP.group
