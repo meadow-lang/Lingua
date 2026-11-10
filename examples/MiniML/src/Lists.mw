@@ -831,10 +831,10 @@ format! {
      ])
     [
       "mac {\n  x {\n    aaaaaaaaaa,\n    bbbbbbbbbb,\n    cccccccccc,\n    dddddddddd\n  }\n  y\n}",
-      "mac {\n  aaaaaaaaaaaa,\n  bbbbbbbbbbbb,\n  cccccccccccc,\n  dddd\n  e\n}",
+      "mac {\n  aaaaaaaaaaaa,\n    bbbbbbbbbbbb,\n    cccccccccccc,\n    dddd\n  e\n}",
       "mac {\n  x {a, b}\n  y\n}"
     ]
-    "a list within an item a line, an entry split at its commas, and what fits on one line"
+    "a list within an item a line, an entry split at its commas -- what follows the first a level in, as it goes on -- and what fits on one line"
 
 @test fun anEntryThatReadsAsTheLanguageIsLaidOutAsItIs () =
   let a =

@@ -441,8 +441,9 @@ fixities:
 The tiers are written loosest first and parted by `;`, each a list of
 operators. `trailing` puts a tier's break after its operators instead of
 before them. `sep` makes a tier's operators separators: the break goes after
-them, what follows is no further in than what is before, and they split the
-chain however they are spaced, so `a, b` and `a,b` both split at the comma.
+them, what follows is no further in than what is before (but a level in, in
+one entry of a macro body that has several, as what goes on with the entry),
+and they split the chain however they are spaced, so `a, b` and `a,b` both split at the comma.
 `sep N M` is a `sep` whose items run on, as many to a line as fit, where
 there are `N` items or more and each is `M` tokens at most with no bracket in
 it (any number of tokens, where `M` is not given). Otherwise it is a plain

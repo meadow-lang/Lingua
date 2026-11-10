@@ -1965,10 +1965,14 @@ fun entryDocAs
            let built =
              (match built with
               | (lead, parts) ->
+                  -- After a separator: in an arm, its body's column; in a
+                  -- bracket that holds only the list, no further in than what
+                  -- is before it; and in one entry of several, a level in, as
+                  -- what goes on with it.
                   tiersBuilt
                     tiers
                     arm
-                    (if bar then arm else 0)
+                    (if bar then arm else if opened > 0 then 0 else unitOf st)
                     (finished lead)
                     (V.map
                        (\p -> match p with | (op, tier, run) -> (op, tier, finished run))
