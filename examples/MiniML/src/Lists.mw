@@ -1173,3 +1173,18 @@ format! {
       "mac {\n  aaaa,\n  bbbb,\n  cccc,\n  dddd + e,\n  ffff\n}"
     ]
     "four or more run on, three do not, nor any where one is more than a token"
+
+-- A list on one line however long, though its items are a group that goes
+-- on one line only while it is short.
+format! {
+  FlatShort for Lists
+  indent 2
+  width 40
+    | List = "[" flat(group 3(items(tight "," line))) "]"
+}
+
+@test fun aShortGroupOnOneLineAllTheSameIsLaidOut () =
+  assertEq
+    (formatFlatShort (fst (parseLists "[aaaa,bbbb,   cccc]")))
+    "[aaaa, bbbb, cccc]"
+    "the group longer than it may be on one line, and not the whole text as it was written"

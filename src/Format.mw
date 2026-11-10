@@ -1804,15 +1804,21 @@ fun entryDocAs
      | (Just g, _) -> bareDoc (reading st text) (R.root g)
      | (None, Just (k, g, bodyText)) ->
          let op = (match V.get kids k with | Just c -> firstTokenText st c | None -> "->") in
-         -- The body on the line the pattern ends, where it fits there --
-         -- `} -> 1` after a pattern that broke -- and `arm` in under it if not.
-         PP.concat [
-           PP.text "|",
-           PP.space,
-           entryDocAs st kids (a + 1) (k - 1) False (unitOf st) tiers other False 0,
-           PP.text (" " ++ op),
-           PP.group (PP.nest arm (PP.append PP.line (bareDoc (reading st bodyText) (R.root g))))
-         ]
+         -- What is before the body, its lines after the first `arm` in as
+         -- the body is. The body after `->` on the line that ends, where it
+         -- fits there -- `} -> 1` after a pattern that broke -- and `arm` in
+         -- under it if not; after `=`, on a line of its own where what is
+         -- before it broke, as a definition's is.
+         let body = PP.nest arm (PP.append PP.line (bareDoc (reading st bodyText) (R.root g))) in
+         let parts =
+           [
+             PP.text "|",
+             PP.space,
+             entryDocAs st kids (a + 1) (k - 1) False arm tiers other False 0,
+             PP.text (" " ++ op)
+           ]
+         in if op == "=" then PP.group (PP.concat (V.pushBack parts body))
+            else PP.concat (V.pushBack parts (PP.group body))
      | (None, None) ->
          if commented then PP.text text
          else
@@ -2058,6 +2064,10 @@ fun flattened (d : Doc ()) : Doc () =
   | Doc.Union l _ -> flattened l
   | Doc.Column f -> PP.column (\c -> flattened (f c))
   | Doc.Nesting f -> PP.nesting (\n -> flattened (f n))
+  -- What would fail on one line -- a `group N(…)` longer than `N`, a group
+  -- that must break -- is on one line here all the same: it is laid out so,
+  -- not tried so, and a failure with no other way would fail the whole text.
+  | Doc.Fail -> PP.nil
   | other -> other
 
 -- What a group that must break holds: nothing, broken, and on one line, a

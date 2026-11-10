@@ -424,7 +424,9 @@ group in it too, as nothing inside a string should break:
 | InterpE = "interp_start" flat(first mids) "interp_end"
 ```
 
-A break it must have, after a comment, it keeps.
+A break it must have, after a comment, it keeps. A `group N(…)` inside it, or
+a group that `breaks` says must break, is on one line all the same: a hole
+longer than `N` that holds a `match` is still one line.
 
 **`tiers(…)(head tail)`** lays out a chain of operators that the grammar keeps
 flat, `Ops = first:Operand rest:InfixTail*` with each `InfixTail` an operator
@@ -537,8 +539,11 @@ an entry a line:
   arm, such as a `pass!` arm whose pattern says `later`, or a `database!`
   query's `| query name (x : T) : U =`, may still have a body that reads as
   the language: what follows its `->`, or its first `=` where it has no
-  `->`. That body is laid out by the rules, on the line the pattern ends where
-  it fits there (`} -> 1`) and a step in under it if not. The readers are what `syntax!` writes
+  `->`. That body is laid out by the rules, `N` in from the `|`, as are the
+  lines of what is before it after the first. After `->`, the body goes on the
+  line the pattern ends where it fits there (`} -> 1`). After `=`, it goes on
+  a line of its own wherever what is before it broke, as a definition's body
+  does. The readers are what `syntax!` writes
   for the rules a `starts { Arm, Expr }` section names: `parse<Lang><Rule>`,
   the text read as that rule, with an error where the rule ends before the
   text does.
