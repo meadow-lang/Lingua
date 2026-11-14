@@ -437,7 +437,7 @@ fun change (l : Lang) (d : Delta) : Result [TokenTree] Lang =
                        (withKeeping
                           added
                           (match langKeeping added with
-                           | AsTrees ts tv fs0 -> AsTrees ts tv (V.append fs0 toks)
+                           | AsTrees ts tv fs0 sp -> AsTrees ts tv (V.append fs0 toks) sp
                            | AsTables -> AsTables)))
   | Every s at fs ->
       if isTreeLang l then

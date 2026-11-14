@@ -259,10 +259,15 @@ fun written (src : String) : String =
     "a level in, and the `in` back out"
 
 @test fun aCommentKeepsItsLineAndBreaksWhatHoldsIt () =
-  assertEq
-    (laidOut "let x = -- note\n1 in x")
-    "let x =\n  -- note\n  1\nin\nx"
-    "the comment before the value, where it was"
+  let a =
+    assertEq
+      (laidOut "let x = -- note\n1 in x")
+      "let x = -- note\n  1\nin\nx"
+      "a comment that ended a line stays at its end, and breaks what holds it"
+  in assertEq
+       (laidOut "let x =\n-- note\n1 in x")
+       "let x =\n  -- note\n  1\nin\nx"
+       "and one on a line of its own keeps it, before the value"
 
 @test fun layingOutChangesOnlyTheSpace () =
   let srcs =

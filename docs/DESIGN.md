@@ -309,7 +309,7 @@ built-in type is -- and meet nothing of the program's, or of another grammar's:
 | a rule's type         | `CalcLet`, `CalcExpr`                                                                     |
 | its cast and way back | `asCalcLet`, `syntaxCalcLet`                                                              |
 | an accessor           | `calcLetName`                                                                             |
-| the entry points      | `parseCalc`, `parseCalcTokens`, `astCalc`                                                 |
+| the entry points      | `parseCalc`, `parseCalcTokens`, `astCalc`; and, for each rule a `starts { Expr, … }` section names, `parseCalcExpr` |
 | the parser's own      | `linguaCalc_<x>`, `x` lower case where a rule's is upper                                  |
 
 A node rule and a token of one name are two kinds, and none of them is one of

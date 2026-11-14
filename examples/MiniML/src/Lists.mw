@@ -1,0 +1,1215 @@
+-- A grammar in the shapes Meadow's own has, for what `format!` does with
+-- them: a list whose commas are tokens between its items, with one after
+-- the last or not; a `match` with arms; and a `let` whose body is a level of
+-- precedence -- a node holding one node -- above the `let` it may be; an
+-- operator; and an attribute on what follows it.
+
+use Scythe (lexer!)
+use Lingua (syntax!, format!)
+use Lingua.Green as LinguaG
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Test (assertEq)
+
+@derive(Lexer)
+@pub data Tok
+  = @regex("[ \t\r\n]+") Space
+  | @regex("--[^\n]*") Comment
+  | @token("let") Let
+  | @token("in") In
+  | @token("match") Match
+  | @token("with") With
+  | @token("if") If
+  | @token("call") Call
+  | @token("mac") Mac
+  | @token("{") LBrace
+  | @token("}") RBrace
+  | @token("<") Lt
+  | @token(">") Gt
+  | @token("\\") Lam
+  | @token("then") Then
+  | @token("else") Else
+  | @token("|") Bar
+  | @token("->") Arrow
+  | @token("=") Equals
+  | @token("[") Open
+  | @token("]") Close
+  | @token(",") Comma
+  | @token("+") Plus
+  | @token("*") Star
+  | @token("==") EqEq
+  | @token("@") At
+  | @token("(") LParen
+  | @token(")") RParen
+  | @token("?") Quest
+  | @regex("[a-z0-9]+") Name String
+
+syntax! {
+  Lists
+  lexer Tok
+  trivia { Space, Comment }
+  starts { Arm, Expr }
+  tokens {
+    "let" = Let,
+    "in" = In,
+    "match" = Match,
+    "with" = With,
+    "if" = If,
+    "call" = Call,
+    "mac" = Mac,
+    "{" = LBrace,
+    "}" = RBrace,
+    "<" = Lt,
+    ">" = Gt,
+    "\\" = Lam,
+    "then" = Then,
+    "else" = Else,
+    "|" = Bar,
+    "->" = Arrow,
+    "=" = Equals,
+    "[" = Open,
+    "]" = Close,
+    "," = Comma,
+    "+" = Plus,
+    "*" = Star,
+    "==" = EqEq,
+    "@" = At,
+    "(" = LParen,
+    ")" = RParen,
+    "?" = Quest,
+    "name" = Name _
+  }
+  grammar {
+    File = items:Expr*
+    Expr = first:Term rest:Tail*
+    Tail = op:("+" | "*" | "==") operand:Term
+    Term = List | LetE | MatchE | IfE | Tagged | Call | LamE | Paren | Vec | Mac | Hole | Var
+    Hole = "?" "name"
+    Vec = "<" body:VecBody? ">"
+    VecBody = first:Expr tail:VecItem*
+    VecItem = "," expr:Expr?
+    Call = "call" head:Var args:Arg*
+    Mac = "mac" body:Brace
+    Brace = "{" trees:Tree* "}"
+    Tree = Brace | Leaf
+    Leaf = word:("name" | "|" | "->" | "," | "=" | "+")
+    Arg = term:Term
+    LamE = "\\" param:Var "->" body:Expr
+    Paren = "(" elems:(Expr ("," Expr)*)? ")"
+    IfE = "if" cond:Expr "then" yes:Expr "else" no:Expr
+    Tagged = attr:Attr expr:Expr
+    Attr = "@" name:Var "(" arg:Var ")"
+    List = "[" items:(Expr ("," Expr)* ","?)? "]"
+    LetE = "let" name:Var "=" value:Expr "in" body:Expr
+    MatchE = "match" scrutinee:Expr "with" arms:(Arm Arm*)
+    Arm = "|" pat:Var "->" body:Expr
+    Var = "name"
+  }
+}
+
+-- A list's items parted by their commas, which break with it; a `match` and
+-- its arms on one line only while there are two arms at most; and a chain of
+-- `let`s a step to a line once it is two steps long. An operator is spaced
+-- as it was written; and what `@fmt(skip)` is on is kept as it was.
+format! {
+  Listed for Lists
+  indent 2
+  width 40
+  skip "@fmt(skip)"
+    | File = items(newline)
+    | Tagged = attr aswritten expr
+    | Expr = first rest
+    | Tail = kept op kept operand
+    | List = "[" indent(cut items(tight "," line)) cut "]"
+    | LetE = "let" name "=" value "in" line body breaks 2 body
+    | MatchE = "match" scrutinee "with" indent(arms) breaks 3 arms
+    | Arm = line "|" pat "->" body
+}
+
+fun listed (src : String) : String = formatListed (fst (parseLists src))
+
+-- A `let` whose body goes on its `in`'s line when the binding broke, and on
+-- a line of its own when the binding did not but the whole does not fit;
+-- and an `if` whose `else` goes on with another `if` as one chain.
+format! {
+  Chained for Lists
+  indent 2
+  width 40
+    | File = items(newline)
+    | Expr = first rest
+    | Tail = kept op kept operand
+    | LetE =
+        group
+          60(breaks
+             2
+             body
+             group("let" name "=" indent(line value) line "in")
+             when
+             LetE(newline body)(ifbroke(space, line) align(body)))
+    | IfE =
+        "if"
+          cond
+          "then"
+          group(indent(line yes))
+          line
+          "else"
+          when
+          IfE(chained no)(group(indent(line no)))
+    | List = "[" indent(cut items(tight "," line)) cut "]"
+}
+
+fun chained (src : String) : String = formatChained (fst (parseLists src))
+
+-- A list of seven items or more run on, as many to a line as fit, while each
+-- is one token; and a list of one item, with no comma, spaced inside.
+format! {
+  Filled for Lists
+  indent 2
+  width 30
+    | List =
+        when
+          1
+          items("[" items "]")(when
+             7+
+             items("[" indent(cut items(tight "," fill 1)) cut "]")("["
+                indent(cut items(tight "," line))
+                cut
+                "]"))
+}
+
+fun filled (src : String) : String = formatFilled (fst (parseLists src))
+
+-- A call whose last argument hugs it, where that is a lambda, a list, a
+-- tuple, or parentheses around a lambda: it starts on the call's line and
+-- breaks inside itself before the arguments break, an argument a line.
+format! {
+  Hugged for Lists
+  indent 2
+  width 30
+    | Call = "call" head indent(line hug LamE Paren+ List Paren.LamE Vec+ ","(args(line)))
+    | Tagged = attr indent(line hug List(expr))
+    | Vec = "<" indent(cut body) cut ">"
+    | VecBody = first tail
+    | VecItem = nogroup tight "," line expr
+    | LamE = "\\" tight param "->" indent(line body)
+    | List = "[" indent(cut items(tight "," line)) cut "]"
+    | Paren = when 1 elems("(" tight elems tight ")")("(" indent(cut elems(tight "," line)) cut ")")
+}
+
+fun hugged (src : String) : String = formatHugged (fst (parseLists src))
+
+-- What an attribute is on, broken however short it is -- as a `record`'s
+-- block is a line a field -- and the same list on one line elsewhere.
+format! {
+  Blocky for Lists
+  indent 2
+  width 40
+    | Tagged = attr broken expr
+    | List = "[" indent(cut items(tight "," line)) cut "]"
+}
+
+fun blocky (src : String) : String = formatBlocky (fst (parseLists src))
+
+-- A `let` on one line only while it is 20 columns -- but as far as the width
+-- where it is alone in parentheses.
+format! {
+  Roomy for Lists
+  indent 2
+  width 80
+    | LetE = group 20("let" name "=" value "in" line body)
+    | Paren = "(" tight wide elems tight ")"
+}
+
+fun roomy (src : String) : String = formatRoomy (fst (parseLists src))
+
+-- An attribute with nothing written between its pieces, and a list in
+-- parentheses on one line whatever the width -- as a string's holes are.
+format! {
+  Pieces for Lists
+  indent 2
+  width 20
+    | Attr = "@" name group("(" arg ")")
+    | Paren = "(" tight flat(elems) tight ")"
+    | List = "[" indent(cut items(tight "," line)) cut "]"
+}
+
+fun pieces (src : String) : String = formatPieces (fst (parseLists src))
+
+-- A bracket whose commas are in its items, each item's `line` a `fill` where
+-- the items are all small: as many to a line as fit.
+format! {
+  Runs for Lists
+  indent 2
+  width 30
+    | Vec = when + "," body("<" indent(cut body) cut ">")("<" tight body tight ">")
+    | VecBody = first filled 2 tail
+    | VecItem = nogroup tight "," line expr
+}
+
+fun runs (src : String) : String = formatRuns (fst (parseLists src))
+
+-- A chain of operators broken at its loosest first: `==`, then `+`, and `*`
+-- the tightest -- and, in the other, the break after `==` rather than before.
+format! {
+  Tiered for Lists
+  indent 2
+  width 30
+    | Expr = tiers("=="; "+"; "*")(first rest)
+}
+
+format! {
+  TieredAfter for Lists
+  indent 2
+  width 30
+    | Expr = tiers("==" trailing; "+"; other)(first rest)
+}
+
+fun tiered (src : String) : String = formatTiered (fst (parseLists src))
+
+-- A macro's body an entry a line, its `|` entries under a heading a level in,
+-- each entry split at its operators -- an arm's body four in from its `|`.
+format! {
+  Macro for Lists
+  indent 2
+  width 40
+  reparse "|" parseListsArm else parseListsExpr
+    | Arm = line "|" pat "->" indent(line body)
+    | Expr = first indent(rest)
+    | Tail = line op operand
+    | Brace =
+        "{"
+          entries
+          own
+          Mac
+          4("," sep; "|"; "=" trailing; "->" trailing; "+")(indent(cut chain("," sep; "+")(trees))
+             cut)
+          "}"
+}
+
+fun bodied (src : String) : String = formatMacro (fst (parseLists src))
+
+fun tieredAfter (src : String) : String = formatTieredAfter (fst (parseLists src))
+
+format! {
+  Plain for Lists
+  indent 2
+  width 60
+}
+
+fun plain (src : String) : String = formatPlain (fst (parseLists src))
+
+@test fun aListsCommasAreBetweenItsItems () =
+  let a = assertEq (listed "[a,b ,  c]") "[a, b, c]" "each after an item, and a space after it" in
+  let b = assertEq (listed "[a, b,]") "[a, b,]" "one after the last is kept, as it was" in
+  let c = assertEq (listed "[]") "[]" "and none of nothing" in
+  assertEq
+    (listed "[aaaaaaaaaa, bbbbbbbbbb, cccccccccc, dddddddddd,]")
+    "[\n  aaaaaaaaaa,\n  bbbbbbbbbb,\n  cccccccccc,\n  dddddddddd,\n]"
+    "broken, an item a line, each comma at the end of its item's line"
+
+@test fun aBlankLineBetweenItemsIsKept () =
+  assertEq (listed "[a,\n\n\nb]") "[\n  a,\n\n  b\n]" "one, which breaks the list"
+
+@test fun aGroupBreaksWhenWhatItCountsIsLongEnough () =
+  let a =
+    assertEq
+      (listed "match x with | a -> b | c -> d")
+      "match x with | a -> b | c -> d"
+      "two arms: one line, as it fits"
+  in
+  let b =
+    assertEq
+      (listed "match x with | a -> b | c -> d | e -> f")
+      "match x with\n  | a -> b\n  | c -> d\n  | e -> f"
+      "three: an arm a line, though they would fit on one"
+  in assertEq
+       (listed "match x with | a -> b\n\n| c -> d")
+       "match x with\n  | a -> b\n\n  | c -> d"
+       "and two with a blank line between them"
+
+@test fun aChainIsCountedThroughWhatHoldsEachStep () =
+  let a = assertEq (listed "let a = x in a") "let a = x in a" "one step: one line" in
+  let b =
+    assertEq
+      (listed "let a = x in let b = y in b")
+      "let a = x in\nlet b = y in\nb"
+      "two: a step to a line, the inner one too, though each would fit"
+  in assertEq
+       (listed "let a = [x, let b = y in b] in a")
+       "let a = [x, let b = y in b] in a"
+       "and a `let` inside another's value is no step of its chain"
+
+@test fun aListLaidOutChangesOnlyTheSpace () =
+  let srcs =
+    [
+      "[a, b,]",
+      "[a,,b]",
+      "[a b]",
+      "match x with | a -> [b, c,] | d -> e | f -> g",
+      "let a = [x,\n-- one\ny] in let b = a in b"
+    ]
+  in
+  let squeezed = \s -> S.join "" (S.split " " (S.join "" (S.split "\n" s))) in
+  let a =
+    assertEq
+      (V.map (\s -> squeezed (listed s)) srcs)
+      (V.map squeezed srcs)
+      "every token still there, in order"
+  in assertEq (V.map (\s -> listed (listed s)) srcs) (V.map listed srcs) "and twice is once"
+
+@test fun anOperatorIsSpacedAsItWasWritten () =
+  assertEq
+    (V.map listed ["a+b", "a + b", "a+ b", "a  +\n   b", "[a+b, c + d]"])
+    ["a+b", "a + b", "a+ b", "a + b", "[a+b, c + d]"]
+    "touching stays touching, apart stays apart, and apart is one space"
+
+@test fun whatAnAttributeKeepsIsAsItWasWritten () =
+  let a =
+    assertEq
+      (listed "[a,@fmt(skip) [b,c  ,d],e]")
+      "[a, @fmt(skip) [b,c  ,d], e]"
+      "what it is on as it was, and what is around it laid out"
+  in
+  let b =
+    assertEq
+      (listed "[a,@other(x) [b,c  ,d],e]")
+      "[a, @other(x) [b, c, d], e]"
+      "another attribute keeps nothing"
+  in
+  let c =
+    assertEq
+      (listed "[aaaaaaaaaa, @fmt(skip) [b,\n    c], dddddddddd, eeeeeeeeee]")
+      "[\n  aaaaaaaaaa,\n  @fmt(skip) [b,\n    c],\n  dddddddddd,\n  eeeeeeeeee\n]"
+      "its lines as they were, wherever it is put"
+  in assertEq
+       (formatListedWithin 0 (fst (parseLists "[a,\n@fmt(skip) [b,\nc],\nd]")))
+       "[a,\n  @fmt(skip) [b,\nc],\n  d]"
+       "and when only indenting, a line that starts inside it is left alone"
+
+@test fun aCommentThatEndsALineStaysAtItsEnd () =
+  let a = assertEq (listed "[x] -- after\n[y]") "[x] -- after\n[y]" "after a separator's break" in
+  assertEq
+    (listed "[aaaaaaaaaa, -- one\nbbbbbbbbbb, cccccccccc, dddddddddd]")
+    "[\n  aaaaaaaaaa, -- one\n  bbbbbbbbbb,\n  cccccccccc,\n  dddddddddd\n]"
+    "and after the comma it followed, the list broken"
+
+@test fun aBlankLineAfterACommentIsKept () =
+  let a =
+    assertEq
+      (listed "-- top\n\n[x]\n\n-- c\n\n[y]\n")
+      "-- top\n\n[x]\n\n-- c\n\n[y]\n"
+      "after a comment, as before one"
+  in assertEq (listed "[x]\n-- c\n\n[y]") "[x]\n-- c\n\n[y]" "and only where it was"
+
+@test fun theRootsLinesStayWhereTheyWere () =
+  assertEq
+    (plain "[x]\n[y]\n\n  [z]")
+    "[x]\n[y]\n\n  [z]"
+    "a file with no rule: its items are not taken for lines that go on"
+
+@test fun asWrittenKeepsABreakASpaceOrNothing () =
+  assertEq
+    (V.map listed ["@a(b)\n[x]", "@a(b)   [x]", "@a(b)[x]", "@a(b)\n\n\n[x]"])
+    ["@a(b)\n[x]", "@a(b) [x]", "@a(b)[x]", "@a(b)\n\n[x]"]
+    "a break, a space, nothing, and a blank line, as the text had them"
+
+-- The same shapes from a lexer that skips blank space and comments, as Meadow's
+-- does: the parser keeps what it skipped as runs, a comment and the breaks
+-- around it in one piece.
+@derive(Lexer)
+@pub data Bare
+  = @regex("[ \t\r\n]+") @skip Space
+  | @regex("--[^\n]*") @skip Comment
+  | @token("[") Open
+  | @token("]") Close
+  | @token(",") Comma
+  | @token("@") At
+  | @regex("[a-z0-9]+") Name String
+
+syntax! {
+  Skips
+  lexer Bare
+  tokens { "[" = Open, "]" = Close, "," = Comma, "@" = At, "name" = Name _ }
+  grammar {
+    File = items:Item*
+    Item = attrs:Attr* thing:Thing
+    Attr = "@" name:Var
+    Thing = List | Var
+    List = "[" items:(Var ("," Var)*)? "]"
+    Var = "name"
+  }
+}
+
+format! {
+  SkipsPlain for Skips
+  indent 2
+  width 40
+}
+
+format! {
+  SkipsFiled for Skips
+  indent 2
+  width 40
+    | File = items(newline)
+    | Item = attrs(aswritten) aswritten thing
+    | List = "[" tight items(tight "," line) tight "]"
+}
+
+@test fun aCommentRunIsWrittenWithItsBreaks () =
+  let src = "-- a comment\nx\n\ny -- after\n-- before z\nz\n" in
+  let a = assertEq (formatSkipsPlain (fst (parseSkips src))) src "with no rule" in
+  assertEq (formatSkipsFiled (fst (parseSkips src))) src "and with a rule for the file"
+
+@test fun twoThingsTheTextKeptApartStayApartWhereTheParserStopped () =
+  -- Each has a `[` the parser could not close where it thought to: the
+  -- list is left open, with the run of blank space after its last name in
+  -- it, and what follows that name is no child of the list.
+  assertEq
+    (V.map (\x -> formatSkipsPlain (fst (parseSkips x))) [
+       "[x y] z",
+       "@a [x y",
+       "[x y z]",
+       "@a [x, y z] w",
+       "[x [y z] w]"
+     ])
+    ["[x y] z", "@a [x y", "[x y z]", "@a [x, y z] w", "[x [y z] w]"]
+    "the space between them kept, though the list holds it and the name after it does not"
+
+@test fun aPartingAfterNothingWrittenPartsNothing () =
+  let src = "-- top\n--\n-- more\n\n[x]\n@a\n[y]\n@b @c [z]\n" in
+  assertEq
+    (formatSkipsFiled (fst (parseSkips src)))
+    src
+    "an item with no attributes has no break before it, nor blank line before its comments"
+
+@test fun whatFollowsAGroupIsChosenByWhetherItBroke () =
+  let a = assertEq (chained "let a = x in a") "let a = x in a" "on one line, as it fits" in
+  let b =
+    assertEq
+      (chained "let a = [bbbbbbbbbb, cccccccccc, dddddddddd] in a")
+      "let a =\n  [bbbbbbbbbb, cccccccccc, dddddddddd]\nin a"
+      "the binding broke: the body on the `in`'s line"
+  in assertEq
+       (chained "let a = x in [bbbbbbbbbb, cccccccccc, dddddddddd]")
+       "let a = x in\n[bbbbbbbbbb, cccccccccc, dddddddddd]"
+       "the binding did not, and the whole does not fit: the body on a line of its own"
+
+@test fun aDeepTreeIsLaidOutInTime () =
+  -- Where each thing is in the text is walked down to at each end. An
+  -- expression is a node around its `let`, and that `let` ends with the
+  -- next: a walk down both ends at every node doubles at each, and forty
+  -- `let`s in each other would never be laid out.
+  let deep = "${S.repeat "let a = x in " 40}a" in
+  assertEq
+    (S.join " " (V.filter (\w -> w != "") (S.split " " (S.join " " (S.split "\n" (chained deep))))))
+    (S.trim deep)
+    "laid out, and the same tokens"
+
+@test fun aChildIsLaidOutAsItsKindSays () =
+  let a =
+    assertEq
+      (chained "if a then x else if b then y else z")
+      "if a then x else if b then y else z"
+      "on one line, as it fits"
+  in
+  let b =
+    assertEq
+      (chained "if aaaaaaaa then xxxxxxxx else if bbbbbbbb then yyyyyyyy else zzzzzzzz")
+      "if aaaaaaaa then xxxxxxxx\nelse if bbbbbbbb then yyyyyyyy\nelse zzzzzzzz"
+      "an `if` after `else` goes on with the chain, on the `else`'s line"
+  in assertEq
+       (chained "if a then x else [zzzzzzzzzz, wwwwwwwwww, vvvvvvvvvv]")
+       "if a then x\nelse\n  [zzzzzzzzzz, wwwwwwwwww, vvvvvvvvvv]"
+       "and anything else under the `else`, a level in"
+
+@test fun aChainBreaksAsOne () =
+  let a =
+    assertEq
+      (chained "if aaaaaaaa then xxxxxxxx else if bbbb then yyyy else zzzz")
+      "if aaaaaaaa then xxxxxxxx\nelse if bbbb then yyyy\nelse zzzz"
+      "every `else` of it once one breaks, though the inner `if` would fit"
+  in assertEq
+       (chained "let a = x in let b = y in b")
+       "let a = x in\nlet b = y in\nb"
+       "and a `let` chain's next step on a line of its own"
+
+@test fun whatALayoutBeginsWithSeesWhatCameBeforeIt () =
+  assertEq
+    (chained "let a = [bbbbbbbbbb, cccccccccc, dddddddddd] in a")
+    "let a =\n  [bbbbbbbbbb, cccccccccc, dddddddddd]\nin a"
+    "`ifbroke` first in a `when`'s layout sees the group before the `when`"
+
+@test fun aNodeIsLaidOutByHowManyItHolds () =
+  let a =
+    assertEq
+      (V.map filled ["[ x ]", "[x]", "[ x, ]", "[a, b]", "[]"])
+      ["[ x ]", "[x]", "[x,]", "[a, b]", "[]"]
+      "one item and no comma one way; a comma, two, or none the other"
+  in assertEq
+       (filled "[aaaaaa, bbbbbb, cccccc, dddddd, eeeeee, ffffff]")
+       "[\n  aaaaaa,\n  bbbbbb,\n  cccccc,\n  dddddd,\n  eeeeee,\n  ffffff\n]"
+       "six: an item a line"
+
+@test fun smallItemsRunOnAsManyToALineAsFit () =
+  let a =
+    assertEq
+      (filled "[aaaa, bbbb, cccc, dddd, eeee, ffff, gggg, hhhh]")
+      "[\n  aaaa, bbbb, cccc, dddd,\n  eeee, ffff, gggg, hhhh\n]"
+      "eight of a token each: as many to a line as fit"
+  in
+  let b =
+    assertEq
+      (filled "[a, b, c, d, e, f, g]")
+      "[a, b, c, d, e, f, g]"
+      "and on one line where they all fit"
+  in assertEq
+       (filled "[aaaa, bbbb, cccc, dddd, eeee, ffff, let a = x in a]")
+       "[\n  aaaa,\n  bbbb,\n  cccc,\n  dddd,\n  eeee,\n  ffff,\n  let a = x in a\n]"
+       "but an item a line where one is more than a token"
+
+@test fun aLastArgumentHugsTheCall () =
+  let a = assertEq (hugged "call f a b") "call f a b" "what fits, on one line" in
+  let b =
+    assertEq
+      (hugged "call f aaaa (\\x -> bbbbbbbbbbbbbbbbbbbb)")
+      "call f aaaa (\\x ->\n  bbbbbbbbbbbbbbbbbbbb)"
+      "a lambda in parentheses, broken inside, set in from the call's line"
+  in
+  let c =
+    assertEq
+      (hugged "call f a [bbbbbbbbbb, cccccccccc, dddddddddd]")
+      "call f a [\n  bbbbbbbbbb,\n  cccccccccc,\n  dddddddddd\n]"
+      "a list"
+  in assertEq
+       (hugged "call f a (bbbbbbbbbbbb, cccccccccccc, dddd)")
+       "call f a (\n  bbbbbbbbbbbb,\n  cccccccccccc,\n  dddd\n)"
+       "and a tuple"
+
+@test fun whatMayNotHugBreaksTheArgumentsALine () =
+  let a =
+    assertEq
+      (hugged "call f aaaaaaaaaa bbbbbbbbbb cccccccccc")
+      "call f\n  aaaaaaaaaa\n  bbbbbbbbbb\n  cccccccccc"
+      "a name"
+  in assertEq
+       (hugged "call f aaaaaaaa ([bbbbbbbbbb, cccccccccc])")
+       "call f\n  aaaaaaaa\n  ([bbbbbbbbbb, cccccccccc])"
+       "and parentheses around what is not a lambda, though it could break inside"
+
+@test fun aBrokenChildBreaksHoweverShort () =
+  let a = assertEq (blocky "[x, y]") "[x, y]" "a list on one line, where it fits" in
+  assertEq
+    (blocky "@a(b) [x, y]")
+    "@a(b) [\n  x,\n  y\n]"
+    "and the same list, broken where the rule says so"
+
+@test fun aHugNeedsOnlyItsFirstLineToFit () =
+  assertEq
+    (hugged "call f (\\x -> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)")
+    "call f (\\x ->\n  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
+    "a line after the first too long for any width does not stop it hugging"
+
+@test fun aHugsFirstLineIsMeasuredFromWhereItStarts () =
+  assertEq
+    (hugged "call fffffffffffffffffffffff (\\x -> b)")
+    "call fffffffffffffffffffffff\n  (\\x -> b)"
+    "after a long head its first line would not fit, so it goes on a line of its own"
+
+@test fun aBracketsSeparatorsAreFoundInWhatItHolds () =
+  let a =
+    assertEq
+      (hugged "call f a <bbbbbbbbbb, cccccccccc, dddddddddd>")
+      "call f a <\n  bbbbbbbbbb,\n  cccccccccc,\n  dddddddddd\n>"
+      "its commas each in a node of its own, and it hugs"
+  in assertEq
+       (hugged "call f aaaaaaaaaaaaaa <bbbbbbbbbbbbbbbbb>")
+       "call f\n  aaaaaaaaaaaaaa\n  <bbbbbbbbbbbbbbbbb>"
+       "with none, it does not, though its first line would fit"
+
+@test fun aWideChildsShortGroupsAreAsWideAsTheWidth () =
+  let a =
+    assertEq
+      (roomy "let aaaa = xxxxx in aaaa")
+      "let aaaa = xxxxx in\naaaa"
+      "24 columns, more than its 20: broken"
+  in assertEq
+       (roomy "(let aaaa = xxxxx in aaaa)")
+       "(let aaaa = xxxxx in aaaa)"
+       "and in parentheses, where its parent makes it wide, on one line"
+
+@test fun whatNothingPartsIsPartedAsTheTextHadIt () =
+  assertEq
+    (V.map pieces ["@a(b) x", "@ a ( b ) x", "@a (b) x"])
+    ["@a(b) x", "@ a ( b ) x", "@a (b) x"]
+    "touching where it touched, which may mean something; a space where it did not"
+
+@test fun whatIsFlatIsOnOneLineWhateverTheWidth () =
+  let a =
+    assertEq
+      (pieces "[aaaaaaaaaa, bbbbbbbbbb, cccccccccc]")
+      "[\n  aaaaaaaaaa,\n  bbbbbbbbbb,\n  cccccccccc\n]"
+      "a list too wide, broken"
+  in assertEq
+       (pieces "([aaaaaaaaaa, bbbbbbbbbb, cccccccccc])")
+       "([aaaaaaaaaa, bbbbbbbbbb, cccccccccc])"
+       "and the same list where it is flat, on one line"
+
+@test fun oneChildHugsAsTheLastOfOne () =
+  assertEq
+    (hugged "@a(b) [cccccccccc, dddddddddd, eeeeeeeeee]")
+    "@a(b) [\n  cccccccccc,\n  dddddddddd,\n  eeeeeeeeee\n]"
+    "a child that is one node hugs as the last of many does"
+
+@test fun itemsWhoseSeparatorsAreTheirOwnRunOn () =
+  let a =
+    assertEq
+      (runs "<aaaa, bbbb, cccc, dddd, eeee, ffff, gggg, hhhh>")
+      "<\n  aaaa, bbbb, cccc, dddd,\n  eeee, ffff, gggg, hhhh\n>"
+      "each item's `line` a `fill`: as many to a line as fit"
+  in assertEq
+       (runs "<aaaa, bbbb, cccc, dddd, [eeee, ffff], gggg>")
+       "<\n  aaaa,\n  bbbb,\n  cccc,\n  dddd,\n  [eeee, ffff],\n  gggg\n>"
+       "and where one is more than two tokens, an item a line"
+
+@test fun noLineEndsWithBlankSpace () =
+  let outs =
+    V.concat [
+      V.map chained [
+        "let a = [bbbbbbbbbb, cccccccccc, dddddddddd] in\n-- note\na",
+        "let a = [bbbbbbbbbb, cccccccccc, dddddddddd] in -- note\na",
+        "if aaaaaaaa then xxxxxxxx -- one\nelse if b then y else z"
+      ],
+      V.map (\x -> formatSkipsFiled (fst (parseSkips x))) ["@a\n-- c\n\n[x, y]\n", "@a -- c\n[x]"]
+    ]
+  in assertEq
+       (V.filter (\o -> V.any (\l -> S.endsWith " " l) (S.split "\n" o)) outs)
+       []
+       "a space put before what then broke is not left at the line's end"
+
+@test fun aPartingBeforeWhatANodeLacksPartsNothing () =
+  assertEq
+    (V.map runs ["<a, b,>", "<a, b, c>"])
+    ["<a, b,>", "<a, b, c>"]
+    "a comma with nothing after it, in an item, is not followed by a space"
+
+@test fun aCommentsLineIsNoBlankLine () =
+  assertEq
+    (V.map listed ["@a(b)\n-- c\n[x]", "@a(b)\n\n-- c\n[x]"])
+    ["@a(b)\n-- c\n[x]", "@a(b)\n\n-- c\n[x]"]
+    "a break and a comment's line are a break; a line of nothing is a blank one"
+
+@test fun aCommentOnALineOfItsOwnKeepsIt () =
+  assertEq
+    (chained "let a = [bbbbbbbbbb, cccccccccc, dddddddddd] in\n-- note\na")
+    "let a =\n  [bbbbbbbbbb, cccccccccc, dddddddddd]\nin\n-- note\na"
+    "though the parting before it is a space"
+
+@test fun aCommentsBreakIsOneWithABreakBesideIt () =
+  assertEq
+    (chained "let a = x in\nlet b = y in\n-- note\nb")
+    "let a = x in\nlet b = y in\n-- note\nb"
+    "the step's `line` broke, and the comment's break is that one, not another"
+
+@test fun nothingIsLostWhereALineAfterABreakIsTooLong () =
+  let src =
+    "let a = x in\nlet b  =  y in\nmatch zzzz with | aaaa -> bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb | c -> d | e -> f"
+  in
+  let squeezed = \s -> S.join "" (S.split " " (S.join "" (S.split "\n" s))) in
+  let a = assertEq (squeezed (chained src)) (squeezed src) "every token still there, in order" in
+  -- What formatting gives back as it was, when it would have lost text, is
+  -- not laid out: so laid out, nothing was lost on the way.
+  assertEq (chained src == src) False "and laid out, not given back as it was"
+
+@test fun aChainBreaksAtItsLoosestOperatorsFirst () =
+  let a = assertEq (tiered "a + b * c == d") "a + b * c == d" "on one line, as it fits" in
+  let b =
+    assertEq
+      (tiered "aaaaaaaaaa + bbbbbbbbbb == cccccccccc * dddddddddd")
+      "aaaaaaaaaa + bbbbbbbbbb\n  == cccccccccc * dddddddddd"
+      "at the `==`, each side of it whole"
+  in assertEq
+       (tiered "aaaaaaaaaa + bbbbbbbbbb + cccccccccc + dddddddddd")
+       "aaaaaaaaaa\n  + bbbbbbbbbb\n  + cccccccccc\n  + dddddddddd"
+       "and at every `+` of a chain of them"
+
+@test fun anOperatorThatTouchesIsPartOfWhatItTouches () =
+  assertEq
+    (tiered "aaaaaaaaaa+bbbbbbbbbb + cccccccccc + dddddddddd")
+    "aaaaaaaaaa+bbbbbbbbbb\n  + cccccccccc\n  + dddddddddd"
+    "not broken at, and no tier of the chain"
+
+@test fun aTierMayBreakAfterItsOperators () =
+  assertEq
+    (tieredAfter "aaaaaaaaaa + bbbbbbbbbb == cccccccccc * dddddddddd")
+    "aaaaaaaaaa + bbbbbbbbbb ==\n  cccccccccc * dddddddddd"
+    "the break after the `==`, and `*`, which no tier names, the tightest"
+
+@test fun aChainWithACommentInItIsLaidOutAsItsRuleSays () =
+  let src = "aaaaaaaaaa + -- note\nbbbbbbbbbb + cccccccccc + dddddddddd" in
+  let squeezed = \x -> S.join "" (S.split " " (S.join "" (S.split "\n" x))) in
+  -- Unchecked: the check `format<Name>` makes would hide a comment lost.
+  let laid = LinguaF.layoutUnchecked linguaTiered_style (fst (parseLists src)) in
+  assertEq (squeezed laid) (squeezed src) "every token, the comment too, still there"
+
+@test fun aMacroBodyIsAnEntryALine () =
+  let a =
+    assertEq
+      (bodied "mac {\na = b\nc = d\n}")
+      "mac {\n  a = b\n  c = d\n}"
+      "each entry a line, two in"
+  in
+  let b =
+    assertEq
+      (bodied "mac {\na = b\n\n\nc = d\n}")
+      "mac {\n  a = b\n\n  c = d\n}"
+      "a blank line between two kept, one"
+  in assertEq
+       (bodied "mac {\na = b\n+ c\nd = e\n}")
+       "mac {\n  a = b + c\n  d = e\n}"
+       "and a line that starts with an operator goes on with the entry before, at its column too"
+
+@test fun aBlankLineAroundACommentInAMacroBodyIsKeptWhereItWas () =
+  assertEq
+    (V.map bodied [
+       "mac {\na = b\n\n-- c\n\nd = e\n}",
+       "mac {\na = b\n-- c\n\n-- d\nd = e\n}",
+       "mac {\na = b\n\n-- c\nd = e\n}"
+     ])
+    [
+      "mac {\n  a = b\n\n  -- c\n\n  d = e\n}",
+      "mac {\n  a = b\n  -- c\n\n  -- d\n  d = e\n}",
+      "mac {\n  a = b\n\n  -- c\n  d = e\n}"
+    ]
+    "before the comments, between two, and after them"
+
+@test fun aBarEntryUnderAHeadingIsALevelIn () =
+  let a =
+    assertEq
+      (bodied "mac {\nhead x\n| a -> b\n| c -> d\n}")
+      "mac {\n  head x\n    | a -> b\n    | c -> d\n}"
+      "after a heading"
+  in assertEq
+       (bodied "mac {\n| a -> b\n| c -> d\n}")
+       "mac {\n  | a -> b\n  | c -> d\n}"
+       "and at the body's level before one"
+
+@test fun anEntryTooLongBreaksAtItsOperators () =
+  let a =
+    assertEq
+      (bodied "mac {\naaaaaaaaaaaa = bbbbbbbbbbbb + cccccccccccc\ne = f\n}")
+      "mac {\n  aaaaaaaaaaaa =\n    bbbbbbbbbbbb + cccccccccccc\n  e = f\n}"
+      "at its loosest, a level in"
+  in assertEq
+       (bodied "mac {\n| aaaaaaa bbbbbbbb -> cccccccccccccccccccccc\n| c -> d\n}")
+       "mac {\n  | aaaaaaa bbbbbbbb ->\n      cccccccccccccccccccccc\n  | c -> d\n}"
+       "and, where it does not read as an arm, an arm's body four in from its `|`"
+
+@test fun aBodyThatIsNoEntriesIsLaidOutAsItsBracketSays () =
+  assertEq
+    (bodied "mac {\nx {\na,\nb\n}\ny\n}")
+    "mac {\n  x {a, b}\n  y\n}"
+    "a bracket within, with commas and no `|`, is a list"
+
+@test fun aCommentThatEndsTheHeadsLineLeavesNothingToHug () =
+  assertEq
+    (hugged "call f -- note\n[bbbbbbbbbb, cccccccccc, dddddddddd]")
+    "call f -- note\n  [\n    bbbbbbbbbb,\n    cccccccccc,\n    dddddddddd\n  ]"
+    "the comment stays where it was, and what was to hug is on the next line, a level in"
+
+@test fun aBracketIsAListWhereItHoldsItsSeparators () =
+  assertEq
+    (V.map runs ["< x >", "<a, b>", "<(aaaaaaaaaa, bbbbbbbbbb, cccccccccc)>"])
+    ["<x>", "<a, b>", "<(aaaaaaaaaa, bbbbbbbbbb, cccccccccc)>"]
+    "one thing against the brackets; a list where commas are in its items, not in a bracket within"
+
+@test fun aListInAMacrosBodyBreaksAtItsCommas () =
+  assertEq
+    (V.map bodied [
+       "mac {\nx {aaaaaaaaaa, bbbbbbbbbb, cccccccccc, dddddddddd}\ny\n}",
+       "mac {\naaaaaaaaaaaa, bbbbbbbbbbbb, cccccccccccc, dddd\ne\n}",
+       "mac {\nx {a, b}\ny\n}"
+     ])
+    [
+      "mac {\n  x {\n    aaaaaaaaaa,\n    bbbbbbbbbb,\n    cccccccccc,\n    dddddddddd\n  }\n  y\n}",
+      "mac {\n  aaaaaaaaaaaa,\n    bbbbbbbbbbbb,\n    cccccccccccc,\n    dddd\n  e\n}",
+      "mac {\n  x {a, b}\n  y\n}"
+    ]
+    "a list within an item a line, an entry split at its commas -- what follows the first a level in, as it goes on -- and what fits on one line"
+
+@test fun anEntryThatReadsAsTheLanguageIsLaidOutAsItIs () =
+  let a =
+    assertEq
+      (bodied "mac {\nhead\n| aaaa -> bbbbbbbbbb + cccccccccc + dddddddddd\n}")
+      "mac {\n  head\n    | aaaa ->\n      bbbbbbbbbb\n        + cccccccccc\n        + dddddddddd\n}"
+      "an arm, by the rules for an arm and what is in it"
+  in assertEq
+       (bodied "mac {\nx = y\nz = w\n}")
+       "mac {\n  x = y\n  z = w\n}"
+       "and what does not read as the language, by its tokens"
+
+-- A file whose items have nothing written between them: as the text had them.
+format! {
+  Joiner for Lists
+  indent 2
+  width 40
+    | File = items
+}
+
+@test fun whatTheTextKeptApartStaysApart () =
+  assertEq
+    (formatJoiner (fst (parseLists "(a, b c)")))
+    "(a, b c)"
+    "a node left open keeps the space after it, which is not where the next thing touches it"
+
+-- What follows an attribute set in further than the attribute ends.
+format! {
+  Deep for Lists
+  indent 2
+  width 40
+    | Tagged = attr indent 8(expr)
+}
+
+@test fun aCommentNeverTouchesWhatIsBeforeIt () =
+  assertEq
+    (formatDeep (fst (parseLists "@a(b)\n-- c\n[x]")))
+    "@a(b)\n        -- c\n        [x]"
+    "a line of its own, though the line before ends short of where it is set in"
+
+-- What follows an attribute set in as far as the attribute ends.
+format! {
+  Level for Lists
+  indent 2
+  width 40
+    | Tagged = attr indent 5(expr)
+}
+
+@test fun aCommentNeverTouchesWhatEndsWhereItIsSetIn () =
+  assertEq
+    (LinguaF.layoutUnchecked linguaLevel_style (fst (parseLists "@a(b)\n-- c\n[x]")))
+    "@a(b)\n     -- c\n     [x]"
+    "a line of its own, though the line before ends where a line just begun would"
+
+-- A token the grammar names by what it is, not by how it is spelled.
+format! {
+  Spelled for Lists
+  indent 2
+  width 40
+    | Hole = "?" tight "name"
+}
+
+@test fun aTokenTheGrammarNamesIsFoundByItsKind () =
+  assertEq
+    (formatSpelled (fst (parseLists "? x")))
+    "?x"
+    "`\"name\"` is any name, though no name is spelled `name`"
+
+@test fun aLineAsWrittenKeepsHowFarInItWas () =
+  -- No rule is for a `(...)`: its second line is one further in than its
+  -- first, as it was, and not a whole level.
+  assertEq
+    (LinguaF.layoutUnchecked linguaLevel_style (fst (parseLists "(x,\n y)")))
+    "(x,\n y)"
+    "set in by a column, as written"
+
+-- A rule that would make two words one.
+format! {
+  Glued for Lists
+  indent 2
+  width 40
+    | LetE = "let" tight name "=" value "in" body
+}
+
+@test fun aLayoutThatJoinsTwoWordsIsNotGiven () =
+  let g = fst (parseLists "let x = 1 in x") in
+  let a =
+    assertEq
+      (LinguaF.layoutUnchecked linguaGlued_style g)
+      "letx = 1 in x"
+      "laid out, they are one word"
+  in assertEq (formatGlued g) "let x = 1 in x" "so the text is given back as it was"
+
+@test fun aSeparatorStaysWithWhatItFollowsThoughACommentComesFirst () =
+  assertEq
+    (V.map chained ["[a\n-- c\n, b]", "[aaaaaaaaaa, bbbbbbbbbb -- c\n, cccccccccc, dddddddddd]"])
+    [
+      "[\n  a,\n  -- c\n  b\n]",
+      "[\n  aaaaaaaaaa,\n  bbbbbbbbbb, -- c\n  cccccccccc,\n  dddddddddd\n]"
+    ]
+    "the comma on its item's line, before a comment on a line of its own, or one that ends the line"
+
+@test fun anEntryOfThingsSideBySideIsAnApplication () =
+  assertEq
+    (V.map bodied [
+       "mac {\naaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd\nf = g\n}",
+       "mac {\nhead x {aaaaaaaaaa = b\ncccccccccc = d}\nf = g\n}",
+       "mac {\nhead xxxxxxxxxx yyyyyyyyyy zzzzzzzzzz {aaaaaaaaaa = b\ncccccccccc = d}\nf = g\n}"
+     ])
+    [
+      "mac {\n  aaaaaaaaaa\n    bbbbbbbbbb\n    cccccccccc\n    dddddddddd\n  f = g\n}",
+      "mac {\n  head x {\n    aaaaaaaaaa = b\n    cccccccccc = d\n  }\n  f = g\n}",
+      "mac {\n  head\n    xxxxxxxxxx\n    yyyyyyyyyy\n    zzzzzzzzzz\n    {\n      aaaaaaaaaa = b\n      cccccccccc = d\n    }\n  f = g\n}"
+    ]
+    "each thing a line a step in where they do not fit; a bracket last on the line before it where that has room"
+
+-- Items that run on, a `?name` one token however many it holds.
+format! {
+  FilledAs for Lists
+  indent 2
+  width 30
+    | List =
+        when
+          1
+          items("[" items "]")(when
+             7+
+             items("[" indent(cut items(tight "," fill 1 as Hole)) cut "]")("["
+                indent(cut items(tight "," line))
+                cut
+                "]"))
+    | VecBody = first filled 2 tail as Hole
+}
+
+-- Items that run on while each is three tokens at most, and no bracket.
+format! {
+  FilledThree for Lists
+  indent 2
+  width 30
+    | List =
+        when
+          1
+          items("[" items "]")(when
+             7+
+             items("[" indent(cut items(tight "," fill 3)) cut "]")("["
+                indent(cut items(tight "," line))
+                cut
+                "]"))
+}
+
+@test fun aNodeOfAKindSaidIsOneTokenAndABracketIsNoSmallItem () =
+  let src = "[aaaa, ?bbbb, cccc, dddd, eeee, ffff, gggg, hhhh]" in
+  let a =
+    assertEq
+      (V.map (\f -> f (fst (parseLists src))) [formatFilledAs, formatFilled])
+      [
+        "[\n  aaaa, ?bbbb, cccc, dddd,\n  eeee, ffff, gggg, hhhh\n]",
+        "[\n  aaaa,\n  ?bbbb,\n  cccc,\n  dddd,\n  eeee,\n  ffff,\n  gggg,\n  hhhh\n]"
+      ]
+      "`?bbbb` one token with `as Hole`, and two without"
+  in assertEq
+       (V.map (\x -> formatFilledThree (fst (parseLists x))) [
+          "[aaaa, bbbb, cccc, dddd, eeee, ffff, ?gg]",
+          "[aaaa, bbbb, cccc, dddd, eeee, ffff, (gg)]"
+        ])
+       [
+         "[\n  aaaa, bbbb, cccc, dddd,\n  eeee, ffff, ?gg\n]",
+         "[\n  aaaa,\n  bbbb,\n  cccc,\n  dddd,\n  eeee,\n  ffff,\n  (gg)\n]"
+       ]
+       "three tokens run on, and three with a bracket do not"
+
+@test fun aCommentGoesNoFurtherOnThanTheCodeBeforeIt () =
+  let g = fst (parseSkips "x -- c\ny\n") in
+  assertEq
+    (V.map (LinguaF.keptApart linguaSkipsPlain_style g) [
+       "x -- c\ny\n",
+       "x\ny -- c\n",
+       "-- c\nx\ny\n"
+     ])
+    [True, True, False]
+    "as it was; what was after it before it, as a separator may be; but not what was before it after it"
+
+-- A tuple as one chain of operators, through its expressions and their
+-- tails: split at its commas, a line each where it breaks, and each part
+-- at its `+`s.
+format! {
+  Chainy for Lists
+  indent 2
+  width 20
+    | Paren = "(" indent(cut chain("," sep; "+")(elems) through(Expr Tail)) cut ")"
+}
+
+@test fun aChainGoesThroughTheNodesItNamesToItsOperators () =
+  assertEq
+    (V.map (\x -> formatChainy (fst (parseLists x))) [
+       "(a + b, c)",
+       "(aaaaaaaaaaaa, bbbbbbbbbbbb)",
+       "(aaaaaaaa + bbbbbbbb + cccccccc, dd)",
+       "(x, (aaaaaaaa + bbbbbbbb, c))"
+     ])
+    [
+      "(a + b, c)",
+      "(\n  aaaaaaaaaaaa,\n  bbbbbbbbbbbb\n)",
+      "(\n  aaaaaaaa\n    + bbbbbbbb\n    + cccccccc,\n  dd\n)",
+      "(\n  x,\n  (\n    aaaaaaaa\n      + bbbbbbbb,\n    c\n  )\n)"
+    ]
+    "on one line if it fits; and if not, a comma a line, and a part that does not fit at its `+`s"
+
+@test fun aNodeThatBeginsWithAGluedTokenHasItBeforeTheComments () =
+  assertEq
+    (V.map (\x -> formatHugged (fst (parseLists x))) [
+       "<aaaaaaaaaa, bbbbbbbbbb\n-- c\n, cccccccccc>",
+       "<aaaaaaaaaa, bbbbbbbbbb -- c\n, cccccccccc>"
+     ])
+    [
+      "<\n  aaaaaaaaaa,\n  bbbbbbbbbb,\n  -- c\n  cccccccccc\n>",
+      "<\n  aaaaaaaaaa,\n  bbbbbbbbbb, -- c\n  cccccccccc\n>"
+    ]
+    "`VecItem = tight \",\" line expr`: its comma on the item before, the comment after it"
+
+@test fun nothingHugsThatHasACommentBeforeIt () =
+  assertEq
+    (formatHugged (fst (parseLists "call f\n-- c\n[aaaaaaaaaa, bbbbbbbbbb, cccccccccc]")))
+    "call f\n  -- c\n  [\n    aaaaaaaaaa,\n    bbbbbbbbbb,\n    cccccccccc\n  ]"
+    "the comment on its line, and the list under it, a step in"
+
+@test fun aBraceHugsWhereItsFirstLineFits () =
+  assertEq
+    (bodied
+       "mac {\nhead x {aaaaaaaaaa = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nc = d}\nf = g\n}")
+    "mac {\n  head x {\n    aaaaaaaaaa =\n      bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n    c = d\n  }\n  f = g\n}"
+    "a word too long for any line in it does not keep the brace off the line, as `meadow fmt` has it"
+
+-- Items that run on while each is three tokens at most, an operand after a
+-- break of its own where its item breaks.
+format! {
+  FilledLines for Lists
+  indent 2
+  width 30
+    | List =
+        when
+          1
+          items("[" items "]")(when
+             7+
+             items("[" indent(cut items(tight "," fill 3)) cut "]")("["
+                indent(cut items(tight "," line))
+                cut
+                "]"))
+    | Tail = op indent(line operand)
+}
+
+@test fun anItemRunOnIsPutWhereItFitsWhole () =
+  assertEq
+    (formatFilledLines (fst (parseLists "[aaaa, bbbb, cccc, d + eeeeeeeee, ff, gg, hh]")))
+    "[\n  aaaa, bbbb, cccc,\n  d + eeeeeeeee, ff, gg, hh\n]"
+    "on the next line, and not broken at its own break where the line has room for its start"
+
+-- The same, what follows a part's first operand four in from it.
+format! {
+  ChainyFar for Lists
+  indent 2
+  width 20
+    | Paren = "(" indent(cut chain 4("," sep; "+")(elems) through(Expr Tail)) cut ")"
+}
+
+@test fun aChainSaysHowFarInWhatFollowsItsFirstOperandIs () =
+  assertEq
+    (formatChainyFar (fst (parseLists "(aaaaaaaa + bbbbbbbb + cccccccc, dd)")))
+    "(\n  aaaaaaaa\n      + bbbbbbbb\n      + cccccccc,\n  dd\n)"
+    "its `+`s four in, and its first operand and its commas where they would be"
+
+@test fun aListInABraceBreaksAnItemALineWithIt () =
+  assertEq
+    (bodied "mac {\nhead xxxxxxxxxxxx {aaaa, bbbb, cccc, dddd, eeee}\n}")
+    "mac {\n  head xxxxxxxxxxxx {\n    aaaa,\n    bbbb,\n    cccc,\n    dddd,\n    eeee\n  }\n}"
+    "its commas break where the brace does, though what is between them fits a line"
+
+-- What a list holds lined up after its `[`.
+format! {
+  SkipsAligned for Skips
+  indent 2
+  width 40
+    | File = items(newline)
+    | List = "[" tight align(items(tight "," line)) tight "]"
+}
+
+@test fun aCommentsLinesAreAllSetInWhereItIs () =
+  assertEq
+    (formatSkipsAligned (fst (parseSkips "[a,\n-- one\n-- two\n    -- three\nb]\n")))
+    "[a,\n -- one\n -- two\n     -- three\n b]\n"
+    "each line of a run of them where the first is, or as far in from it as it was"
+
+-- Items that run on, an operator's operands a step in where it breaks.
+format! {
+  FilledApplied for Lists
+  indent 2
+  width 26
+    | Vec = when + "," body("<" indent(cut body) cut ">")("<" tight body tight ">")
+    | VecBody = first filled 4 tail
+    | VecItem = nogroup tight "," line expr
+    | Expr = first indent(rest)
+    | Tail = line op operand
+}
+
+@test fun anItemRunOnBreaksBeforeItAndNotWithin () =
+  assertEq
+    (formatFilledApplied (fst (parseLists "<aaaa, bbbb, cccc, ddddd + ee, ff>")))
+    "<\n  aaaa, bbbb, cccc,\n  ddddd + ee, ff\n>"
+    "`ddddd + ee` on the next line whole, and not broken at its `+`"
+
+@test fun aBarEntrysBodyAfterItsArrowOrEqualsIsTheLanguage () =
+  assertEq
+    (bodied
+       "mac {\nhead\n| p {aaaaaaaaaa, bbbbbbbbbb, cccccccccc} -> x\n| q {r} y = zzzzzzzzzz + wwwwwwwwww + vvvvvvvvvv\n}")
+    "mac {\n  head\n    | p {\n      aaaaaaaaaa,\n      bbbbbbbbbb,\n      cccccccccc\n    } -> x\n    | q {r} y =\n        zzzzzzzzzz\n          + wwwwwwwwww\n          + vvvvvvvvvv\n}"
+    "the body on the line its pattern ends where it fits, and one after `=` laid out by the rules where no `->` is"
+
+-- A list in a brace whose items run on from four of them, each one token.
+format! {
+  MacroRuns for Lists
+  indent 2
+  width 24
+    | Mac = "mac" body
+    | Brace = "{" indent(cut chain("," sep 4 1; "+")(trees)) cut "}"
+}
+
+@test fun aListOfSoManySmallItemsRunsOn () =
+  assertEq
+    (V.map (\x -> formatMacroRuns (fst (parseLists x))) [
+       "mac {aaaa, bbbb, cccc, dddd, eeee, ffff}",
+       "mac {aaaaaaaa, bbbbbbbb, cccccccc}",
+       "mac {aaaa, bbbb, cccc, dddd + e, ffff}"
+     ])
+    [
+      "mac {\n  aaaa, bbbb, cccc,\n  dddd, eeee, ffff\n}",
+      "mac {\n  aaaaaaaa,\n  bbbbbbbb,\n  cccccccc\n}",
+      "mac {\n  aaaa,\n  bbbb,\n  cccc,\n  dddd + e,\n  ffff\n}"
+    ]
+    "four or more run on, three do not, nor any where one is more than a token"
+
+-- A list on one line however long, though its items are a group that goes
+-- on one line only while it is short.
+format! {
+  FlatShort for Lists
+  indent 2
+  width 40
+    | List = "[" flat(group 3(items(tight "," line))) "]"
+}
+
+@test fun aShortGroupOnOneLineAllTheSameIsLaidOut () =
+  assertEq
+    (formatFlatShort (fst (parseLists "[aaaa,bbbb,   cccc]")))
+    "[aaaa, bbbb, cccc]"
+    "the group longer than it may be on one line, and not the whole text as it was written"
+
+@test fun aCommentAtTheEndOfTheTextKeepsItsLine () =
+  let srcs = ["x\n\n-- end\n", "x\n-- one\n-- two", "x -- after\n\n\n-- last\n"] in
+  let a =
+    assertEq
+      (V.map listed srcs)
+      ["x\n\n-- end\n", "x\n-- one\n-- two", "x -- after\n\n-- last\n"]
+      "after a blank line, a break, or on the line of what is before it, as the text had it"
+  in
+  assertEq
+    (V.map (\x -> formatSkipsFiled (fst (parseSkips x))) srcs)
+    ["x\n\n-- end\n", "x\n-- one\n-- two", "x -- after\n\n-- last\n"]
+    "and so where the comments and the breaks around them are one piece"
+
+@test fun aChainWithACommentOnALineOfItsOwnIsStillLaidOut () =
+  assertEq
+    (V.map (\x -> formatChainy (fst (parseLists x))) [
+       "(aa,\n      -- c\n         bbbbbbbb + cccccccc + dddddddd)",
+       "(aa, -- c\n bb)"
+     ])
+    [
+      "(\n  aa,\n  -- c\n  bbbbbbbb\n    + cccccccc\n    + dddddddd\n)",
+      "(aa, -- c\n bb)"
+    ]
+    "the comment where its node now is, and the node broken to the width; one that ends a line, as the text had it"

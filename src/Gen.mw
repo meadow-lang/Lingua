@@ -89,6 +89,7 @@ data Section
   | Grammar String Loc Int
   | GrammarTrees [TokenTree] Int
   | Lookahead Int
+  | Starts [String]
   | Public
 
 use Section.*
@@ -129,6 +130,7 @@ def section : Parser Tokens Section =
       |> keep ident
       |> keep (group Brace (P.many level)),
     P.skipThen (keyword "lookahead") (P.map Lookahead number),
+    P.pure Starts |> skip (keyword "starts") |> keep (group Brace (P.many (comma ident))),
     P.skipThen
       (keyword "grammar")
       (P.choice [
@@ -230,6 +232,7 @@ fun written name sections =
                       (\acc s -> match s with | Lookahead k -> k | _ -> acc)
                       lookaheadDefault
                       sections,
+                  starts = V.concatMap (\s -> match s with | Starts rs -> rs | _ -> []) sections,
                   defs,
                   start
                 }
@@ -712,6 +715,7 @@ fun generate spec (env : Grammar) : [TokenTree] ! { Mut | e } =
           context = [],
           prec = None,
           lookahead = k,
+          starts = [],
           defs,
           start = 0 - 1
         }
@@ -1243,6 +1247,34 @@ fun entry spec pub root lx =
   (if V.isEmpty spec.context then streamed spec lx else gathered spec lx)
     ++ tokensEntry spec pub lx
     ++ parseEntry spec pub root
+    ++ S.join "" (V.map (\r -> startEntry spec pub r) spec.starts)
+
+-- `parseCalcExpr`, for a rule `starts` names: `input` read as that rule
+-- rather than the whole grammar's -- a piece of a text, a macro's entry --
+-- and every error with the byte it is at. What the rule does not read is an
+-- error too.
+fun startEntry spec pub r = "
+-- `input` as a lossless tree of one `${r}`, and every error with the byte it
+-- is at -- one where the `${r}` ends before the input does.
+${pub}fun parse${spec.name}${r} (input : String) =
+  match ${fn spec "lexemes"} input with
+  | Err err ->
+      (LinguaG.node ${kn spec r} [LinguaG.token ${kx spec "Unknown"} input], [(LinguaScythe.errorAt err, \"the lexer stopped here\")])
+  | Ok lexemes ->
+      let kinds = LinguaB.parsedKinds lexemes in
+      -- What the rule read, and whether that was all of it.
+      let parsed =
+        runSt (\\() ->
+          let p = LinguaP.parser kinds ${kx spec "Eof"} ${kx spec "ErrorNode"} ${fn spec "name"} in
+          let _ = ${fn spec r} p in
+          (LinguaP.events p, LinguaP.atEnd p)) in
+      match parsed with
+      | (events, whole) ->
+          match LinguaB.build ${kn spec r} events lexemes with
+          | (g, errs) ->
+              if whole and LinguaG.text g == input then (g, errs)
+              else (g, LinguaV.pushBack errs (0, \"not all of the input is one ${r}\"))
+"
 
 -- The lexer's tokens, a kind each by the tokens around it: gathered first,
 -- then kinded, then given to the builder as `streamed` gives them.
@@ -1787,7 +1819,11 @@ fun grammarLang spec : Lang =
        (V.append enumSorts loners)
        spec.name
        []
-       (AsTrees tokenKinds trivia tokenFieldsOf)
+       (AsTrees
+          tokenKinds
+          trivia
+          tokenFieldsOf
+          (V.map (\e -> (tokName e, "Token${entryKind spec e}")) spec.tokens))
        []
 
 -- The production of rule `r`: an enum inside an enum is a production holding
